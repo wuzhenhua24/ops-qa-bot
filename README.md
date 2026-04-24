@@ -58,6 +58,7 @@ uv run python run.py --hide-tools
    - 请求方式选 **HTTP**，请求地址填 `https://<your-host>/feishu/webhook`
    - 保存时飞书会打一次 `url_verification` challenge，本服务会自动回 `challenge`，一次通过
    - "Verification Token" 就是代码里的 `FEISHU_VERIFY_TOKEN`（可选，配置后强校验来源）
+   - **Encrypt Key**（强烈推荐公网部署时启用）：填入配置到 `feishu.encrypt_key`。启用后飞书会对 payload 做 AES 加密，并在请求头带签名，服务端会自动解密并校验 `X-Lark-Signature`（SHA256）。篡改或伪造的请求会被 401 拒绝。
 5. **事件订阅 → 添加事件**：订阅 `im.message.receive_v1`（接收消息 v2.0）。
 6. **功能 → 机器人 → 消息卡片请求网址**：填 `https://<your-host>/feishu/card`。这是反馈按钮点击回调的地址（与上面的事件 webhook 是两个独立 URL），首次保存时同样会做 `url_verification` 校验。如果卡片回调的 Verification Token 与事件订阅**不同**，通过环境变量 `FEISHU_CARD_VERIFY_TOKEN` 单独配置；默认会复用 `FEISHU_VERIFY_TOKEN`。
 7. **版本管理与发布**：创建版本 → 提交发布 → 等企业管理员审批通过。
@@ -167,10 +168,16 @@ grep -F '"event": "feedback"' logs/feedback.log \
 
 ### 安全
 
-- 本实现未包含 `encrypt_key` 签名校验。推荐用以下两层替代：
-  1. 飞书开放平台的**事件订阅**页配置 **IP 白名单**（飞书出口 IP 段）限制来源；
-  2. 配置 `FEISHU_VERIFY_TOKEN` 让服务侧强校验事件 `token` 字段。
+三层防御，按安全强度递增：
+
+1. **IP 白名单**（基础）：飞书开放平台"事件订阅"页配置，只放飞书出口 IP 段。
+2. **Verification Token**（轻量）：`feishu.verify_token` + `feishu.card_verify_token`，飞书在 payload 里带的 token 字符串比对。防不了链路中间人。
+3. **Encrypt Key**（推荐）：`feishu.encrypt_key`。启用后 payload AES-256-CBC 加密，请求头带 SHA256 签名，服务端在 `ops_qa_bot/feishu_crypto.py` 里做解密 + 签名校验。可以彻底防伪造/篡改，等价于飞书官方 SDK 的保护级别。公网部署建议开启。
+
+另外：
+
 - `/admin/*` 接口生产环境请务必设置 `ADMIN_TOKEN`，或通过反向代理限制内网访问。
+- 签名校验用 `hmac.compare_digest` 做常量时间比较，防 timing attack。
 
 ## 扩展
 

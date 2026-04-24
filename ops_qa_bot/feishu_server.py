@@ -31,6 +31,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
 from .bot import OpsQABot
 from .config import AppConfig
+from .feishu_crypto import FeishuCrypto
 from .feishu_format import markdown_to_feishu_post
 from .logging_config import request_id_var
 
@@ -364,6 +365,11 @@ def create_app(config: AppConfig) -> FastAPI:
     feishu = FeishuClient(config.feishu.app_id, config.feishu.app_secret)
     session_mgr = SessionManager(docs_root=docs_root, idle_ttl=idle_ttl)
 
+    # 配置了 encrypt_key 就启用签名校验 + AES 解密，否则维持原行为（依赖 verify_token + IP 白名单）
+    crypto: FeishuCrypto | None = (
+        FeishuCrypto(config.feishu.encrypt_key) if config.feishu.encrypt_key else None
+    )
+
     # 飞书事件/卡片回调在超时或网络抖动时会重试，用 TTLCache 按 event_id
     # 和 (message_id, qid, rating) 做幂等，10 分钟窗口覆盖飞书重试周期。
     # asyncio 单线程下，TTLCache 的 __contains__ / __setitem__ 都不 await，
@@ -457,9 +463,27 @@ def create_app(config: AppConfig) -> FastAPI:
         if token != verify_token:
             raise HTTPException(status_code=403, detail="invalid verify token")
 
+    async def _read_and_decode(req: Request) -> dict:
+        """读 body → 签名校验（可选）→ AES 解密（可选）→ 返回原始 payload dict。
+
+        encrypt_key 未配置时走老路径，只 json 解析 body。配置后全流程都走。
+        """
+        body = await req.body()
+        if crypto is not None:
+            ts = req.headers.get("X-Lark-Request-Timestamp", "")
+            nonce = req.headers.get("X-Lark-Request-Nonce", "")
+            sig = req.headers.get("X-Lark-Signature", "")
+            if not crypto.verify_sig(ts, nonce, body, sig):
+                logger.warning("signature verification failed")
+                raise HTTPException(status_code=401, detail="invalid signature")
+        wrapped = json.loads(body)
+        if crypto is not None:
+            return crypto.unwrap(wrapped)
+        return wrapped
+
     @app.post("/feishu/webhook")
     async def webhook(req: Request, background: BackgroundTasks):
-        payload = await req.json()
+        payload = await _read_and_decode(req)
 
         # 每个请求生成 correlation id：优先用飞书 event_id 前 8 位（方便对照飞书后台），
         # 没有就随机。同一请求链路（含 BackgroundTasks 里的 process_question）所有日志都会带。
@@ -506,7 +530,7 @@ def create_app(config: AppConfig) -> FastAPI:
         在飞书开放平台：功能 → 机器人 → 消息卡片请求网址，配置为
         `https://<host>/feishu/card`。首次保存时飞书会打 url_verification。
         """
-        payload = await req.json()
+        payload = await _read_and_decode(req)
 
         # 卡片回调也分配一个 rid，便于和问答链路关联查问题
         request_id_var.set("c" + uuid.uuid4().hex[:7])

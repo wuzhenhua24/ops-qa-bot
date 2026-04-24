@@ -398,6 +398,7 @@ dependencies = [
 [package.optional-dependencies]
 server = [
     { name = "cachetools" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "uvicorn", extra = ["standard"] },
@@ -408,6 +409,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.0.0" },
     { name = "cachetools", marker = "extra == 'server'", specifier = ">=5.3" },
     { name = "claude-agent-sdk", specifier = ">=0.1.65" },
+    { name = "cryptography", marker = "extra == 'server'", specifier = ">=41.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.30" },

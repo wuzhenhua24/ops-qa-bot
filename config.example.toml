@@ -16,6 +16,11 @@ verify_token = ""                     # env: FEISHU_VERIFY_TOKEN
 # 可选：消息卡片回调的 Verification Token，默认回退到上面的 verify_token
 card_verify_token = ""                # env: FEISHU_CARD_VERIFY_TOKEN
 
+# 可选但强烈推荐（尤其公网部署）：飞书"事件订阅"页的 Encrypt Key。
+# 设置后服务会对入站请求做 AES 解密 + SHA256 签名校验，防止篡改/伪造。
+# 飞书平台必须也同时启用 encrypt_key 才会加密推送，否则保持空串即可。
+encrypt_key = ""                      # env: FEISHU_ENCRYPT_KEY
+
 [server]
 host = "0.0.0.0"                      # env: HOST
 port = 8000                           # env: PORT
