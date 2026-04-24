@@ -49,10 +49,11 @@ uv run python run.py --hide-tools
 1. 登录 [飞书开放平台](https://open.feishu.cn/)，**创建企业自建应用**，拿到 `App ID`（对应 `FEISHU_APP_ID`）和 `App Secret`（对应 `FEISHU_APP_SECRET`）。
 2. **应用功能 → 机器人**：开启机器人能力。
 3. **权限管理** 至少开启以下权限：
-   - `im:message`（接收/读取消息）
+   - `im:message`（接收/读取/发送/**更新**消息——"占位→最终答案"的编辑操作也走这个权限）
    - `im:message.group_at_msg`（接收群组 @ 消息）
    - `im:message:send_as_bot`（以机器人身份发消息，包含 interactive 卡片）
-   - `im:message.update_msg`（编辑自己发出的消息，用于"占位 → 最终答案"替换流程）
+
+   > 注：权限名称以飞书开放平台实际展示为准。如果服务启动后编辑/发送消息报权限不足错误，根据返回的 `code` 和 `msg` 对照 [权限总览](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/permission-list) 补上即可。
 4. **事件与回调 → 事件订阅**：
    - 请求方式选 **HTTP**，请求地址填 `https://<your-host>/feishu/webhook`
    - 保存时飞书会打一次 `url_verification` challenge，本服务会自动回 `challenge`，一次通过
