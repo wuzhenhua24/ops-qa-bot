@@ -352,6 +352,104 @@ def _excerpt(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+async def handle_question(
+    chat_id: str,
+    user_id: str,
+    question: str,
+    feishu: "FeishuClient",
+    session_mgr: "SessionManager",
+) -> None:
+    """处理单条用户提问（完整流程：重置 / 占位 / 答题 / 编辑 / 反馈卡片）。
+
+    抽成模块级函数的原因：HTTP 模式和长连接模式都要走同一套业务逻辑，
+    参数化 feishu 和 session_mgr 之后两边可以共享。
+    """
+    key = (chat_id, user_id)
+
+    # 重置指令：清掉该用户的会话
+    if question in RESET_TRIGGERS:
+        existed = await session_mgr.reset(key)
+        reply = (
+            "已清空你的对话历史，下一个问题会开启新会话。"
+            if existed
+            else "你当前还没有活跃会话，下一个问题就是新会话。"
+        )
+        await feishu.send_post(chat_id, _mention_post(user_id, reply))
+        return
+
+    # 1. 立即发占位消息，让用户感知 bot 已收到（问答生成要 5-15 秒）
+    placeholder_mid = await feishu.send_post(
+        chat_id, _mention_post(user_id, PLACEHOLDER_MARKDOWN)
+    )
+
+    # 2. 生成答案
+    try:
+        entry = await session_mgr.get(key)
+        async with entry.lock:
+            answer = await entry.bot.answer(question)
+            entry.last_used = time.time()
+    except Exception as e:
+        logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
+        answer = f"抱歉，处理失败：{e}"
+    answer = answer or "（无回答内容）"
+    final_post = _mention_post(user_id, answer)
+
+    # 3. 用最终答案替换占位；编辑失败则兜底发新消息
+    if placeholder_mid is not None:
+        if not await feishu.update_post(placeholder_mid, final_post):
+            logger.warning(
+                "update placeholder failed (mid=%s), sending new message",
+                placeholder_mid,
+            )
+            await feishu.send_post(chat_id, final_post)
+    else:
+        await feishu.send_post(chat_id, final_post)
+
+    # 4. 发反馈卡片并记录问答（qid 用来关联后续的反馈事件）
+    qid = uuid.uuid4().hex[:12]
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "qa",
+                "qid": qid,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "question": _excerpt(question, 500),
+                "answer_excerpt": _excerpt(answer, 500),
+            },
+            ensure_ascii=False,
+        )
+    )
+    await feishu.send_interactive(chat_id, _feedback_card(qid, user_id))
+
+
+def handle_feedback_click(
+    qid: str,
+    rating: str,
+    clicker_id: str | None,
+    asker_id: str | None,
+) -> dict:
+    """记录反馈点击日志，返回应替换原卡片的 ack 卡片 JSON。
+
+    两种模式通用：HTTP 模式把这个 dict 包成 `{"card": <ack>}` 返回；
+    WS 模式把它塞进 `P2CardActionTriggerResponse`。
+    """
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "feedback",
+                "qid": qid,
+                "rating": rating,
+                "clicker_id": clicker_id,
+                "asker_id": asker_id,
+            },
+            ensure_ascii=False,
+        )
+    )
+    logger.info("feedback qid=%s rating=%s by=%s", qid, rating, clicker_id)
+    return _feedback_ack_card(rating)
+
+
 def create_app(config: AppConfig) -> FastAPI:
     docs_root = config.docs_root
     if not (docs_root / "INDEX.md").is_file():
@@ -395,63 +493,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
 
     async def process_question(chat_id: str, user_id: str, question: str) -> None:
-        key = (chat_id, user_id)
-
-        # 重置指令：清掉该用户的会话
-        if question in RESET_TRIGGERS:
-            existed = await session_mgr.reset(key)
-            reply = (
-                "已清空你的对话历史，下一个问题会开启新会话。"
-                if existed
-                else "你当前还没有活跃会话，下一个问题就是新会话。"
-            )
-            await feishu.send_post(chat_id, _mention_post(user_id, reply))
-            return
-
-        # 1. 立即发占位消息，让用户感知 bot 已收到（问答生成要 5-15 秒）
-        placeholder_mid = await feishu.send_post(
-            chat_id, _mention_post(user_id, PLACEHOLDER_MARKDOWN)
-        )
-
-        # 2. 生成答案
-        try:
-            entry = await session_mgr.get(key)
-            async with entry.lock:
-                answer = await entry.bot.answer(question)
-                entry.last_used = time.time()
-        except Exception as e:
-            logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
-            answer = f"抱歉，处理失败：{e}"
-        answer = answer or "（无回答内容）"
-        final_post = _mention_post(user_id, answer)
-
-        # 3. 用最终答案替换占位；编辑失败则兜底发新消息
-        if placeholder_mid is not None:
-            if not await feishu.update_post(placeholder_mid, final_post):
-                logger.warning(
-                    "update placeholder failed (mid=%s), sending new message",
-                    placeholder_mid,
-                )
-                await feishu.send_post(chat_id, final_post)
-        else:
-            await feishu.send_post(chat_id, final_post)
-
-        # 4. 发反馈卡片并记录问答（qid 用来关联后续的反馈事件）
-        qid = uuid.uuid4().hex[:12]
-        feedback_logger.info(
-            json.dumps(
-                {
-                    "event": "qa",
-                    "qid": qid,
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "question": _excerpt(question, 500),
-                    "answer_excerpt": _excerpt(answer, 500),
-                },
-                ensure_ascii=False,
-            )
-        )
-        await feishu.send_interactive(chat_id, _feedback_card(qid, user_id))
+        await handle_question(chat_id, user_id, question, feishu, session_mgr)
 
     def _check_verify_token(payload: dict) -> None:
         if not verify_token:
@@ -564,22 +606,14 @@ def create_app(config: AppConfig) -> FastAPI:
             return {"card": _feedback_ack_card(rating)}
         seen_clicks[click_key] = True
 
-        feedback_logger.info(
-            json.dumps(
-                {
-                    "event": "feedback",
-                    "qid": qid,
-                    "rating": rating,
-                    "clicker_id": clicker_id,
-                    "asker_id": value.get("asker_id"),
-                },
-                ensure_ascii=False,
-            )
+        ack_card = handle_feedback_click(
+            qid=qid,
+            rating=rating,
+            clicker_id=clicker_id,
+            asker_id=value.get("asker_id"),
         )
-        logger.info("feedback qid=%s rating=%s by=%s", qid, rating, clicker_id)
-
         # 返回新卡片替换原按钮卡片（防止重复点击）
-        return {"card": _feedback_ack_card(rating)}
+        return {"card": ack_card}
 
     @app.get("/healthz")
     async def healthz():

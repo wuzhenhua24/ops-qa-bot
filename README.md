@@ -44,6 +44,15 @@ uv run python run.py --hide-tools
 
 > ⚠️ 注意：**群自定义机器人 webhook**（`open.feishu.cn/open-apis/bot/v2/hook/xxx`）是单向入站通道，只能让你把消息推进群，**收不到用户消息**，无法用于问答机器人。本项目必须走"飞书自建应用 + 事件订阅"路线。
 
+### 两种接入模式，任选其一
+
+| 模式 | 入口 | 适用场景 |
+|------|------|----------|
+| **HTTP 模式**（`run_server.py`） | 公网 HTTPS Webhook | 已有 Nginx/Ingress 基建、公网入站无审批阻力 |
+| **长连接模式**（`run_ws.py`） | 只出不进，飞书 SDK WebSocket | 内网部署、不想开公网端口、本地开发/调试 |
+
+两种模式**业务逻辑完全一致**（会话隔离、占位消息、反馈收集、日志都复用同一套），差异只在"事件怎么进来"这一层。下面先讲 HTTP 模式的飞书平台配置（通用前半段），再分别给出两种启动方式。
+
 ### 前置：在飞书开放平台配置自建应用
 
 1. 登录 [飞书开放平台](https://open.feishu.cn/)，**创建企业自建应用**，拿到 `App ID`（对应 `FEISHU_APP_ID`）和 `App Secret`（对应 `FEISHU_APP_SECRET`）。
@@ -89,6 +98,29 @@ uv run python run_server.py
 ```
 
 服务默认监听 `0.0.0.0:8000`。生产环境请用 Nginx / Caddy 反向代理加 TLS，并在飞书开放平台的"事件订阅"页配置飞书出口 **IP 白名单**限制来源。
+
+### 启动服务（长连接模式）
+
+```bash
+# 1. 只需要 ws 这个 extra，比 server 少装 fastapi/uvicorn/cryptography 等
+uv sync --extra ws
+
+# 2. 配置文件里只填 app_id / app_secret 即可，其他字段（encrypt_key、
+#    verify_token、HTTPS 入站相关）都用不上
+cp config.example.toml config.toml
+
+# 3. 启动
+uv run python run_ws.py
+```
+
+**飞书开放平台配置差异**（切换到长连接模式时）：
+- "**事件与回调 → 事件订阅**"：订阅方式选 **长连接**（不用填 Request URL）
+- "**消息卡片 → 接收方式**"：选 **事件订阅**（对应 `card.action.trigger` 新版事件，通过同一条长连接推回）
+- 订阅事件：`im.message.receive_v1` + `card.action.trigger`
+- 不需要配 `encrypt_key` / `verify_token`（SDK 自己管鉴权）
+- 不需要配公网 HTTPS 地址、不需要 IP 白名单
+
+长连接模式只需要**出站 443 能访问 `open.feishu.cn`** 即可，入站无端口暴露。审核流程和安全评估通常比开公网容易很多。
 
 ### 运维接口
 

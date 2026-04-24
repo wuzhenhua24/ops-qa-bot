@@ -17,6 +17,11 @@ server = [
     "cachetools>=5.3",
     "cryptography>=41.0",
 ]
+# 长连接模式：走飞书官方 SDK 的 WebSocket 事件订阅，避免开公网 HTTPS 入口
+ws = [
+    "lark-oapi>=1.4.0",
+    "httpx>=0.27",
+]
 
 [tool.uv]
 package = false
