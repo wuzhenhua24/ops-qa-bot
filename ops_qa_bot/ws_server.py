@@ -32,9 +32,10 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 
 from .config import AppConfig
-from .feishu_server import (
+from .feishu_core import (
     FeishuClient,
     SessionManager,
+    _feedback_ack_card,
     handle_feedback_click,
     handle_question,
 )
@@ -159,7 +160,6 @@ class WsRunner:
         if click_key in self._seen_clicks:
             logger.info("duplicate card click, skip: key=%s", click_key)
             # 即使重复也返回 ack 卡片，保证 UI 一致
-            from .feishu_server import _feedback_ack_card
             return P2CardActionTriggerResponse(
                 {"card": {"type": "raw", "data": _feedback_ack_card(rating)}}
             )

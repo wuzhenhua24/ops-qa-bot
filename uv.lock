@@ -508,6 +508,7 @@ server = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 ws = [
+    { name = "cachetools" },
     { name = "httpx" },
     { name = "lark-oapi" },
 ]
@@ -516,6 +517,7 @@ ws = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.0.0" },
     { name = "cachetools", marker = "extra == 'server'", specifier = ">=5.3" },
+    { name = "cachetools", marker = "extra == 'ws'", specifier = ">=5.3" },
     { name = "claude-agent-sdk", specifier = ">=0.1.65" },
     { name = "cryptography", marker = "extra == 'server'", specifier = ">=41.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
