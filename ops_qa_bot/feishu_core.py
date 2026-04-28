@@ -13,11 +13,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
 
 import httpx
+from cachetools import TTLCache
 
 from .bot import AnswerResult, OpsQABot
 from .feishu_format import markdown_to_feishu_post
@@ -32,6 +34,13 @@ RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 PLACEHOLDER_MARKDOWN = "🔍 正在翻文档，请稍候..."
 
 SessionKey = tuple[str, str]  # (chat_id, user_open_id)
+
+# 升级机制：bot 答不上来时，按 prompt 输出 <<ESCALATE:ou_xxx>> 标记，
+# handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
+# 只接受形如 ou_xxxx 或字面量 none 两种值，防止注入。
+_ESCALATE_RE = re.compile(r"<<ESCALATE:(ou_[A-Za-z0-9_-]+|none)>>")
+# 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
+_escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
 
 
 class FeishuClient:
@@ -311,6 +320,35 @@ def _excerpt(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _parse_escalate(answer: str) -> tuple[str, str | None]:
+    """从答案里抽 <<ESCALATE:xxx>> 标记。
+
+    返回 (清理后的答案文本, 要 @ 的 open_id 或 None)。
+    none 视作 "不 @ 任何人"，与"未匹配到标记"等价。
+    """
+    m = _ESCALATE_RE.search(answer)
+    if not m:
+        return answer, None
+    cleaned = _ESCALATE_RE.sub("", answer).strip()
+    target = m.group(1)
+    return cleaned, (target if target != "none" else None)
+
+
+def _append_escalate_at(post: dict, owner_id: str) -> None:
+    """在 post 内容末尾追加一段 "📣 已通知负责人 @xxx 协助回答"。
+
+    用独立段落（一行）展示，不和答案正文挤在一起。
+    """
+    post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
+    post["zh_cn"]["content"].append(
+        [
+            {"tag": "text", "text": "📣 已通知负责人 "},
+            {"tag": "at", "user_id": owner_id},
+            {"tag": "text", "text": " 协助回答 🙏"},
+        ]
+    )
+
+
 async def handle_question(
     chat_id: str,
     user_id: str,
@@ -352,7 +390,24 @@ async def handle_question(
         logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
         answer = f"抱歉，处理失败：{e}"
     answer = answer or "（无回答内容）"
+
+    # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
+    answer, escalate_owner = _parse_escalate(answer)
     final_post = _mention_post(user_id, answer)
+    if escalate_owner is not None:
+        cooldown_key = (chat_id, escalate_owner)
+        if cooldown_key in _escalate_cooldown:
+            logger.info(
+                "escalate cooldown hit: chat=%s owner=%s, suppress @",
+                chat_id,
+                escalate_owner,
+            )
+        else:
+            _escalate_cooldown[cooldown_key] = True
+            _append_escalate_at(final_post, escalate_owner)
+            logger.info(
+                "escalated to owner: chat=%s owner=%s", chat_id, escalate_owner
+            )
 
     # 3. 用最终答案替换占位；编辑失败则兜底发新消息
     if placeholder_mid is not None:
@@ -375,6 +430,8 @@ async def handle_question(
         "question": _excerpt(question, 500),
         "answer_excerpt": _excerpt(answer, 500),
     }
+    if escalate_owner is not None:
+        qa_record["escalated_to"] = escalate_owner
     # 模型用量：直接转发 SDK 给的字段，对接第三方 Claude 兼容代理时可以拿
     # input_tokens / output_tokens / cache_* 套自己的单价表算成本。
     if result is not None:
