@@ -1,0 +1,52 @@
+# systemd unit for ops-qa-bot (long-connection mode)
+#
+# 默认假设：
+#   - 项目装在 /opt/ops-qa-bot
+#   - 配置文件在 /etc/ops-qa-bot/config.toml
+#   - 运行用户/组 ops-bot（非 root，需要预先 useradd）
+#   - 用 uv 管理虚拟环境，路径在 .venv/bin/python
+# 不一致时把下面 ExecStart / WorkingDirectory / User / Group 改掉即可。
+#
+# 安装：见 README "部署到服务器" 章节。
+
+[Unit]
+Description=Ops QA Bot (Feishu long-connection mode)
+Documentation=https://github.com/<your-org>/ops-qa-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ops-bot
+Group=ops-bot
+WorkingDirectory=/opt/ops-qa-bot
+
+# 用 venv 里的 python 直接跑，避免依赖宿主机的 uv/PATH 配置
+ExecStart=/opt/ops-qa-bot/.venv/bin/python run_ws.py --config /etc/ops-qa-bot/config.toml
+
+# 崩溃自动重启（异常退出时），但禁止无限循环：1 分钟内连续 5 次失败就停手
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 优雅停机：先 SIGTERM 让 lifespan 关闭 SessionManager 收尾，30 秒后再 SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# mixed: 主进程收 SIGTERM 自己处理，整个 cgroup 收 SIGKILL 兜底，
+# 把 claude CLI 子进程一并清理掉，避免孤儿
+KillMode=mixed
+
+# 资源限制
+LimitNOFILE=65535
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# 只允许写日志目录（如果你把 LOG_FILE / FEEDBACK_LOG 配到别处，相应增减）
+ReadWritePaths=/opt/ops-qa-bot/logs
+
+[Install]
+WantedBy=multi-user.target

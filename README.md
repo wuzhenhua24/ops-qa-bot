@@ -278,6 +278,24 @@ grep -F '"event": "qa"' logs/feedback.log \
 - `/admin/*` 接口生产环境请务必设置 `ADMIN_TOKEN`，或通过反向代理限制内网访问。
 - 签名校验用 `hmac.compare_digest` 做常量时间比较，防 timing attack。
 
+## 部署到服务器（生产）
+
+不要用 `nohup &` 跑长期服务——崩溃不会自动重启、`kill` 不走优雅停机会留下孤儿 claude 子进程、机器重启后 bot 也不会自动起来。**用 systemd**（Linux 服务器自带）能一次性解决这些问题。
+
+完整步骤、systemd unit 文件和常用运维操作见 [`deploy/README.md`](deploy/README.md)，核心要点：
+
+- 专用 `ops-bot` 系统用户，非 root 运行
+- 项目装在 `/opt/ops-qa-bot`，配置文件 `/etc/ops-qa-bot/config.toml`（权限 `640`，含 secret 不能被其他用户读）
+- `Restart=on-failure` + `StartLimitBurst=5` 自动重启不雪崩
+- `KillMode=mixed` 优雅停机时把 claude CLI 子进程一并回收
+- `journalctl -u ops-qa-bot -f` 看实时日志，`systemctl restart` 升级
+
+```bash
+# 一行总结：
+sudo cp deploy/ops-qa-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ops-qa-bot
+```
+
 ## 扩展
 
 - **新增组件文档**：在 `docs/` 下新建组件目录，写 markdown，然后在 `docs/INDEX.md` 加一行即可。无需改代码。
