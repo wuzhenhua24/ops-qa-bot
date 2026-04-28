@@ -156,8 +156,22 @@ class OpsQABot:
                 num_turns = event.get("num_turns")
                 duration_ms = event.get("duration_ms")
                 duration_api_ms = event.get("duration_api_ms")
+                parts: list[str] = []
                 if cost_usd is not None:
-                    logger.info("  done, cost=$%.4f", cost_usd)
+                    parts.append(f"cost=${cost_usd:.4f}")
+                if usage:
+                    parts.append(f"in={usage.get('input_tokens', 0)}")
+                    parts.append(f"out={usage.get('output_tokens', 0)}")
+                    if cache_r := usage.get("cache_read_input_tokens"):
+                        parts.append(f"cache_r={cache_r}")
+                    if cache_w := usage.get("cache_creation_input_tokens"):
+                        parts.append(f"cache_w={cache_w}")
+                if num_turns is not None:
+                    parts.append(f"turns={num_turns}")
+                if duration_ms is not None:
+                    parts.append(f"took={duration_ms / 1000:.1f}s")
+                if parts:
+                    logger.info("  done, %s", " ".join(parts))
         return AnswerResult(
             text="".join(chunks).strip(),
             cost_usd=cost_usd,
