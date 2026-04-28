@@ -65,6 +65,42 @@ sudo systemctl status ops-qa-bot
 sudo journalctl -u ops-qa-bot -f       # 实时日志，等价于 tail
 ```
 
+## 健康检查（长连接模式）
+
+长连接模式下进程不监听任何对外端口，但**会启动一个本地 HTTP 健康服务**（默认 `127.0.0.1:8001`）供监控调用。HTTP 模式跑 `run_server.py` 时这些路径已经在主端口下，无需另外配置。
+
+```bash
+# liveness：进程没卡死就返回 200
+curl http://127.0.0.1:8001/healthz
+# {"ok": true, "active_sessions": 0, "uptime_seconds": 123.4}
+
+# readiness：长时间没收事件 / WS 状态异常时返回 503
+curl http://127.0.0.1:8001/readyz
+# {"ready": true, "reason": "ok", "last_event_age_seconds": 3.2, ...}
+# 或：HTTP 503 + {"ready": false, "reason": "idle for 1900s exceeds 1800s"}
+
+# 当前活跃会话快照
+curl http://127.0.0.1:8001/admin/sessions
+```
+
+接外部监控（接收非 localhost 请求）改 `config.toml`：
+
+```toml
+[health]
+host = "0.0.0.0"
+port = 8001
+ready_max_idle_seconds = 1800   # 超过这个空闲时间 /readyz 就 503
+```
+
+systemd 集成示例（如果你想让 systemd 把 readyz 失败也当成失败处理）：
+
+```ini
+# 在 deploy/ops-qa-bot.service 里加一段
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5; do curl -fs http://127.0.0.1:8001/healthz && exit 0; sleep 2; done; exit 1'
+```
+
+或者写个 cron 定期检查 `/readyz`，失败就重启服务。
+
 ## 常用运维操作
 
 ```bash

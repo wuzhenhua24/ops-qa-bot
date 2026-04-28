@@ -21,7 +21,9 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import lark_oapi as lark
 from cachetools import TTLCache
@@ -39,6 +41,7 @@ from .feishu_core import (
     handle_feedback_click,
     handle_question,
 )
+from .health_server import HealthServer
 from .logging_config import request_id_var
 
 logger = logging.getLogger("ops_qa_bot.ws")
@@ -68,6 +71,13 @@ class WsRunner:
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ws_thread: threading.Thread | None = None
+        self._health: HealthServer | None = None
+
+        # 健康检查用的状态
+        self._started_at: float = 0.0
+        self._last_event_at: float = 0.0  # 最近一次成功收到事件
+        self._event_count: int = 0
+        self._click_count: int = 0
 
     # ------------------------------------------------------------------
     # 事件回调（SDK 从线程池调用，同步接口）
@@ -80,6 +90,10 @@ class WsRunner:
         import uuid as _uuid
         rid = event_id[:8] if event_id else "ws" + _uuid.uuid4().hex[:6]
         request_id_var.set(rid)
+
+        # 收到事件就更新健康状态（任何路径都算"链路通"）
+        self._last_event_at = time.time()
+        self._event_count += 1
 
         # 去重
         if event_id:
@@ -142,6 +156,10 @@ class WsRunner:
         rid = "c" + (event_id[:7] if event_id else _uuid.uuid4().hex[:7])
         request_id_var.set(rid)
 
+        # 卡片点击同样算"链路通"
+        self._last_event_at = time.time()
+        self._click_count += 1
+
         data = event.event
         if not data or not data.action or not data.action.value:
             return P2CardActionTriggerResponse({})
@@ -177,6 +195,58 @@ class WsRunner:
         )
 
     # ------------------------------------------------------------------
+    # 健康检查端点
+    # ------------------------------------------------------------------
+
+    async def _h_healthz(self) -> tuple[int, dict[str, Any]]:
+        """liveness：进程响应即 200。能跑到这里说明 asyncio loop 没卡死。"""
+        return 200, {
+            "ok": True,
+            "active_sessions": self._session_mgr.active_count(),
+            "uptime_seconds": round(time.time() - self._started_at, 1),
+        }
+
+    async def _h_readyz(self) -> tuple[int, dict[str, Any]]:
+        """readiness：长时间没收到事件视为 not ready。
+
+        startup 起 grace_period 内允许"还没收到任何事件"也算 ready，
+        给 WS 建立连接和接到第一条事件留时间。
+        """
+        now = time.time()
+        uptime = now - self._started_at
+        threshold = self._config.health.ready_max_idle_seconds
+        last = self._last_event_at
+        idle = (now - last) if last > 0 else None
+
+        ready: bool
+        reason: str
+        if uptime < threshold and last == 0:
+            ready, reason = True, "in startup grace period"
+        elif last == 0:
+            ready, reason = False, "no events received since startup"
+        elif idle is not None and idle > threshold:
+            ready, reason = False, f"idle for {idle:.0f}s exceeds {threshold:.0f}s"
+        else:
+            ready, reason = True, "ok"
+
+        return (200 if ready else 503), {
+            "ready": ready,
+            "reason": reason,
+            "last_event_age_seconds": round(idle, 1) if idle is not None else None,
+            "uptime_seconds": round(uptime, 1),
+            "event_count": self._event_count,
+            "click_count": self._click_count,
+        }
+
+    async def _h_admin_sessions(self) -> tuple[int, dict[str, Any]]:
+        sessions = await self._session_mgr.snapshot()
+        return 200, {
+            "count": len(sessions),
+            "idle_ttl_seconds": self._session_mgr.idle_ttl,
+            "sessions": sessions,
+        }
+
+    # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
 
@@ -194,9 +264,22 @@ class WsRunner:
         )
 
     async def run(self) -> None:
-        """主入口：启动 asyncio 主循环 + 后台 WS 线程，阻塞直到 Ctrl+C。"""
+        """主入口：启动 asyncio 主循环 + 后台 WS 线程 + 健康检查 server。"""
         self._loop = asyncio.get_running_loop()
+        self._started_at = time.time()
         await self._session_mgr.start()
+
+        if self._config.health.enabled:
+            self._health = HealthServer(
+                host=self._config.health.host,
+                port=self._config.health.port,
+                routes={
+                    "/healthz": self._h_healthz,
+                    "/readyz": self._h_readyz,
+                    "/admin/sessions": self._h_admin_sessions,
+                },
+            )
+            await self._health.start()
 
         ws_client = self._build_ws_client()
         self._ws_thread = threading.Thread(
@@ -218,5 +301,8 @@ class WsRunner:
             pass
         finally:
             logger.info("ws server stopping, closing sessions ...")
+            if self._health is not None:
+                await self._health.stop()
+                self._health = None
             await self._session_mgr.stop()
             logger.info("ws server stopped")

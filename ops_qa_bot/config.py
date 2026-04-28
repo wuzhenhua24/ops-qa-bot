@@ -36,6 +36,17 @@ class LoggingConfig:
 
 
 @dataclass
+class HealthConfig:
+    """长连接模式下的辅助 HTTP 健康检查端点。HTTP 模式不需要这个（已自带 /healthz）。"""
+
+    enabled: bool = True
+    host: str = "127.0.0.1"  # 默认只监听 localhost；接外部监控时改成 0.0.0.0
+    port: int = 8001
+    # /readyz 判定空闲多久还算 ready。startup 起 grace 同样这么久。
+    ready_max_idle_seconds: float = 1800.0
+
+
+@dataclass
 class AppConfig:
     docs_root: Path
     feishu: FeishuConfig
@@ -43,6 +54,7 @@ class AppConfig:
     session_idle_ttl: float = 1800.0
     admin_token: str | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
 
 
 def _pick(env_key: str, cfg_value: Any, default: Any = None) -> Any:
@@ -101,6 +113,19 @@ def load_config(path: Path) -> AppConfig:
         _pick("FEEDBACK_LOG", logging_raw.get("feedback_log"), "./logs/feedback.log")
     )
 
+    health_raw = data.get("health") or {}
+    health_enabled_raw = _pick("HEALTH_ENABLED", health_raw.get("enabled"), True)
+    health_enabled = (
+        health_enabled_raw
+        if isinstance(health_enabled_raw, bool)
+        else str(health_enabled_raw).lower() not in ("0", "false", "no", "")
+    )
+    health_host = _pick("HEALTH_HOST", health_raw.get("host"), "127.0.0.1")
+    health_port = int(_pick("HEALTH_PORT", health_raw.get("port"), 8001))
+    health_idle = float(
+        _pick("HEALTH_READY_MAX_IDLE", health_raw.get("ready_max_idle_seconds"), 1800)
+    )
+
     return AppConfig(
         docs_root=docs_root,
         feishu=FeishuConfig(
@@ -114,4 +139,10 @@ def load_config(path: Path) -> AppConfig:
         session_idle_ttl=idle_ttl,
         admin_token=admin_token,
         logging=LoggingConfig(main_log=main_log, feedback_log=feedback_log),
+        health=HealthConfig(
+            enabled=health_enabled,
+            host=health_host,
+            port=health_port,
+            ready_max_idle_seconds=health_idle,
+        ),
     )
