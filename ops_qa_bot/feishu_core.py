@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from .bot import OpsQABot
+from .bot import AnswerResult, OpsQABot
 from .feishu_format import markdown_to_feishu_post
 
 logger = logging.getLogger("ops_qa_bot.feishu")
@@ -341,11 +341,13 @@ async def handle_question(
     )
 
     # 2. 生成答案
+    result: AnswerResult | None = None
     try:
         entry = await session_mgr.get(key)
         async with entry.lock:
-            answer = await entry.bot.answer(question)
+            result = await entry.bot.answer(question)
             entry.last_used = time.time()
+        answer = result.text
     except Exception as e:
         logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
         answer = f"抱歉，处理失败：{e}"
@@ -365,19 +367,23 @@ async def handle_question(
 
     # 4. 发反馈卡片并记录问答（qid 用来关联后续的反馈事件）
     qid = uuid.uuid4().hex[:12]
-    feedback_logger.info(
-        json.dumps(
-            {
-                "event": "qa",
-                "qid": qid,
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "question": _excerpt(question, 500),
-                "answer_excerpt": _excerpt(answer, 500),
-            },
-            ensure_ascii=False,
-        )
-    )
+    qa_record: dict[str, object] = {
+        "event": "qa",
+        "qid": qid,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "question": _excerpt(question, 500),
+        "answer_excerpt": _excerpt(answer, 500),
+    }
+    # 模型用量：直接转发 SDK 给的字段，对接第三方 Claude 兼容代理时可以拿
+    # input_tokens / output_tokens / cache_* 套自己的单价表算成本。
+    if result is not None:
+        qa_record["cost_usd"] = result.cost_usd
+        qa_record["usage"] = result.usage
+        qa_record["num_turns"] = result.num_turns
+        qa_record["duration_ms"] = result.duration_ms
+        qa_record["duration_api_ms"] = result.duration_api_ms
+    feedback_logger.info(json.dumps(qa_record, ensure_ascii=False))
     await feishu.send_interactive(chat_id, _feedback_card(qid, user_id))
 
 

@@ -167,6 +167,29 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 
 `logs/feedback.log` 每行是 `时间戳 + JSON`。用 `sed 's/^[^{]*//'` 去掉时间戳前缀后就能喂给 `jq`。
 
+**`qa` 事件的字段**：
+
+```json
+{
+  "event": "qa",
+  "qid": "abc123",
+  "chat_id": "oc_xxx",
+  "user_id": "ou_xxx",
+  "question": "...",
+  "answer_excerpt": "...",
+  "cost_usd": 0.0123,                    // SDK 给的官方价估算（订阅模式下是参考值）
+  "usage": {
+    "input_tokens": 1234,                // 净输入（不含缓存命中）
+    "output_tokens": 567,                // 输出
+    "cache_read_input_tokens": 8901,     // 缓存命中（约 1/10 价）
+    "cache_creation_input_tokens": 23    // 写缓存（比正价贵 25% 左右）
+  },
+  "num_turns": 4,                        // 几轮 tool use 才答完
+  "duration_ms": 8500,                   // 总耗时
+  "duration_api_ms": 7200                // 模型 API 实际耗时
+}
+```
+
 ```bash
 # 1. 查看所有被 👎 的问答（自动按 qid 关联回原题）
 grep -F '"rating": "down"' logs/feedback.log \
@@ -197,6 +220,49 @@ grep -F '"event": "feedback"' logs/feedback.log \
 ```
 
 拿到高频被踩的问题后，对照检查对应组件的文档是否缺内容、`INDEX.md` 路由表是否有歧义、`prompt.py` 的 system prompt 是否需要加 few-shot 示例——这就是"反馈驱动优化"的闭环。
+
+**按自定单价算实际成本**（对接第三方 Claude 兼容代理时尤其有用）：
+
+```bash
+# 假设单价（每 1M tokens 的美元数）：
+#   input         = $3
+#   output        = $15
+#   cache_read    = $0.3
+#   cache_create  = $3.75
+# 这只是占位值，按你实际的代理/模型单价改
+
+grep -F '"event": "qa"' logs/feedback.log \
+  | sed 's/^[^{]*//' \
+  | jq -r '
+      .usage as $u
+      | (
+          ($u.input_tokens // 0)               * 3      / 1000000 +
+          ($u.output_tokens // 0)              * 15     / 1000000 +
+          ($u.cache_read_input_tokens // 0)    * 0.3    / 1000000 +
+          ($u.cache_creation_input_tokens // 0)* 3.75   / 1000000
+        ) as $cost
+      | "\(.qid)  $\($cost | tostring | .[0:8])  in=\($u.input_tokens // 0) out=\($u.output_tokens // 0) cache_r=\($u.cache_read_input_tokens // 0)"
+    '
+```
+
+聚合每天总开销：
+
+```bash
+grep -F '"event": "qa"' logs/feedback.log \
+  | awk '{print substr($1,1,10), $0}' \
+  | sed 's/^\([^ ]*\) [^{]*/\1\t/' \
+  | awk -F'\t' '{print $1, $2}' \
+  | while read date rest; do
+      echo "$rest" | jq --arg d "$date" '
+        .usage as $u
+        | (
+            ($u.input_tokens // 0)*3 + ($u.output_tokens // 0)*15
+            + ($u.cache_read_input_tokens // 0)*0.3
+            + ($u.cache_creation_input_tokens // 0)*3.75
+          )/1000000 as $c
+        | [$d, $c, .qid] | @tsv'
+    done | awk '{day[$1]+=$2; n[$1]++} END {for (d in day) printf "%s  $%.4f  (%d 次)\n", d, day[d], n[d]}'
+```
 
 ### 安全
 
