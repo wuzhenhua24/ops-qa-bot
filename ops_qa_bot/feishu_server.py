@@ -24,8 +24,11 @@ from .feishu_core import (
     SessionManager,
     _archive_ack_card,
     _feedback_ack_card,
+    _feedback_reason_form_card,
     handle_archive_submit,
     handle_feedback_click,
+    handle_feedback_reason_skip,
+    handle_feedback_reason_submit,
     handle_question,
 )
 from .feishu_crypto import FeishuCrypto
@@ -215,7 +218,13 @@ def create_app(config: AppConfig) -> FastAPI:
             click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
             if click_key in seen_clicks:
                 logger.info("duplicate card click, skip: key=%s", click_key)
-                return {"card": _feedback_ack_card(rating)}
+                # 重试要返回和首次一致的卡片，否则 👎 的原因表单会被 ack 顶掉
+                replay = (
+                    _feedback_reason_form_card(qid, value.get("asker_id"))
+                    if rating == "down"
+                    else _feedback_ack_card(rating)
+                )
+                return {"card": {"type": "raw", "data": replay}}
             seen_clicks[click_key] = True
             ack_card = handle_feedback_click(
                 qid=qid,
@@ -223,8 +232,29 @@ def create_app(config: AppConfig) -> FastAPI:
                 clicker_id=clicker_id,
                 asker_id=value.get("asker_id"),
             )
-            # 返回新卡片替换原按钮卡片（防止重复点击）
-            return {"card": ack_card}
+            # 用 raw 包一层兼容 v1（👍 ack）与 v2（👎 表单）两种 schema
+            return {"card": {"type": "raw", "data": ack_card}}
+
+        if action_name in ("feedback_reason_submit", "feedback_reason_skip"):
+            qid = value.get("qid")
+            asker_id = value.get("asker_id")
+            click_key = f"{msg_id}|reason|{qid}|{clicker_id}|{action_name}"
+            if click_key in seen_clicks:
+                logger.info("duplicate reason click, skip: key=%s", click_key)
+                return {
+                    "card": {"type": "raw", "data": _feedback_ack_card("down")}
+                }
+            seen_clicks[click_key] = True
+            if action_name == "feedback_reason_skip":
+                ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
+            else:
+                form_value = action.get("form_value") or {}
+                reason = form_value.get("reason") or None
+                comment = form_value.get("comment") or None
+                ack_card = handle_feedback_reason_submit(
+                    qid, reason, comment, clicker_id, asker_id
+                )
+            return {"card": {"type": "raw", "data": ack_card}}
 
         if action_name == "archive_submit":
             qid = value.get("qid")

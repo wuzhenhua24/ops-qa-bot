@@ -330,6 +330,116 @@ def _feedback_ack_card(rating: str, clicker_name: str | None = None) -> dict:
     }
 
 
+# 👎 后弹出的原因枚举：覆盖最常见的几类可执行抓手（更新文档 / 调 prompt）
+_FEEDBACK_REASONS: dict[str, str] = {
+    "outdated": "文档过时",
+    "incomplete": "步骤不完整",
+    "incorrect": "事实错误",
+    "verbose": "答案啰嗦 / 没重点",
+    "other": "其他",
+}
+
+
+def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
+    """👎 后替换原卡的原因收集表单（card v2 form）。
+
+    select 选原因 + 多行 input 写备注（可选）+ 提交/跳过两个按钮。
+    qid / asker_id 透过按钮 value 带回，不依赖服务端状态。
+    """
+    options = [
+        {"text": {"tag": "plain_text", "content": label}, "value": value}
+        for value, label in _FEEDBACK_REASONS.items()
+    ]
+    btn_common = {"qid": qid, "asker_id": asker_id}
+    return {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "想了解一下这次回答哪里需要改进，方便我们补文档 / 调 prompt："
+                    ),
+                },
+                {
+                    "tag": "form",
+                    "name": "feedback_reason_form",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "name": "reason",
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "请选择原因",
+                            },
+                            "label": {"tag": "plain_text", "content": "原因"},
+                            "label_position": "top",
+                            "required": True,
+                            "options": options,
+                        },
+                        {
+                            "tag": "input",
+                            "name": "comment",
+                            "input_type": "multiline_text",
+                            "rows": 3,
+                            "max_length": 500,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "可选：举例哪步错了 / 哪条步骤少了 / 哪段过时了",
+                            },
+                            "label": {"tag": "plain_text", "content": "备注（可选）"},
+                            "label_position": "top",
+                        },
+                        {
+                            "tag": "column_set",
+                            "columns": [
+                                {
+                                    "tag": "column",
+                                    "elements": [
+                                        {
+                                            "tag": "button",
+                                            "text": {
+                                                "tag": "plain_text",
+                                                "content": "提交",
+                                            },
+                                            "type": "primary",
+                                            "action_type": "form_submit",
+                                            "name": "submit_btn",
+                                            "value": {
+                                                "action": "feedback_reason_submit",
+                                                **btn_common,
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "tag": "column",
+                                    "elements": [
+                                        {
+                                            "tag": "button",
+                                            "text": {
+                                                "tag": "plain_text",
+                                                "content": "跳过",
+                                            },
+                                            "type": "default",
+                                            "action_type": "form_submit",
+                                            "name": "skip_btn",
+                                            "value": {
+                                                "action": "feedback_reason_skip",
+                                                **btn_common,
+                                            },
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ]
+        },
+    }
+
+
 def _excerpt(text: str, limit: int = 200) -> str:
     text = text.strip().replace("\n", " ")
     return text if len(text) <= limit else text[:limit] + "..."
@@ -740,10 +850,11 @@ def handle_feedback_click(
     clicker_id: str | None,
     asker_id: str | None,
 ) -> dict:
-    """记录反馈点击日志，返回应替换原卡片的 ack 卡片 JSON。
+    """记录反馈点击日志，返回应替换原卡片的卡片 JSON。
 
-    两种模式通用：HTTP 模式把返回值包成 `{"card": <ack>}`；
-    WS 模式塞进 `P2CardActionTriggerResponse`。
+    👍：返回简单 ack 卡（v1，流程结束）。
+    👎：先记 rating=down，再返回原因收集表单（v2 form）；用户填完按"提交"
+    或"跳过"会触发第二次回调（feedback_reason_submit / _skip）记 reason 行。
     """
     feedback_logger.info(
         json.dumps(
@@ -758,4 +869,70 @@ def handle_feedback_click(
         )
     )
     logger.info("feedback qid=%s rating=%s by=%s", qid, rating, clicker_id)
+    if rating == "down":
+        return _feedback_reason_form_card(qid, asker_id)
     return _feedback_ack_card(rating)
+
+
+def handle_feedback_reason_submit(
+    qid: str | None,
+    reason: str | None,
+    comment: str | None,
+    clicker_id: str | None,
+    asker_id: str | None,
+) -> dict:
+    """处理 👎 后原因表单的提交，返回最终 ack 卡。
+
+    reason 不在白名单（None / 注入 / SDK 字段名变了）会写一行 invalid 标记的
+    日志，但仍返回 ack，避免 UI 卡住。grep `event=feedback_reason invalid=true`
+    可发现这类异常。
+    """
+    valid = reason in _FEEDBACK_REASONS
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "feedback_reason",
+                "qid": qid,
+                "reason": reason if valid else None,
+                "reason_label": _FEEDBACK_REASONS.get(reason or "") if valid else None,
+                "comment": _excerpt(comment, 500) if comment else None,
+                "clicker_id": clicker_id,
+                "asker_id": asker_id,
+                "invalid": not valid,
+            },
+            ensure_ascii=False,
+        )
+    )
+    logger.info(
+        "feedback reason qid=%s reason=%s by=%s comment_len=%d",
+        qid,
+        reason,
+        clicker_id,
+        len(comment or ""),
+    )
+    return _feedback_ack_card("down")
+
+
+def handle_feedback_reason_skip(
+    qid: str | None,
+    clicker_id: str | None,
+    asker_id: str | None,
+) -> dict:
+    """用户在原因表单里点"跳过"：记一条 skipped 事件，返回最终 ack。
+
+    skipped 计数能告诉我们"愿不愿意填原因"的整体比例；如果绝大多数都跳过，
+    说明这个二次表单要么时机不对要么选项不对，需要再调。
+    """
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "feedback_reason_skipped",
+                "qid": qid,
+                "clicker_id": clicker_id,
+                "asker_id": asker_id,
+            },
+            ensure_ascii=False,
+        )
+    )
+    logger.info("feedback reason skipped: qid=%s by=%s", qid, clicker_id)
+    return _feedback_ack_card("down")

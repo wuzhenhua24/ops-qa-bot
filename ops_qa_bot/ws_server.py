@@ -39,8 +39,11 @@ from .feishu_core import (
     SessionManager,
     _archive_ack_card,
     _feedback_ack_card,
+    _feedback_reason_form_card,
     handle_archive_submit,
     handle_feedback_click,
+    handle_feedback_reason_skip,
+    handle_feedback_reason_submit,
     handle_question,
 )
 from .health_server import HealthServer
@@ -179,9 +182,14 @@ class WsRunner:
             click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
             if click_key in self._seen_clicks:
                 logger.info("duplicate card click, skip: key=%s", click_key)
-                # 即使重复也返回 ack 卡片，保证 UI 一致
+                # 重试要返回和首次一致的卡片，否则 👎 的原因表单会被 ack 顶掉
+                replay = (
+                    _feedback_reason_form_card(qid, value.get("asker_id"))
+                    if rating == "down"
+                    else _feedback_ack_card(rating)
+                )
                 return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": _feedback_ack_card(rating)}}
+                    {"card": {"type": "raw", "data": replay}}
                 )
             self._seen_clicks[click_key] = True
             ack_card = handle_feedback_click(
@@ -191,6 +199,34 @@ class WsRunner:
                 asker_id=value.get("asker_id"),
             )
             # v2 卡片回调响应格式：{"type": "raw", "data": <card json>}
+            return P2CardActionTriggerResponse(
+                {"card": {"type": "raw", "data": ack_card}}
+            )
+
+        if action_name in ("feedback_reason_submit", "feedback_reason_skip"):
+            qid = value.get("qid")
+            asker_id = value.get("asker_id")
+            click_key = f"{msg_id}|reason|{qid}|{clicker_id}|{action_name}"
+            if click_key in self._seen_clicks:
+                logger.info("duplicate reason click, skip: key=%s", click_key)
+                return P2CardActionTriggerResponse(
+                    {
+                        "card": {
+                            "type": "raw",
+                            "data": _feedback_ack_card("down"),
+                        }
+                    }
+                )
+            self._seen_clicks[click_key] = True
+            if action_name == "feedback_reason_skip":
+                ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
+            else:
+                form_value = data.action.form_value or {}
+                reason = form_value.get("reason") or None
+                comment = form_value.get("comment") or None
+                ack_card = handle_feedback_reason_submit(
+                    qid, reason, comment, clicker_id, asker_id
+                )
             return P2CardActionTriggerResponse(
                 {"card": {"type": "raw", "data": ack_card}}
             )
