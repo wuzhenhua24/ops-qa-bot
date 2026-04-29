@@ -149,6 +149,7 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 - **空闲回收**：会话空闲超 `SESSION_IDLE_TTL`（默认 30 分钟）自动关闭，释放 subprocess。
 - **手动重置**：用户发 `/reset`、`/new`、`新对话`、`重置` 任一关键词即可清空自己的上下文开新会话，不影响别人。
 - **@ 提问者**：回复消息开头会 `@` 对应用户，群里多人并行提问时一眼看出归属。
+- **信息不足时反问**：问题命中多个组件、缺关键参数（版本/环境/具体报错码）会让答案分叉时，bot 会先反问 1-2 个最关键差异点而不是硬答或直接升级。反问通过会话上下文自然延续——用户在同一 session 里答完，下一轮就按补充信息直接答。原则是"宁可漏问别滥问"：用户消息里已带具体信息时直接答，反问也最多一轮（一轮没拿到就转直接答 + ⚠️ 假设声明）。反问轮日志带 `clarification: true` 标记，`grep` 能直接看到反问占比和用户回填率。
 - **找不到答案 @ 负责人**：bot 在文档里查不到时，会按 `INDEX.md` 里登记的组件 `open_id` 自动 @ 对应负责人协助。同一 (群, 负责人) 30 分钟内只 @ 一次，防止刷屏。配置方式：在 `docs/INDEX.md` 的"组件目录"表里加一列 `open_id`，对应飞书用户的 `ou_xxxxxxxx`。
 - **问答留档**：被升级到负责人的问题，bot 会同时发一张表单卡片。负责人在群里正常作答给提问者看到的同时，把整理过的答案填进卡片提交，bot 自动追加进 `docs/<component>/qa-archive.md`（按 `INDEX.md` 反查组件目录，查不到落到 `docs/qa-archive.md`）。下次再有人问类似问题，RAG 会从这里找到答案，文档库自然滚雪球。每条带 `qid` 字段，可通过 `logs/feedback.log` 里 `event=archive` 的记录追溯。
 - **健康检查**：HTTP 模式自带 `/healthz` 和 `/admin/sessions`；长连接模式额外启动一个本地小 HTTP 服务（默认 `127.0.0.1:8001`）暴露 `/healthz` / `/readyz` / `/admin/sessions`，方便接 Prometheus、k8s 探针、内网监控脚本。`/readyz` 检查 WS 客户端线程是否还在跑，挂了返回 503；事件计数 / 上次事件时间作为观测字段返回，不参与 ready 判定。详见 `deploy/README.md`。

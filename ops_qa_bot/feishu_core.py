@@ -49,6 +49,11 @@ _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
 # key 必须出自 _FOLLOWUP_LIBRARY；最多 3 个；不在白名单的 key 静默过滤。
 # 抓取宽松（含数字/大小写都先收下），合法性靠 _FOLLOWUP_LIBRARY 白名单过滤
 _FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([\w|]+)>>")
+
+# 反问标记：LLM 检测到信息不足以准确答时输出 <<CLARIFY>>，把答案当成反问轮处理。
+# 反问轮：不发反馈卡 / 追问按钮 / 升级 @ / 归档卡，让用户专注回答反问；
+# 用户在同一 session 里答完，下一轮就按补充信息直接答。
+_CLARIFY_RE = re.compile(r"<<CLARIFY>>")
 _FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
     "troubleshoot": (
         "📋 排查步骤",
@@ -406,6 +411,13 @@ def _parse_followups(answer: str) -> tuple[str, list[str]]:
         if len(valid) >= 3:
             break
     return cleaned, valid
+
+
+def _parse_clarify(answer: str) -> tuple[str, bool]:
+    """抽 <<CLARIFY>> 标记，返回 (清理后的答案, 是否为反问轮)。"""
+    if _CLARIFY_RE.search(answer):
+        return _CLARIFY_RE.sub("", answer).strip(), True
+    return answer, False
 
 
 def _followup_ack_card(label: str) -> dict:
@@ -934,6 +946,13 @@ async def handle_question(
     answer, escalate_owner = _parse_escalate(answer)
     # 解析快捷追问标记，挂在反馈卡上面让用户一键发起新一轮
     answer, followup_keys = _parse_followups(answer)
+    # 解析反问标记：是否为"信息不足、需要用户补充"的反问轮
+    answer, is_clarification = _parse_clarify(answer)
+    # 反问轮防御性清空：prompt 已要求反问时不输出 ESCALATE/FOLLOWUPS，但 LLM
+    # 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
+    if is_clarification:
+        escalate_owner = None
+        followup_keys = []
     final_post = _mention_post(user_id, answer)
     escalated_now = False
     if escalate_owner is not None:
@@ -977,6 +996,8 @@ async def handle_question(
     }
     if escalate_owner is not None:
         qa_record["escalated_to"] = escalate_owner
+    if is_clarification:
+        qa_record["clarification"] = True
     # 模型用量：直接转发 SDK 给的字段，对接第三方 Claude 兼容代理时可以拿
     # input_tokens / output_tokens / cache_* 套自己的单价表算成本。
     if result is not None:
@@ -988,9 +1009,11 @@ async def handle_question(
     feedback_logger.info(json.dumps(qa_record, ensure_ascii=False))
 
     # 5. 反馈卡（每次都发，含可选的快捷追问按钮）
-    await feishu.send_interactive(
-        chat_id, _feedback_card(qid, user_id, chat_id, followup_keys)
-    )
+    # 反问轮跳过：让用户专注答反问，下一轮按补充信息再答 + 那时再挂反馈/追问
+    if not is_clarification:
+        await feishu.send_interactive(
+            chat_id, _feedback_card(qid, user_id, chat_id, followup_keys)
+        )
 
     # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
     if escalated_now:
