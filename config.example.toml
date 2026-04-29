@@ -42,5 +42,3 @@ feedback_log = "./logs/feedback.log"    # env: FEEDBACK_LOG
 enabled = true                          # env: HEALTH_ENABLED；不需要监控时设 false
 host    = "127.0.0.1"                   # env: HEALTH_HOST；接外部监控时改 0.0.0.0
 port    = 8001                          # env: HEALTH_PORT
-# /readyz 判定空闲多久还算 ready；同样长度的 startup grace
-ready_max_idle_seconds = 1800           # env: HEALTH_READY_MAX_IDLE

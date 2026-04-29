@@ -74,10 +74,13 @@ sudo journalctl -u ops-qa-bot -f       # 实时日志，等价于 tail
 curl http://127.0.0.1:8001/healthz
 # {"ok": true, "active_sessions": 0, "uptime_seconds": 123.4}
 
-# readiness：长时间没收事件 / WS 状态异常时返回 503
+# readiness：WS 客户端线程挂了才会 503
 curl http://127.0.0.1:8001/readyz
-# {"ready": true, "reason": "ok", "last_event_age_seconds": 3.2, ...}
-# 或：HTTP 503 + {"ready": false, "reason": "idle for 1900s exceeds 1800s"}
+# {"ready": true, "reason": "ok", "ws_thread_alive": true, "last_event_age_seconds": 3.2, ...}
+# 或：HTTP 503 + {"ready": false, "reason": "ws client thread has exited"}
+#
+# 注：last_event_age_seconds / event_count 仅作观测，不参与 ready 判定。
+# 测试环境低流量时这个值会很大也属正常，不要据此重启服务。
 
 # 当前活跃会话快照
 curl http://127.0.0.1:8001/admin/sessions
@@ -89,7 +92,6 @@ curl http://127.0.0.1:8001/admin/sessions
 [health]
 host = "0.0.0.0"
 port = 8001
-ready_max_idle_seconds = 1800   # 超过这个空闲时间 /readyz 就 503
 ```
 
 systemd 集成示例（如果你想让 systemd 把 readyz 失败也当成失败处理）：

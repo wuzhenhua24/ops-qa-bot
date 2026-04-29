@@ -150,7 +150,7 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 - **手动重置**：用户发 `/reset`、`/new`、`新对话`、`重置` 任一关键词即可清空自己的上下文开新会话，不影响别人。
 - **@ 提问者**：回复消息开头会 `@` 对应用户，群里多人并行提问时一眼看出归属。
 - **找不到答案 @ 负责人**：bot 在文档里查不到时，会按 `INDEX.md` 里登记的组件 `open_id` 自动 @ 对应负责人协助。同一 (群, 负责人) 30 分钟内只 @ 一次，防止刷屏。配置方式：在 `docs/INDEX.md` 的"组件目录"表里加一列 `open_id`，对应飞书用户的 `ou_xxxxxxxx`。
-- **健康检查**：HTTP 模式自带 `/healthz` 和 `/admin/sessions`；长连接模式额外启动一个本地小 HTTP 服务（默认 `127.0.0.1:8001`）暴露 `/healthz` / `/readyz` / `/admin/sessions`，方便接 Prometheus、k8s 探针、内网监控脚本。`/readyz` 会在长时间没收到飞书事件时返回 503，发现"假活"故障。详见 `deploy/README.md`。
+- **健康检查**：HTTP 模式自带 `/healthz` 和 `/admin/sessions`；长连接模式额外启动一个本地小 HTTP 服务（默认 `127.0.0.1:8001`）暴露 `/healthz` / `/readyz` / `/admin/sessions`，方便接 Prometheus、k8s 探针、内网监控脚本。`/readyz` 检查 WS 客户端线程是否还在跑，挂了返回 503；事件计数 / 上次事件时间作为观测字段返回，不参与 ready 判定。详见 `deploy/README.md`。
 - **占位消息**：收到提问后**立即**发送 `🔍 正在翻文档，请稍候...` 作为占位，答案生成完后通过飞书编辑消息 API（`PUT /im/v1/messages/{mid}`）把占位替换成最终答案。用户立刻感知 bot 已接到、不会以为 @ 掉了。编辑失败时自动兜底发新消息。
 - **反馈收集**：答案后紧跟一条 interactive 卡片，带 👍 / 👎 两个按钮。用户点击 → 飞书回调 `/feishu/card` → 服务侧记录 + 返回新卡片替换按钮（防重复点击）。问答和反馈都落在 `logs/feedback.log`，每行 JSON，用 `qid` 关联：
 

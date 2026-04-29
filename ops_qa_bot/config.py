@@ -42,8 +42,6 @@ class HealthConfig:
     enabled: bool = True
     host: str = "127.0.0.1"  # 默认只监听 localhost；接外部监控时改成 0.0.0.0
     port: int = 8001
-    # /readyz 判定空闲多久还算 ready。startup 起 grace 同样这么久。
-    ready_max_idle_seconds: float = 1800.0
 
 
 @dataclass
@@ -122,9 +120,6 @@ def load_config(path: Path) -> AppConfig:
     )
     health_host = _pick("HEALTH_HOST", health_raw.get("host"), "127.0.0.1")
     health_port = int(_pick("HEALTH_PORT", health_raw.get("port"), 8001))
-    health_idle = float(
-        _pick("HEALTH_READY_MAX_IDLE", health_raw.get("ready_max_idle_seconds"), 1800)
-    )
 
     return AppConfig(
         docs_root=docs_root,
@@ -143,6 +138,5 @@ def load_config(path: Path) -> AppConfig:
             enabled=health_enabled,
             host=health_host,
             port=health_port,
-            ready_max_idle_seconds=health_idle,
         ),
     )

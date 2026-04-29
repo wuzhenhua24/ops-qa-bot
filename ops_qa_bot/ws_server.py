@@ -207,31 +207,30 @@ class WsRunner:
         }
 
     async def _h_readyz(self) -> tuple[int, dict[str, Any]]:
-        """readiness：长时间没收到事件视为 not ready。
+        """readiness：asyncio loop 跑得到这里 + WS 客户端线程还活着就算 ready。
 
-        startup 起 grace_period 内允许"还没收到任何事件"也算 ready，
-        给 WS 建立连接和接到第一条事件留时间。
+        不拿"业务事件新鲜度"做判定 —— 低流量时会误报，真断连时又迟报。
+        事件计数 / 上次事件距今多久仅作为观测字段返回，不参与 ready 判定。
+        真断连的兜底靠 SDK 自身重连 + 进程退出后 systemd 拉起。
         """
         now = time.time()
         uptime = now - self._started_at
-        threshold = self._config.health.ready_max_idle_seconds
         last = self._last_event_at
         idle = (now - last) if last > 0 else None
 
-        ready: bool
-        reason: str
-        if uptime < threshold and last == 0:
-            ready, reason = True, "in startup grace period"
-        elif last == 0:
-            ready, reason = False, "no events received since startup"
-        elif idle is not None and idle > threshold:
-            ready, reason = False, f"idle for {idle:.0f}s exceeds {threshold:.0f}s"
+        ws_thread = self._ws_thread
+        ws_alive = ws_thread is not None and ws_thread.is_alive()
+        if ws_thread is None:
+            ready, reason = False, "ws client thread not started yet"
+        elif not ws_alive:
+            ready, reason = False, "ws client thread has exited"
         else:
             ready, reason = True, "ok"
 
         return (200 if ready else 503), {
             "ready": ready,
             "reason": reason,
+            "ws_thread_alive": ws_alive,
             "last_event_age_seconds": round(idle, 1) if idle is not None else None,
             "uptime_seconds": round(uptime, 1),
             "event_count": self._event_count,
@@ -269,6 +268,14 @@ class WsRunner:
         self._started_at = time.time()
         await self._session_mgr.start()
 
+        # 先把 WS 线程拉起来再开 health server，避免 /readyz 在
+        # "health up 但 _ws_thread 还是 None" 的毫秒级窗口里误报 503
+        ws_client = self._build_ws_client()
+        self._ws_thread = threading.Thread(
+            target=ws_client.start, daemon=True, name="lark-ws-client"
+        )
+        self._ws_thread.start()
+
         if self._config.health.enabled:
             self._health = HealthServer(
                 host=self._config.health.host,
@@ -280,12 +287,6 @@ class WsRunner:
                 },
             )
             await self._health.start()
-
-        ws_client = self._build_ws_client()
-        self._ws_thread = threading.Thread(
-            target=ws_client.start, daemon=True, name="lark-ws-client"
-        )
-        self._ws_thread.start()
         logger.info(
             "ws server started: app_id=%s docs_root=%s idle_ttl=%ss",
             self._config.feishu.app_id,
