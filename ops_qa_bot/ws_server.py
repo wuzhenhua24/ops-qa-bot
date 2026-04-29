@@ -37,7 +37,9 @@ from .config import AppConfig
 from .feishu_core import (
     FeishuClient,
     SessionManager,
+    _archive_ack_card,
     _feedback_ack_card,
+    handle_archive_submit,
     handle_feedback_click,
     handle_question,
 )
@@ -164,35 +166,79 @@ class WsRunner:
         if not data or not data.action or not data.action.value:
             return P2CardActionTriggerResponse({})
         value = data.action.value
-        if value.get("action") != "feedback":
-            return P2CardActionTriggerResponse({})
-
-        qid = value.get("qid")
-        rating = value.get("rating")
+        action_name = value.get("action")
         clicker_id = data.operator.open_id if data.operator else None
-        if not qid or rating not in ("up", "down"):
-            return P2CardActionTriggerResponse({})
+        msg_id = data.context.open_message_id if data.context else ""
 
-        # 去重：点击重试场景
-        click_key = f"{data.context.open_message_id if data.context else ''}|{qid}|{clicker_id}|{rating}"
-        if click_key in self._seen_clicks:
-            logger.info("duplicate card click, skip: key=%s", click_key)
-            # 即使重复也返回 ack 卡片，保证 UI 一致
-            return P2CardActionTriggerResponse(
-                {"card": {"type": "raw", "data": _feedback_ack_card(rating)}}
+        if action_name == "feedback":
+            qid = value.get("qid")
+            rating = value.get("rating")
+            if not qid or rating not in ("up", "down"):
+                return P2CardActionTriggerResponse({})
+            # 去重：点击重试场景
+            click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
+            if click_key in self._seen_clicks:
+                logger.info("duplicate card click, skip: key=%s", click_key)
+                # 即使重复也返回 ack 卡片，保证 UI 一致
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": _feedback_ack_card(rating)}}
+                )
+            self._seen_clicks[click_key] = True
+            ack_card = handle_feedback_click(
+                qid=qid,
+                rating=rating,
+                clicker_id=clicker_id,
+                asker_id=value.get("asker_id"),
             )
-        self._seen_clicks[click_key] = True
+            # v2 卡片回调响应格式：{"type": "raw", "data": <card json>}
+            return P2CardActionTriggerResponse(
+                {"card": {"type": "raw", "data": ack_card}}
+            )
 
-        ack_card = handle_feedback_click(
-            qid=qid,
-            rating=rating,
-            clicker_id=clicker_id,
-            asker_id=value.get("asker_id"),
-        )
-        # v2 卡片回调响应格式：{"type": "raw", "data": <card json>}
-        return P2CardActionTriggerResponse(
-            {"card": {"type": "raw", "data": ack_card}}
-        )
+        if action_name == "archive_submit":
+            qid = value.get("qid")
+            form_value = data.action.form_value or {}
+            answer = form_value.get("answer") or ""
+            click_key = f"{msg_id}|archive|{qid}|{clicker_id}"
+            if click_key in self._seen_clicks:
+                logger.info("duplicate archive submit, skip: key=%s", click_key)
+                return P2CardActionTriggerResponse(
+                    {
+                        "card": {
+                            "type": "raw",
+                            "data": _archive_ack_card("ℹ️", "已处理。"),
+                        }
+                    }
+                )
+            self._seen_clicks[click_key] = True
+            if self._loop is None:
+                return P2CardActionTriggerResponse(
+                    {
+                        "card": {
+                            "type": "raw",
+                            "data": _archive_ack_card(
+                                "❌", "服务未就绪，请稍后再试。"
+                            ),
+                        }
+                    }
+                )
+            # SDK 在线程池里同步调本回调，转发到 asyncio 主 loop 跑写盘逻辑
+            fut = asyncio.run_coroutine_threadsafe(
+                handle_archive_submit(
+                    qid, answer, clicker_id, self._config.docs_root
+                ),
+                self._loop,
+            )
+            try:
+                ack_card = fut.result(timeout=15)
+            except Exception:
+                logger.exception("archive submit failed: qid=%s", qid)
+                ack_card = _archive_ack_card("❌", "归档失败，请联系管理员。")
+            return P2CardActionTriggerResponse(
+                {"card": {"type": "raw", "data": ack_card}}
+            )
+
+        return P2CardActionTriggerResponse({})
 
     # ------------------------------------------------------------------
     # 健康检查端点

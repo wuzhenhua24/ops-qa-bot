@@ -22,7 +22,9 @@ from .config import AppConfig
 from .feishu_core import (
     FeishuClient,
     SessionManager,
+    _archive_ack_card,
     _feedback_ack_card,
+    handle_archive_submit,
     handle_feedback_click,
     handle_question,
 )
@@ -200,30 +202,51 @@ def create_app(config: AppConfig) -> FastAPI:
 
         action = payload.get("action") or {}
         value = action.get("value") or {}
-        if value.get("action") != "feedback":
-            return {}  # 其他类型的按钮暂不处理
-
-        qid = value.get("qid")
-        rating = value.get("rating")
+        action_name = value.get("action")
         clicker_id = payload.get("open_id") or payload.get("user_id")
-        if not qid or rating not in ("up", "down"):
-            return {}
+        msg_id = payload.get("open_message_id") or ""
 
-        # 去重：卡片回调同样会重试（无 event_id，用 message + qid + 点击人 + 方向作组合键）。
-        click_key = f"{payload.get('open_message_id')}|{qid}|{clicker_id}|{rating}"
-        if click_key in seen_clicks:
-            logger.info("duplicate card click, skip: key=%s", click_key)
-            return {"card": _feedback_ack_card(rating)}
-        seen_clicks[click_key] = True
+        if action_name == "feedback":
+            qid = value.get("qid")
+            rating = value.get("rating")
+            if not qid or rating not in ("up", "down"):
+                return {}
+            # 去重：卡片回调同样会重试（无 event_id，用 message + qid + 点击人 + 方向作组合键）。
+            click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
+            if click_key in seen_clicks:
+                logger.info("duplicate card click, skip: key=%s", click_key)
+                return {"card": _feedback_ack_card(rating)}
+            seen_clicks[click_key] = True
+            ack_card = handle_feedback_click(
+                qid=qid,
+                rating=rating,
+                clicker_id=clicker_id,
+                asker_id=value.get("asker_id"),
+            )
+            # 返回新卡片替换原按钮卡片（防止重复点击）
+            return {"card": ack_card}
 
-        ack_card = handle_feedback_click(
-            qid=qid,
-            rating=rating,
-            clicker_id=clicker_id,
-            asker_id=value.get("asker_id"),
-        )
-        # 返回新卡片替换原按钮卡片（防止重复点击）
-        return {"card": ack_card}
+        if action_name == "archive_submit":
+            qid = value.get("qid")
+            form_value = action.get("form_value") or {}
+            answer = form_value.get("answer") or ""
+            click_key = f"{msg_id}|archive|{qid}|{clicker_id}"
+            if click_key in seen_clicks:
+                logger.info("duplicate archive submit, skip: key=%s", click_key)
+                return {
+                    "card": {
+                        "type": "raw",
+                        "data": _archive_ack_card("ℹ️", "已处理。"),
+                    }
+                }
+            seen_clicks[click_key] = True
+            ack_card = await handle_archive_submit(
+                qid, answer, clicker_id, docs_root
+            )
+            # v2 卡片用 type:raw 包一层，确保飞书按 v2 渲染
+            return {"card": {"type": "raw", "data": ack_card}}
+
+        return {}  # 其他类型的按钮暂不处理
 
     @app.get("/healthz")
     async def healthz():

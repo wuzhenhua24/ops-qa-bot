@@ -39,8 +39,19 @@ SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 # handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
 # 只接受形如 ou_xxxx 或字面量 none 两种值，防止注入。
 _ESCALATE_RE = re.compile(r"<<ESCALATE:(ou_[A-Za-z0-9_-]+|none)>>")
+_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
 _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
+
+# 归档机制：bot 升级到负责人后，同时发一张表单卡（card v2 form）。
+# 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md。
+# qid → {chat_id, asker_id, question, owner_id, component_dir}。
+# 24h 没人填写就过期，重启后清空（测试环境不持久化）。
+_pending_archives: TTLCache = TTLCache(maxsize=1000, ttl=86400)
+# INDEX.md 解析缓存：路径 → (mtime, {open_id: 目录名})
+_archive_index_cache: dict[Path, tuple[float, dict[str, str]]] = {}
+# 每个归档文件一把 asyncio.Lock，避免并发提交撕裂内容
+_archive_locks: dict[Path, asyncio.Lock] = {}
 
 
 class FeishuClient:
@@ -232,6 +243,10 @@ class SessionManager:
     def idle_ttl(self) -> float:
         return self._idle_ttl
 
+    @property
+    def docs_root(self) -> Path:
+        return self._docs_root
+
     async def snapshot(self) -> list[dict]:
         """当前活跃 session 的只读快照，按空闲时长升序（最新活跃在前）。"""
         now = time.time()
@@ -349,6 +364,249 @@ def _append_escalate_at(post: dict, owner_id: str) -> None:
     )
 
 
+def _index_owner_to_dir(docs_root: Path) -> dict[str, str]:
+    """解析 docs_root/INDEX.md 的"组件目录"表 → {open_id: 目录名}。
+
+    依赖 mtime 缓存：文件没改就直接返回上次的结果。
+    解析容错：表头需要同时含"目录"和"open_id"两列；分隔行（|---|）跳过；
+    open_id 列必须形如 ou_xxx 才录入，目录列允许 backtick / 末尾 `/`。
+    """
+    index_path = docs_root / "INDEX.md"
+    try:
+        mtime = index_path.stat().st_mtime
+    except FileNotFoundError:
+        return {}
+    cached = _archive_index_cache.get(index_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    mapping: dict[str, str] = {}
+    in_table = False
+    dir_idx = -1
+    open_id_idx = -1
+    try:
+        with index_path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line.startswith("|"):
+                    if in_table:
+                        break
+                    continue
+                cols = [c.strip() for c in line.strip("|").split("|")]
+                if not in_table:
+                    if "目录" in cols and "open_id" in cols:
+                        dir_idx = cols.index("目录")
+                        open_id_idx = cols.index("open_id")
+                        in_table = True
+                    continue
+                # 分隔行 |---|---|
+                if all(set(c) <= set("-: ") and c for c in cols):
+                    continue
+                if max(dir_idx, open_id_idx) >= len(cols):
+                    continue
+                dir_cell = cols[dir_idx].strip("`").strip().rstrip("/")
+                open_id_cell = cols[open_id_idx].strip("`").strip()
+                if not dir_cell or not _OPEN_ID_RE.match(open_id_cell):
+                    continue
+                mapping[open_id_cell] = dir_cell
+    except OSError as e:
+        logger.warning("read INDEX.md for archive mapping failed: %s", e)
+        return _archive_index_cache.get(index_path, (0.0, {}))[1]
+
+    _archive_index_cache[index_path] = (mtime, mapping)
+    return mapping
+
+
+def _archive_form_card(
+    qid: str, question: str, owner_id: str, archive_path_repr: str
+) -> dict:
+    """归档表单卡（card v2 form）：展示问题 + 多行答案输入框 + 提交按钮。
+
+    archive_path_repr：展示给 owner 的相对路径（如 "redis/qa-archive.md"），
+    让他知道答案会落到哪个文件再决定写多详细。
+    """
+    return {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "📝 问答归档"},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**Q:** {_excerpt(question, 300)}\n\n"
+                        f"<at id={owner_id}></at> 答完后请把整理过的答案填进下方输入框，"
+                        f"提交后会追加进 `{archive_path_repr}`。"
+                    ),
+                },
+                {
+                    "tag": "form",
+                    "name": "archive_form",
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": "answer",
+                            "input_type": "multiline_text",
+                            "rows": 6,
+                            "max_length": 10000,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "粘贴整理后的答案文本…",
+                            },
+                            "required": True,
+                            "label": {"tag": "plain_text", "content": "答案"},
+                            "label_position": "top",
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "提交并归档"},
+                            "type": "primary",
+                            "action_type": "form_submit",
+                            "name": "submit_btn",
+                            "value": {"action": "archive_submit", "qid": qid},
+                        },
+                    ],
+                },
+            ]
+        },
+    }
+
+
+def _archive_ack_card(icon: str, message: str) -> dict:
+    """提交后用来替换原表单卡的提示卡（card v2，纯文本）。"""
+    return {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": f"{icon} {message}"},
+            ]
+        },
+    }
+
+
+async def _write_qa_archive(
+    file_path: Path,
+    qid: str,
+    question: str,
+    answer: str,
+    owner_id: str,
+    asker_id: str | None,
+) -> bool:
+    """append-only 写一条 Q&A。已存在 qid 跳过返回 False，写入返回 True。
+
+    每个 file_path 一把 asyncio.Lock，并发归档不会撕裂；幂等键是 `qid: <id>`
+    字符串在文件里的存在与否，省得维护单独索引。
+    """
+    lock = _archive_locks.setdefault(file_path, asyncio.Lock())
+    async with lock:
+        existing = ""
+        if file_path.is_file():
+            try:
+                existing = file_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError as e:
+                logger.warning("read qa-archive failed: path=%s err=%s", file_path, e)
+        if f"qid: {qid}" in existing:
+            return False
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+        meta_parts = [f"回答者：<@{owner_id}>", ts, f"qid: {qid}"]
+        if asker_id:
+            meta_parts.append(f"提问者：<@{asker_id}>")
+        block = (
+            f"\n## Q: {question.strip()}\n\n"
+            f"*{' · '.join(meta_parts)}*\n\n"
+            f"{answer.strip()}\n\n"
+            f"---\n"
+        )
+        with file_path.open("a", encoding="utf-8") as f:
+            f.write(block)
+        return True
+
+
+async def handle_archive_submit(
+    qid: str | None,
+    answer: str,
+    clicker_id: str | None,
+    docs_root: Path,
+) -> dict:
+    """处理归档表单提交。返回应替换原表单卡的 ack 卡片（card v2）。
+
+    所有失败路径（参数缺失、过期、非负责人点击、空答案、写盘异常）都
+    用 ack 卡片告诉点击者，原卡片被替换，避免重复提交困惑。
+    """
+    if not qid:
+        return _archive_ack_card("⚠️", "归档参数缺失，请联系管理员。")
+    ctx = _pending_archives.get(qid)
+    if ctx is None:
+        return _archive_ack_card(
+            "⏰", "归档会话已过期或已处理，请联系管理员手动补记。"
+        )
+
+    expected_owner = ctx["owner_id"]
+    if clicker_id and clicker_id != expected_owner:
+        return _archive_ack_card(
+            "🔒", f"只有 <at id={expected_owner}></at> 能归档此问答。"
+        )
+
+    answer_text = (answer or "").strip()
+    if not answer_text:
+        return _archive_ack_card("⚠️", "答案不能为空，请填写后再提交。")
+    if len(answer_text) > 10_000:
+        return _archive_ack_card("⚠️", "答案过长（>10KB），请精简后再提交。")
+
+    component_dir = ctx.get("component_dir")
+    if component_dir:
+        file_path = docs_root / component_dir / "qa-archive.md"
+    else:
+        file_path = docs_root / "qa-archive.md"
+
+    try:
+        wrote = await _write_qa_archive(
+            file_path=file_path,
+            qid=qid,
+            question=ctx["question"],
+            answer=answer_text,
+            owner_id=expected_owner,
+            asker_id=ctx.get("asker_id"),
+        )
+    except Exception as e:
+        logger.exception("archive write failed: qid=%s path=%s", qid, file_path)
+        return _archive_ack_card("❌", f"归档写入失败：{e}")
+
+    # 完成（写入或幂等命中）：从 pending 里清掉，避免重复处理
+    _pending_archives.pop(qid, None)
+
+    try:
+        rel = file_path.relative_to(docs_root)
+    except ValueError:
+        rel = file_path
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "archive",
+                "qid": qid,
+                "owner_id": expected_owner,
+                "asker_id": ctx.get("asker_id"),
+                "path": str(rel),
+                "answer_excerpt": _excerpt(answer_text, 500),
+                "duplicate": not wrote,
+            },
+            ensure_ascii=False,
+        )
+    )
+    logger.info(
+        "archive written: qid=%s path=%s duplicate=%s", qid, rel, not wrote
+    )
+
+    if wrote:
+        return _archive_ack_card("✅", f"已归档至 `{rel}`，谢谢！")
+    return _archive_ack_card(
+        "ℹ️", f"该 qid 的归档已存在（`{rel}`），跳过。"
+    )
+
+
 async def handle_question(
     chat_id: str,
     user_id: str,
@@ -394,6 +652,7 @@ async def handle_question(
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
     answer, escalate_owner = _parse_escalate(answer)
     final_post = _mention_post(user_id, answer)
+    escalated_now = False
     if escalate_owner is not None:
         cooldown_key = (chat_id, escalate_owner)
         if cooldown_key in _escalate_cooldown:
@@ -405,9 +664,13 @@ async def handle_question(
         else:
             _escalate_cooldown[cooldown_key] = True
             _append_escalate_at(final_post, escalate_owner)
+            escalated_now = True
             logger.info(
                 "escalated to owner: chat=%s owner=%s", chat_id, escalate_owner
             )
+
+    # qid 提前生成：反馈卡 + 归档表单卡都需要它做关联
+    qid = uuid.uuid4().hex[:12]
 
     # 3. 用最终答案替换占位；编辑失败则兜底发新消息
     if placeholder_mid is not None:
@@ -420,8 +683,7 @@ async def handle_question(
     else:
         await feishu.send_post(chat_id, final_post)
 
-    # 4. 发反馈卡片并记录问答（qid 用来关联后续的反馈事件）
-    qid = uuid.uuid4().hex[:12]
+    # 4. 记录问答日志
     qa_record: dict[str, object] = {
         "event": "qa",
         "qid": qid,
@@ -441,7 +703,35 @@ async def handle_question(
         qa_record["duration_ms"] = result.duration_ms
         qa_record["duration_api_ms"] = result.duration_api_ms
     feedback_logger.info(json.dumps(qa_record, ensure_ascii=False))
+
+    # 5. 反馈卡（每次都发）
     await feishu.send_interactive(chat_id, _feedback_card(qid, user_id))
+
+    # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
+    if escalated_now:
+        component_dir = _index_owner_to_dir(session_mgr.docs_root).get(
+            escalate_owner or ""
+        )
+        archive_path_repr = (
+            f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
+        )
+        _pending_archives[qid] = {
+            "chat_id": chat_id,
+            "asker_id": user_id,
+            "question": question,
+            "owner_id": escalate_owner,
+            "component_dir": component_dir,
+        }
+        await feishu.send_interactive(
+            chat_id,
+            _archive_form_card(qid, question, escalate_owner, archive_path_repr),
+        )
+        logger.info(
+            "archive form sent: qid=%s owner=%s target=%s",
+            qid,
+            escalate_owner,
+            archive_path_repr,
+        )
 
 
 def handle_feedback_click(
