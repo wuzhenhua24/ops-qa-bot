@@ -153,10 +153,12 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 - **问答留档**：被升级到负责人的问题，bot 会同时发一张表单卡片。负责人在群里正常作答给提问者看到的同时，把整理过的答案填进卡片提交，bot 自动追加进 `docs/<component>/qa-archive.md`（按 `INDEX.md` 反查组件目录，查不到落到 `docs/qa-archive.md`）。下次再有人问类似问题，RAG 会从这里找到答案，文档库自然滚雪球。每条带 `qid` 字段，可通过 `logs/feedback.log` 里 `event=archive` 的记录追溯。
 - **健康检查**：HTTP 模式自带 `/healthz` 和 `/admin/sessions`；长连接模式额外启动一个本地小 HTTP 服务（默认 `127.0.0.1:8001`）暴露 `/healthz` / `/readyz` / `/admin/sessions`，方便接 Prometheus、k8s 探针、内网监控脚本。`/readyz` 检查 WS 客户端线程是否还在跑，挂了返回 503；事件计数 / 上次事件时间作为观测字段返回，不参与 ready 判定。详见 `deploy/README.md`。
 - **占位消息**：收到提问后**立即**发送 `🔍 正在翻文档，请稍候...` 作为占位，答案生成完后通过飞书编辑消息 API（`PUT /im/v1/messages/{mid}`）把占位替换成最终答案。用户立刻感知 bot 已接到、不会以为 @ 掉了。编辑失败时自动兜底发新消息。
+- **快捷追问**：答完后 LLM 按问题类型挑 1-3 个追问按钮挂上反馈卡（如故障类挂"排查步骤/风险点/示例命令"，变更类挂"回滚方案/风险点/示例命令"），用户一键即发起新一轮，把对话自然带进下一轮。可选项库 6 个，prompt 端枚举给 LLM 选；标记 `<<FOLLOWUPS:k1|k2|k3>>` 写在答案末尾，bot 解析剥离后渲染按钮，注入防御靠 key 白名单。仅原提问者能点（开放给整群会乱）。
 - **反馈收集**：答案后紧跟一条 interactive 卡片，带 👍 / 👎 两个按钮。用户点击 → 飞书回调 `/feishu/card` → 服务侧记录 + 返回新卡片替换按钮（防重复点击）。点 👎 时会再弹一张 v2 表单卡，让用户从 5 类原因（文档过时 / 步骤不完整 / 事实错误 / 答案啰嗦 / 其他）里选一个，可附备注；用户填完点提交或跳过都计入日志。问答和反馈都落在 `logs/feedback.log`，每行 JSON，用 `qid` 关联：
 
   ```
   2026-04-24 ... {"event": "qa", "qid": "abc123", ...}
+  2026-04-24 ... {"event": "followup", "qid": "abc123", "key": "rollback", "label": "↩️ 回滚方案", "asker_id": "...", "clicker_id": "..."}
   2026-04-24 ... {"event": "feedback", "qid": "abc123", "rating": "down", "clicker_id": "...", "asker_id": "..."}
   2026-04-24 ... {"event": "feedback_reason", "qid": "abc123", "reason": "outdated", "reason_label": "文档过时", "comment": "示例命令是旧版的", "clicker_id": "...", "invalid": false}
   2026-04-24 ... {"event": "archive", "qid": "abc123", "owner_id": "...", "path": "redis/qa-archive.md", ...}

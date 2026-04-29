@@ -25,10 +25,14 @@ from .feishu_core import (
     _archive_ack_card,
     _feedback_ack_card,
     _feedback_reason_form_card,
+    _FOLLOWUP_LIBRARY,
+    _followup_ack_card,
+    _followup_error_card,
     handle_archive_submit,
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
+    handle_followup_click,
     handle_question,
 )
 from .feishu_crypto import FeishuCrypto
@@ -254,6 +258,26 @@ def create_app(config: AppConfig) -> FastAPI:
                 ack_card = handle_feedback_reason_submit(
                     qid, reason, comment, clicker_id, asker_id
                 )
+            return {"card": {"type": "raw", "data": ack_card}}
+
+        if action_name == "followup":
+            qid = value.get("qid")
+            key = value.get("key")
+            chat_id_v = value.get("chat_id")
+            asker_id = value.get("asker_id")
+            click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
+            if click_key in seen_clicks:
+                logger.info("duplicate followup click, skip: key=%s", click_key)
+                # 重放：用同样 label 的 ack（key 失效就报错卡）
+                if key in _FOLLOWUP_LIBRARY:
+                    replay = _followup_ack_card(_FOLLOWUP_LIBRARY[key][0])
+                else:
+                    replay = _followup_error_card("追问类型无效。")
+                return {"card": {"type": "raw", "data": replay}}
+            seen_clicks[click_key] = True
+            ack_card = await handle_followup_click(
+                qid, key, chat_id_v, asker_id, clicker_id, feishu, session_mgr
+            )
             return {"card": {"type": "raw", "data": ack_card}}
 
         if action_name == "archive_submit":

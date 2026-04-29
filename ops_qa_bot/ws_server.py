@@ -40,10 +40,14 @@ from .feishu_core import (
     _archive_ack_card,
     _feedback_ack_card,
     _feedback_reason_form_card,
+    _FOLLOWUP_LIBRARY,
+    _followup_ack_card,
+    _followup_error_card,
     handle_archive_submit,
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
+    handle_followup_click,
     handle_question,
 )
 from .health_server import HealthServer
@@ -227,6 +231,52 @@ class WsRunner:
                 ack_card = handle_feedback_reason_submit(
                     qid, reason, comment, clicker_id, asker_id
                 )
+            return P2CardActionTriggerResponse(
+                {"card": {"type": "raw", "data": ack_card}}
+            )
+
+        if action_name == "followup":
+            qid = value.get("qid")
+            key = value.get("key")
+            chat_id_v = value.get("chat_id")
+            asker_id = value.get("asker_id")
+            click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
+            if click_key in self._seen_clicks:
+                logger.info("duplicate followup click, skip: key=%s", click_key)
+                if key in _FOLLOWUP_LIBRARY:
+                    replay = _followup_ack_card(_FOLLOWUP_LIBRARY[key][0])
+                else:
+                    replay = _followup_error_card("追问类型无效。")
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": replay}}
+                )
+            self._seen_clicks[click_key] = True
+            if self._loop is None:
+                return P2CardActionTriggerResponse(
+                    {
+                        "card": {
+                            "type": "raw",
+                            "data": _followup_error_card("服务未就绪，请稍后再试。"),
+                        }
+                    }
+                )
+            fut = asyncio.run_coroutine_threadsafe(
+                handle_followup_click(
+                    qid,
+                    key,
+                    chat_id_v,
+                    asker_id,
+                    clicker_id,
+                    self._feishu,
+                    self._session_mgr,
+                ),
+                self._loop,
+            )
+            try:
+                ack_card = fut.result(timeout=5)
+            except Exception:
+                logger.exception("followup click failed: qid=%s key=%s", qid, key)
+                ack_card = _followup_error_card("追问触发失败，请重试。")
             return P2CardActionTriggerResponse(
                 {"card": {"type": "raw", "data": ack_card}}
             )

@@ -43,6 +43,39 @@ _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
 _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
 
+# 快捷追问机制：bot 答完后按 prompt 输出 <<FOLLOWUPS:k1|k2|k3>> 标记，
+# handle_question 解析 → 在反馈卡上面挂对应按钮。点击 → 用预设 prompt
+# 触发新一轮 handle_question，把用户自然带进下一轮。
+# key 必须出自 _FOLLOWUP_LIBRARY；最多 3 个；不在白名单的 key 静默过滤。
+# 抓取宽松（含数字/大小写都先收下），合法性靠 _FOLLOWUP_LIBRARY 白名单过滤
+_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([\w|]+)>>")
+_FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
+    "troubleshoot": (
+        "📋 排查步骤",
+        "把刚才的内容整理成具体的排查步骤，按顺序列出每一步要查什么、用什么命令、看哪个指标判断。",
+    ),
+    "risks": (
+        "⚠️ 风险点",
+        "做这件事有哪些风险点和注意事项？特别是不可逆操作或可能影响其他业务的地方。",
+    ),
+    "rollback": (
+        "↩️ 回滚方案",
+        "如果按上面的方案做完发现有问题，怎么回滚？给出具体步骤和回滚后的检查清单。",
+    ),
+    "checklist": (
+        "✅ Checklist",
+        "把上面的内容总结成一个可勾选的 checklist，每条尽量短、可执行。",
+    ),
+    "commands": (
+        "💻 示例命令",
+        "给出可以直接复制运行的命令示例，每条带一行注释说明用途和参数含义。",
+    ),
+    "related": (
+        "🔗 相关文档",
+        "还有哪些相关的运维文档（INDEX 里登记的或没登记的）我可能需要看？给出文件路径。",
+    ),
+}
+
 # 归档机制：bot 升级到负责人后，同时发一张表单卡（card v2 form）。
 # 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md。
 # qid → {chat_id, asker_id, question, owner_id, component_dir}。
@@ -277,44 +310,182 @@ def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -
     return post
 
 
-def _feedback_card(qid: str, user_id: str) -> dict:
-    """问答结束后附带的反馈卡片：👍 / 👎 两个按钮。"""
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": [
+def _feedback_card(
+    qid: str,
+    user_id: str,
+    chat_id: str,
+    followup_keys: list[str] | None = None,
+) -> dict:
+    """问答结束后附带的反馈卡片：（可选）追问按钮 + 👍 / 👎。
+
+    `followup_keys` 来自 LLM 输出的 `<<FOLLOWUPS:...>>` 标记，已过滤到白名单内、
+    最多 3 个。每个 button value 自带 chat_id，避免回调时依赖 context 字段。
+    """
+    elements: list[dict] = []
+    if followup_keys:
+        elements.append(
             {
                 "tag": "div",
-                "text": {"tag": "lark_md", "content": "这次回答是否有帮助？"},
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "👍 有帮助"},
-                        "type": "primary",
-                        "value": {
-                            "action": "feedback",
-                            "qid": qid,
-                            "rating": "up",
-                            "asker_id": user_id,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "👎 待改进"},
-                        "type": "default",
-                        "value": {
-                            "action": "feedback",
-                            "qid": qid,
-                            "rating": "down",
-                            "asker_id": user_id,
-                        },
-                    },
-                ],
+                "text": {"tag": "lark_md", "content": "**想再深入？**"},
             }
-        ],
+        )
+        followup_btns: list[dict] = []
+        for k in followup_keys:
+            label, _ = _FOLLOWUP_LIBRARY[k]
+            followup_btns.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": "default",
+                    "value": {
+                        "action": "followup",
+                        "qid": qid,
+                        "key": k,
+                        "asker_id": user_id,
+                        "chat_id": chat_id,
+                    },
+                }
+            )
+        elements.append({"tag": "action", "actions": followup_btns})
+        elements.append({"tag": "hr"})
+    elements.append(
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "这次回答是否有帮助？"},
+        }
+    )
+    elements.append(
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "👍 有帮助"},
+                    "type": "primary",
+                    "value": {
+                        "action": "feedback",
+                        "qid": qid,
+                        "rating": "up",
+                        "asker_id": user_id,
+                    },
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "👎 待改进"},
+                    "type": "default",
+                    "value": {
+                        "action": "feedback",
+                        "qid": qid,
+                        "rating": "down",
+                        "asker_id": user_id,
+                    },
+                },
+            ],
+        }
+    )
+    return {
+        "config": {"wide_screen_mode": True},
+        "elements": elements,
     }
+
+
+def _parse_followups(answer: str) -> tuple[str, list[str]]:
+    """从答案抽 <<FOLLOWUPS:k1|k2|k3>> 标记，返回 (清理后的答案, 合法 key 列表)。
+
+    最多保留 3 个；不在 _FOLLOWUP_LIBRARY 里的 key 静默过滤；去重。
+    没有标记返回 (原文, [])。
+    """
+    m = _FOLLOWUPS_RE.search(answer)
+    if not m:
+        return answer, []
+    cleaned = _FOLLOWUPS_RE.sub("", answer).strip()
+    valid: list[str] = []
+    for k in (k.strip() for k in m.group(1).split("|")):
+        if k and k in _FOLLOWUP_LIBRARY and k not in valid:
+            valid.append(k)
+        if len(valid) >= 3:
+            break
+    return cleaned, valid
+
+
+def _followup_ack_card(label: str) -> dict:
+    """点完追问按钮后用来替换原反馈卡的状态卡（v2）。
+
+    UI 层面：原卡（含 👍/👎 + 追问按钮）整张被替换；用户想反馈得在点追问前点。
+    """
+    return {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"✅ 已发起追问：**{label}** —— 正在生成…",
+                }
+            ]
+        },
+    }
+
+
+def _followup_error_card(message: str) -> dict:
+    return {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": f"⚠️ {message}"},
+            ]
+        },
+    }
+
+
+async def handle_followup_click(
+    qid: str | None,
+    key: str | None,
+    chat_id: str | None,
+    asker_id: str | None,
+    clicker_id: str | None,
+    feishu: "FeishuClient",
+    session_mgr: "SessionManager",
+) -> dict:
+    """处理快捷追问按钮点击。后台触发新一轮 handle_question，立即返回 ack 卡。
+
+    校验：key 在白名单 / chat_id+asker_id 都存在 / 点击者就是原提问者。
+    任何校验失败都返回错误卡，不触发后续答题。
+    """
+    if not key or key not in _FOLLOWUP_LIBRARY:
+        return _followup_error_card("追问类型无效，请重试。")
+    if not chat_id or not asker_id:
+        return _followup_error_card("追问参数缺失，请重试。")
+    if clicker_id and clicker_id != asker_id:
+        return _followup_error_card(
+            f"只有 <at id={asker_id}></at> 能点这个追问，要追问请重新发一条消息。"
+        )
+
+    label, prompt_text = _FOLLOWUP_LIBRARY[key]
+    # 后台跑新一轮答题：卡片回调要求秒级返回，不能等 5-15s 的 LLM 推理
+    asyncio.create_task(
+        handle_question(chat_id, asker_id, prompt_text, feishu, session_mgr)
+    )
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "followup",
+                "qid": qid,
+                "key": key,
+                "label": label,
+                "asker_id": asker_id,
+                "clicker_id": clicker_id,
+            },
+            ensure_ascii=False,
+        )
+    )
+    logger.info(
+        "followup triggered: qid=%s key=%s chat=%s asker=%s",
+        qid,
+        key,
+        chat_id,
+        asker_id,
+    )
+    return _followup_ack_card(label)
 
 
 def _feedback_ack_card(rating: str, clicker_name: str | None = None) -> dict:
@@ -761,6 +932,8 @@ async def handle_question(
 
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
     answer, escalate_owner = _parse_escalate(answer)
+    # 解析快捷追问标记，挂在反馈卡上面让用户一键发起新一轮
+    answer, followup_keys = _parse_followups(answer)
     final_post = _mention_post(user_id, answer)
     escalated_now = False
     if escalate_owner is not None:
@@ -814,8 +987,10 @@ async def handle_question(
         qa_record["duration_api_ms"] = result.duration_api_ms
     feedback_logger.info(json.dumps(qa_record, ensure_ascii=False))
 
-    # 5. 反馈卡（每次都发）
-    await feishu.send_interactive(chat_id, _feedback_card(qid, user_id))
+    # 5. 反馈卡（每次都发，含可选的快捷追问按钮）
+    await feishu.send_interactive(
+        chat_id, _feedback_card(qid, user_id, chat_id, followup_keys)
+    )
 
     # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
     if escalated_now:
