@@ -123,6 +123,7 @@ class WsRunner:
 
         chat_id = msg.chat_id
         sender_id = sender.sender_id.open_id if sender.sender_id else None
+        msg_id = getattr(msg, "message_id", None)
         if not chat_id or not sender_id:
             return
 
@@ -148,7 +149,12 @@ class WsRunner:
             return
         asyncio.run_coroutine_threadsafe(
             handle_question(
-                chat_id, sender_id, question, self._feishu, self._session_mgr
+                chat_id,
+                sender_id,
+                question,
+                self._feishu,
+                self._session_mgr,
+                parent_msg_id=msg_id,
             ),
             self._loop,
         )

@@ -41,33 +41,40 @@ from .logging_config import request_id_var
 logger = logging.getLogger("ops_qa_bot.feishu.http")
 
 
-def _extract_event(event: dict) -> tuple[str | None, str | None, str | None]:
-    """从飞书事件抽出 (chat_id, sender_open_id, question)。不是有效文本消息返回全 None。"""
+def _extract_event(
+    event: dict,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """从飞书事件抽出 (chat_id, sender_open_id, question, message_id)。
+
+    message_id 用于让 bot 后续所有消息都"引用回复"这条原消息，连发多问时归属清晰。
+    不是有效文本消息返回全 None。
+    """
     msg = event.get("message") or {}
     if msg.get("message_type") != "text":
-        return None, None, None
+        return None, None, None, None
     chat_id = msg.get("chat_id")
+    msg_id = msg.get("message_id")
 
     sender = event.get("sender") or {}
     # 只处理真人发送的消息：过滤 sender_type != "user"，避免其他 bot 转发、
     # 应用广播、甚至多 bot 群里互相 @ 形成的消息环路触发答题。
     if sender.get("sender_type") != "user":
-        return None, None, None
+        return None, None, None, None
     sender_id = (sender.get("sender_id") or {}).get("open_id")
     if not chat_id or not sender_id:
-        return None, None, None
+        return None, None, None, None
 
     try:
         content = json.loads(msg.get("content") or "{}")
     except json.JSONDecodeError:
-        return None, None, None
+        return None, None, None, None
     question = (content.get("text") or "").strip()
     # 群聊里去掉 @bot 的提及占位符
     for mention in msg.get("mentions") or []:
         key = mention.get("key")
         if key:
             question = question.replace(key, "").strip()
-    return chat_id, sender_id, (question or None)
+    return chat_id, sender_id, (question or None), msg_id
 
 
 def create_app(config: AppConfig) -> FastAPI:
@@ -112,8 +119,17 @@ def create_app(config: AppConfig) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan)
 
-    async def process_question(chat_id: str, user_id: str, question: str) -> None:
-        await handle_question(chat_id, user_id, question, feishu, session_mgr)
+    async def process_question(
+        chat_id: str, user_id: str, question: str, parent_msg_id: str | None
+    ) -> None:
+        await handle_question(
+            chat_id,
+            user_id,
+            question,
+            feishu,
+            session_mgr,
+            parent_msg_id=parent_msg_id,
+        )
 
     def _check_verify_token(payload: dict) -> None:
         if not verify_token:
@@ -171,7 +187,7 @@ def create_app(config: AppConfig) -> FastAPI:
 
         # 4. 解析消息事件（v2 格式）
         event = payload.get("event") or {}
-        chat_id, sender_id, question = _extract_event(event)
+        chat_id, sender_id, question, msg_id = _extract_event(event)
         if not chat_id or not sender_id or not question:
             return {"code": 0}
 
@@ -182,7 +198,7 @@ def create_app(config: AppConfig) -> FastAPI:
             question[:80],
         )
         # 5. 后台处理，立即返回（飞书要求 3 秒内响应）
-        background.add_task(process_question, chat_id, sender_id, question)
+        background.add_task(process_question, chat_id, sender_id, question, msg_id)
         return {"code": 0}
 
     @app.post("/feishu/card")

@@ -31,7 +31,19 @@ feedback_logger = logging.getLogger("ops_qa_bot.feedback")
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
 POST_TITLE = "运维文档助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
-PLACEHOLDER_MARKDOWN = "🔍 正在翻文档，请稍候..."
+
+
+def _placeholder_text(question: str, queued: bool) -> str:
+    """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
+
+    queued=True 表示当前 session 锁被前一条问题占着，本条还没开始跑，前缀用
+    🕒 排队中；获取到锁开始跑时上层会再 update 一次置成 🔍 翻文档中。
+    """
+    excerpt = question.strip().replace("\n", " ")
+    if len(excerpt) > 40:
+        excerpt = excerpt[:40] + "…"
+    icon = "🕒 排队中" if queued else "🔍 翻文档中"
+    return f"{icon}：'{excerpt}'"
 
 SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 
@@ -119,37 +131,72 @@ class FeishuClient:
             self._token_expires_at = now + int(data.get("expire", 7200))
             return self._token
 
-    async def _send(self, chat_id: str, msg_type: str, content: dict) -> str | None:
-        """发消息。成功返回 message_id，失败返回 None（已打日志）。"""
+    async def _send(
+        self,
+        chat_id: str,
+        msg_type: str,
+        content: dict,
+        *,
+        parent_id: str | None = None,
+    ) -> str | None:
+        """发消息。成功返回 message_id，失败返回 None（已打日志）。
+
+        `parent_id` 给定时走 reply 端点（飞书"引用回复"），消息头部带原消息引用条；
+        不给定时走普通 send 端点。reply 端点的 chat 默认就是父消息所在 chat，不再
+        需要 receive_id。
+        """
         async with httpx.AsyncClient(timeout=10) as client:
             token = await self._get_token(client)
-            resp = await client.post(
-                f"{FEISHU_BASE}/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
-                headers={"Authorization": f"Bearer {token}"},
-                json={
+            if parent_id:
+                url = f"{FEISHU_BASE}/im/v1/messages/{parent_id}/reply"
+                params = None
+                payload = {
+                    "msg_type": msg_type,
+                    "content": json.dumps(content, ensure_ascii=False),
+                    "reply_in_thread": False,  # 引用回复，不开 thread 模式
+                }
+            else:
+                url = f"{FEISHU_BASE}/im/v1/messages"
+                params = {"receive_id_type": "chat_id"}
+                payload = {
                     "receive_id": chat_id,
                     "msg_type": msg_type,
                     "content": json.dumps(content, ensure_ascii=False),
-                },
+                }
+            resp = await client.post(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
             )
             body = resp.json() if resp.content else {}
             if resp.status_code != 200 or body.get("code") != 0:
                 logger.error(
-                    "feishu send(%s) failed: status=%s body=%s",
+                    "feishu send(%s, parent=%s) failed: status=%s body=%s",
                     msg_type,
+                    parent_id,
                     resp.status_code,
                     resp.text,
                 )
                 return None
             return (body.get("data") or {}).get("message_id")
 
-    async def send_text(self, chat_id: str, text: str) -> str | None:
-        return await self._send(chat_id, "text", {"text": text})
+    async def send_text(
+        self, chat_id: str, text: str, *, parent_id: str | None = None
+    ) -> str | None:
+        return await self._send(chat_id, "text", {"text": text}, parent_id=parent_id)
 
-    async def send_post(self, chat_id: str, post_content: dict) -> str | None:
+    async def send_post(
+        self,
+        chat_id: str,
+        post_content: dict,
+        *,
+        parent_id: str | None = None,
+    ) -> str | None:
         """post_content 结构见 feishu_format.markdown_to_feishu_post。"""
-        return await self._send(chat_id, "post", post_content)
+        return await self._send(
+            chat_id, "post", post_content, parent_id=parent_id
+        )
 
     async def update_post(self, message_id: str, post_content: dict) -> bool:
         """编辑已发送的 post 消息。要求 im:message 权限。
@@ -177,9 +224,13 @@ class FeishuClient:
                 return False
             return True
 
-    async def send_interactive(self, chat_id: str, card: dict) -> str | None:
+    async def send_interactive(
+        self, chat_id: str, card: dict, *, parent_id: str | None = None
+    ) -> str | None:
         """发送 interactive 卡片消息，用于反馈收集等交互。"""
-        return await self._send(chat_id, "interactive", card)
+        return await self._send(
+            chat_id, "interactive", card, parent_id=parent_id
+        )
 
 
 class _SessionEntry:
@@ -273,6 +324,18 @@ class SessionManager:
         for key, entry in to_close:
             logger.info("evicting idle session: chat=%s user=%s", *key)
             await self._close_entry(key, entry)
+
+    async def queued(self, key: SessionKey) -> bool:
+        """该 (chat, user) 当前是否有未完成的问题占着 session lock。
+
+        用于占位文本判定：True 表示新进来的问题要排队，前缀用 🕒；False 直接 🔍。
+        不创建 session，纯只读检查。
+        """
+        async with self._manager_lock:
+            entry = self._sessions.get(key)
+            if entry is None:
+                return False
+            return entry.lock.locked()
 
     def active_count(self) -> int:
         return len(self._sessions)
@@ -906,10 +969,17 @@ async def handle_question(
     question: str,
     feishu: FeishuClient,
     session_mgr: SessionManager,
+    *,
+    parent_msg_id: str | None = None,
 ) -> None:
     """处理单条用户提问（完整流程：重置 / 占位 / 答题 / 编辑 / 反馈卡片）。
 
     HTTP 模式和长连接模式都走这里，参数化 feishu 和 session_mgr 以便复用。
+
+    `parent_msg_id` 给定时（来自原始用户消息），所有 bot 发出的消息（占位 / 答案 /
+    反馈卡 / 追问卡 / 归档卡）都会"引用回复"这条原消息，飞书群里每条 bot 消息头部
+    会显示原问题的引用条，连发多条问题时归属一目了然。followup-trigger 走来的不带
+    parent_msg_id（无锚点消息），自然按 top-level 发送。
     """
     key = (chat_id, user_id)
 
@@ -921,12 +991,18 @@ async def handle_question(
             if existed
             else "你当前还没有活跃会话，下一个问题就是新会话。"
         )
-        await feishu.send_post(chat_id, _mention_post(user_id, reply))
+        await feishu.send_post(
+            chat_id, _mention_post(user_id, reply), parent_id=parent_msg_id
+        )
         return
 
-    # 1. 立即发占位消息，让用户感知 bot 已收到（问答生成要 5-15 秒）
+    # 1. 立即发占位消息：带问题摘要 + 排队/翻文档状态前缀，让用户能识别这条占位
+    # 是为哪一句问题、是否在排队等前一条
+    queued = await session_mgr.queued(key)
     placeholder_mid = await feishu.send_post(
-        chat_id, _mention_post(user_id, PLACEHOLDER_MARKDOWN)
+        chat_id,
+        _mention_post(user_id, _placeholder_text(question, queued)),
+        parent_id=parent_msg_id,
     )
 
     # 2. 生成答案
@@ -934,6 +1010,12 @@ async def handle_question(
     try:
         entry = await session_mgr.get(key)
         async with entry.lock:
+            # 拿到锁意味着前面的问题已答完，把占位从"排队中"刷成"翻文档中"
+            if queued and placeholder_mid is not None:
+                await feishu.update_post(
+                    placeholder_mid,
+                    _mention_post(user_id, _placeholder_text(question, False)),
+                )
             result = await entry.bot.answer(question)
             entry.last_used = time.time()
         answer = result.text
@@ -974,16 +1056,16 @@ async def handle_question(
     # qid 提前生成：反馈卡 + 归档表单卡都需要它做关联
     qid = uuid.uuid4().hex[:12]
 
-    # 3. 用最终答案替换占位；编辑失败则兜底发新消息
+    # 3. 用最终答案替换占位；编辑失败则兜底发新消息（也走引用回复维持归属）
     if placeholder_mid is not None:
         if not await feishu.update_post(placeholder_mid, final_post):
             logger.warning(
                 "update placeholder failed (mid=%s), sending new message",
                 placeholder_mid,
             )
-            await feishu.send_post(chat_id, final_post)
+            await feishu.send_post(chat_id, final_post, parent_id=parent_msg_id)
     else:
-        await feishu.send_post(chat_id, final_post)
+        await feishu.send_post(chat_id, final_post, parent_id=parent_msg_id)
 
     # 4. 记录问答日志
     qa_record: dict[str, object] = {
@@ -1012,7 +1094,9 @@ async def handle_question(
     # 反问轮跳过：让用户专注答反问，下一轮按补充信息再答 + 那时再挂反馈/追问
     if not is_clarification:
         await feishu.send_interactive(
-            chat_id, _feedback_card(qid, user_id, chat_id, followup_keys)
+            chat_id,
+            _feedback_card(qid, user_id, chat_id, followup_keys),
+            parent_id=parent_msg_id,
         )
 
     # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
@@ -1033,6 +1117,7 @@ async def handle_question(
         await feishu.send_interactive(
             chat_id,
             _archive_form_card(qid, question, escalate_owner, archive_path_repr),
+            parent_id=parent_msg_id,
         )
         logger.info(
             "archive form sent: qid=%s owner=%s target=%s",
