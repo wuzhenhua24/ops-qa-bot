@@ -378,6 +378,34 @@ def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -
     return post
 
 
+async def handle_unsupported_message(
+    chat_id: str,
+    user_id: str,
+    parent_msg_id: str | None,
+    message_type: str,
+    feishu: "FeishuClient",
+) -> None:
+    """收到非 text 消息（image / file / post / sticker / audio 等）时回一条友好提示。
+
+    不真处理图片 / 文件，只让用户明确知道 bot 看到了但暂不支持文字以外的输入，
+    避免静默丢弃让用户以为 bot 没看见。引用回复到原消息保持线程感。
+    """
+    hint = (
+        "目前只支持文字提问 🙏\n"
+        "图片 / 文件 / 截图请把关键报错或现象用文字描述出来再发，"
+        "比如把截图里的报错关键句敲一遍。"
+    )
+    logger.info(
+        "unsupported message hinted: type=%s chat=%s user=%s",
+        message_type,
+        chat_id,
+        user_id,
+    )
+    await feishu.send_post(
+        chat_id, _mention_post(user_id, hint), parent_id=parent_msg_id
+    )
+
+
 def _feedback_card(qid: str, user_id: str) -> dict:
     """问答结束后附带的反馈卡片：纯 👍 / 👎。
 

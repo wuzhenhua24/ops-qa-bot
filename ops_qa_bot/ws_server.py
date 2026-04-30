@@ -49,6 +49,7 @@ from .feishu_core import (
     handle_feedback_reason_submit,
     handle_followup_click,
     handle_question,
+    handle_unsupported_message,
 )
 from .health_server import HealthServer
 from .logging_config import request_id_var
@@ -116,15 +117,31 @@ class WsRunner:
         sender = data.sender if data else None
         if not msg or not sender:
             return
-        if msg.message_type != "text":
-            return
         if sender.sender_type != "user":
             return
 
         chat_id = msg.chat_id
         sender_id = sender.sender_id.open_id if sender.sender_id else None
         msg_id = getattr(msg, "message_id", None)
-        if not chat_id or not sender_id:
+        message_type = msg.message_type
+        if not chat_id or not sender_id or not message_type:
+            return
+
+        # 非 text 消息（image/file/post/sticker/audio…）：回友好提示，不进答题流程
+        if message_type != "text":
+            logger.info(
+                "non-text message: type=%s chat=%s user=%s",
+                message_type,
+                chat_id,
+                sender_id,
+            )
+            if self._loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    handle_unsupported_message(
+                        chat_id, sender_id, msg_id, message_type, self._feishu
+                    ),
+                    self._loop,
+                )
             return
 
         try:

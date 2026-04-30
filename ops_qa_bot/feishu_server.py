@@ -34,6 +34,7 @@ from .feishu_core import (
     handle_feedback_reason_submit,
     handle_followup_click,
     handle_question,
+    handle_unsupported_message,
 )
 from .feishu_crypto import FeishuCrypto
 from .logging_config import request_id_var
@@ -43,38 +44,41 @@ logger = logging.getLogger("ops_qa_bot.feishu.http")
 
 def _extract_event(
     event: dict,
-) -> tuple[str | None, str | None, str | None, str | None]:
-    """从飞书事件抽出 (chat_id, sender_open_id, question, message_id)。
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """从飞书事件抽出 (chat_id, sender_open_id, question, message_id, message_type)。
 
     message_id 用于让 bot 后续所有消息都"引用回复"这条原消息，连发多问时归属清晰。
-    不是有效文本消息返回全 None。
+    sender 不是真人或缺关键字段时全 None；非 text 消息时 question 为 None 但
+    chat_id/sender_id/msg_id/message_type 仍返回，让 caller 决定是答题还是回不支持提示。
     """
     msg = event.get("message") or {}
-    if msg.get("message_type") != "text":
-        return None, None, None, None
     chat_id = msg.get("chat_id")
     msg_id = msg.get("message_id")
+    message_type = msg.get("message_type")
 
     sender = event.get("sender") or {}
     # 只处理真人发送的消息：过滤 sender_type != "user"，避免其他 bot 转发、
     # 应用广播、甚至多 bot 群里互相 @ 形成的消息环路触发答题。
     if sender.get("sender_type") != "user":
-        return None, None, None, None
+        return None, None, None, None, None
     sender_id = (sender.get("sender_id") or {}).get("open_id")
-    if not chat_id or not sender_id:
-        return None, None, None, None
+    if not chat_id or not sender_id or not message_type:
+        return None, None, None, None, None
+
+    if message_type != "text":
+        return chat_id, sender_id, None, msg_id, message_type
 
     try:
         content = json.loads(msg.get("content") or "{}")
     except json.JSONDecodeError:
-        return None, None, None, None
+        return chat_id, sender_id, None, msg_id, message_type
     question = (content.get("text") or "").strip()
     # 群聊里去掉 @bot 的提及占位符
     for mention in msg.get("mentions") or []:
         key = mention.get("key")
         if key:
             question = question.replace(key, "").strip()
-    return chat_id, sender_id, (question or None), msg_id
+    return chat_id, sender_id, (question or None), msg_id, message_type
 
 
 def create_app(config: AppConfig) -> FastAPI:
@@ -187,8 +191,29 @@ def create_app(config: AppConfig) -> FastAPI:
 
         # 4. 解析消息事件（v2 格式）
         event = payload.get("event") or {}
-        chat_id, sender_id, question, msg_id = _extract_event(event)
-        if not chat_id or not sender_id or not question:
+        chat_id, sender_id, question, msg_id, message_type = _extract_event(event)
+        if not chat_id or not sender_id or not message_type:
+            return {"code": 0}
+
+        # 非 text 消息（image/file/post/sticker/audio…）：回友好提示，不进答题流程
+        if message_type != "text":
+            logger.info(
+                "non-text message: type=%s chat=%s user=%s",
+                message_type,
+                chat_id,
+                sender_id,
+            )
+            background.add_task(
+                handle_unsupported_message,
+                chat_id,
+                sender_id,
+                msg_id,
+                message_type,
+                feishu,
+            )
+            return {"code": 0}
+
+        if not question:
             return {"code": 0}
 
         logger.info(
