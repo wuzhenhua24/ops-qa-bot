@@ -6,7 +6,7 @@
 - 粗体 `**text**`            → bold
 - 斜体 `*text*`              → italic
 - 行内代码 `` `code` ``      → 保留反引号原样（post 无代码样式）
-- 围栏代码块 ``` ```...``` ``` → 以 `---` 分隔，内部逐行保留
+- 围栏代码块 ``` ```lang...``` ``` → post `code_block` 元素（带 language，等宽 + 高亮）
 - 链接 `[text](url)`         → a 标签
 - 无序列表 `- item` / `* item` → 前缀 `• `
 - 有序列表 `1. item`         → 保留原格式
@@ -70,17 +70,35 @@ def markdown_to_feishu_post(markdown: str, title: str = "") -> dict[str, Any]:
     """
     paragraphs: list[list[dict[str, Any]]] = []
     in_code = False
+    code_lang = ""
+    code_lines: list[str] = []
+
+    def _flush_code_block() -> None:
+        # 关栏时调用：把累积的行整段塞进一个 code_block 元素，一段一个块。
+        # language 留空也合法，飞书会按纯代码块渲染（仍是等宽 + 边框）。
+        block: dict[str, Any] = {"tag": "code_block", "text": "\n".join(code_lines)}
+        if code_lang:
+            block["language"] = code_lang
+        paragraphs.append([block])
 
     for raw in markdown.splitlines():
         stripped = raw.lstrip()
 
-        # 围栏代码块：用 --- 分隔，内部逐行原样
+        # 围栏代码块：开栏抓 language，关栏整段输出一个 code_block 元素
         if stripped.startswith("```"):
-            in_code = not in_code
-            paragraphs.append([{"tag": "text", "text": "---"}])
+            if in_code:
+                _flush_code_block()
+                in_code = False
+                code_lang = ""
+                code_lines = []
+            else:
+                in_code = True
+                # ```python / ```bash 等 → 取 ``` 之后的语言标记
+                code_lang = stripped[3:].strip()
+                code_lines = []
             continue
         if in_code:
-            paragraphs.append([{"tag": "text", "text": raw or " "}])
+            code_lines.append(raw)
             continue
 
         # 空行
@@ -103,5 +121,10 @@ def markdown_to_feishu_post(markdown: str, title: str = "") -> dict[str, Any]:
                 paragraphs.append(spans)
             else:
                 paragraphs.append(_inline_spans(raw))
+
+    # LLM 偶尔会忘了闭合围栏（被 max_tokens 截断 / 输出格式抖动），EOF 时
+    # 兜底把累积的代码也作为 code_block 输出，免得用户看不到这段代码
+    if in_code:
+        _flush_code_block()
 
     return {"zh_cn": {"title": title, "content": paragraphs}}
