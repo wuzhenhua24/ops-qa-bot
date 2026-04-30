@@ -281,6 +281,7 @@ def create_app(config: AppConfig) -> FastAPI:
             key = value.get("key")
             chat_id_v = value.get("chat_id")
             asker_id = value.get("asker_id")
+            parent_msg_id_v = value.get("parent_msg_id")
             click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
             if click_key in seen_clicks:
                 logger.info("duplicate followup click, skip: key=%s", click_key)
@@ -292,7 +293,14 @@ def create_app(config: AppConfig) -> FastAPI:
                 return {"card": {"type": "raw", "data": replay}}
             seen_clicks[click_key] = True
             ack_card = await handle_followup_click(
-                qid, key, chat_id_v, asker_id, clicker_id, feishu, session_mgr
+                qid,
+                key,
+                chat_id_v,
+                asker_id,
+                clicker_id,
+                feishu,
+                session_mgr,
+                parent_msg_id=parent_msg_id_v,
             )
             return {"card": {"type": "raw", "data": ack_card}}
 

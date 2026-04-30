@@ -378,82 +378,90 @@ def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -
     return post
 
 
-def _feedback_card(
+def _feedback_card(qid: str, user_id: str) -> dict:
+    """问答结束后附带的反馈卡片：纯 👍 / 👎。
+
+    追问按钮拆到独立的 `_followup_card`，避免点追问把整张反馈卡顶掉、用户失去打分入口。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "这次回答是否有帮助？"},
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "👍 有帮助"},
+                        "type": "primary",
+                        "value": {
+                            "action": "feedback",
+                            "qid": qid,
+                            "rating": "up",
+                            "asker_id": user_id,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "👎 待改进"},
+                        "type": "default",
+                        "value": {
+                            "action": "feedback",
+                            "qid": qid,
+                            "rating": "down",
+                            "asker_id": user_id,
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _followup_card(
     qid: str,
     user_id: str,
     chat_id: str,
-    followup_keys: list[str] | None = None,
+    parent_msg_id: str | None,
+    followup_keys: list[str],
 ) -> dict:
-    """问答结束后附带的反馈卡片：（可选）追问按钮 + 👍 / 👎。
+    """问答结束后附带的追问按钮卡：独立卡片，与反馈卡解耦。
 
-    `followup_keys` 来自 LLM 输出的 `<<FOLLOWUPS:...>>` 标记，已过滤到白名单内、
-    最多 3 个。每个 button value 自带 chat_id，避免回调时依赖 context 字段。
+    `followup_keys` 来自 LLM 输出的 `<<FOLLOWUPS:...>>`，已过滤到白名单内、最多 3 个。
+    每个 button value 自带 chat_id 和 parent_msg_id：parent_msg_id 是用户原始问题的
+    message_id，回调时透传给新一轮 `handle_question`，让追问的占位/答案/卡片继续
+    引用回到原问题，线程感不断。
     """
-    elements: list[dict] = []
-    if followup_keys:
-        elements.append(
+    btns: list[dict] = []
+    for k in followup_keys:
+        label, _ = _FOLLOWUP_LIBRARY[k]
+        btns.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": "default",
+                "value": {
+                    "action": "followup",
+                    "qid": qid,
+                    "key": k,
+                    "asker_id": user_id,
+                    "chat_id": chat_id,
+                    "parent_msg_id": parent_msg_id,
+                },
+            }
+        )
+    return {
+        "config": {"wide_screen_mode": True},
+        "elements": [
             {
                 "tag": "div",
                 "text": {"tag": "lark_md", "content": "**想再深入？**"},
-            }
-        )
-        followup_btns: list[dict] = []
-        for k in followup_keys:
-            label, _ = _FOLLOWUP_LIBRARY[k]
-            followup_btns.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "default",
-                    "value": {
-                        "action": "followup",
-                        "qid": qid,
-                        "key": k,
-                        "asker_id": user_id,
-                        "chat_id": chat_id,
-                    },
-                }
-            )
-        elements.append({"tag": "action", "actions": followup_btns})
-        elements.append({"tag": "hr"})
-    elements.append(
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "这次回答是否有帮助？"},
-        }
-    )
-    elements.append(
-        {
-            "tag": "action",
-            "actions": [
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "👍 有帮助"},
-                    "type": "primary",
-                    "value": {
-                        "action": "feedback",
-                        "qid": qid,
-                        "rating": "up",
-                        "asker_id": user_id,
-                    },
-                },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "👎 待改进"},
-                    "type": "default",
-                    "value": {
-                        "action": "feedback",
-                        "qid": qid,
-                        "rating": "down",
-                        "asker_id": user_id,
-                    },
-                },
-            ],
-        }
-    )
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": elements,
+            },
+            {"tag": "action", "actions": btns},
+        ],
     }
 
 
@@ -520,11 +528,16 @@ async def handle_followup_click(
     clicker_id: str | None,
     feishu: "FeishuClient",
     session_mgr: "SessionManager",
+    parent_msg_id: str | None = None,
 ) -> dict:
     """处理快捷追问按钮点击。后台触发新一轮 handle_question，立即返回 ack 卡。
 
     校验：key 在白名单 / chat_id+asker_id 都存在 / 点击者就是原提问者。
     任何校验失败都返回错误卡，不触发后续答题。
+
+    `parent_msg_id` 来自按钮 value，是用户原始问题的 message_id；透传给新一轮
+    `handle_question`，让追问的占位 / 答案 / 反馈卡继续引用回到原问题，线程不断。
+    早期版本（按钮 value 没带 parent_msg_id）会落到 None，新一轮按 top-level 发送。
     """
     if not key or key not in _FOLLOWUP_LIBRARY:
         return _followup_error_card("追问类型无效，请重试。")
@@ -538,7 +551,14 @@ async def handle_followup_click(
     label, prompt_text = _FOLLOWUP_LIBRARY[key]
     # 后台跑新一轮答题：卡片回调要求秒级返回，不能等 5-15s 的 LLM 推理
     asyncio.create_task(
-        handle_question(chat_id, asker_id, prompt_text, feishu, session_mgr)
+        handle_question(
+            chat_id,
+            asker_id,
+            prompt_text,
+            feishu,
+            session_mgr,
+            parent_msg_id=parent_msg_id,
+        )
     )
     feedback_logger.info(
         json.dumps(
@@ -1090,12 +1110,19 @@ async def handle_question(
         qa_record["duration_api_ms"] = result.duration_api_ms
     feedback_logger.info(json.dumps(qa_record, ensure_ascii=False))
 
-    # 5. 反馈卡（每次都发，含可选的快捷追问按钮）
+    # 5. 追问卡（如果有候选 key）+ 反馈卡（每次都发）。两张独立的 interactive
+    # 消息，都引用回到 parent_msg_id：点追问只替换追问卡，反馈卡照样能 👍/👎。
     # 反问轮跳过：让用户专注答反问，下一轮按补充信息再答 + 那时再挂反馈/追问
     if not is_clarification:
+        if followup_keys:
+            await feishu.send_interactive(
+                chat_id,
+                _followup_card(qid, user_id, chat_id, parent_msg_id, followup_keys),
+                parent_id=parent_msg_id,
+            )
         await feishu.send_interactive(
             chat_id,
-            _feedback_card(qid, user_id, chat_id, followup_keys),
+            _feedback_card(qid, user_id),
             parent_id=parent_msg_id,
         )
 

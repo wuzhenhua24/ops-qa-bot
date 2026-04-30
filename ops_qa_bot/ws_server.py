@@ -246,6 +246,7 @@ class WsRunner:
             key = value.get("key")
             chat_id_v = value.get("chat_id")
             asker_id = value.get("asker_id")
+            parent_msg_id_v = value.get("parent_msg_id")
             click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
             if click_key in self._seen_clicks:
                 logger.info("duplicate followup click, skip: key=%s", click_key)
@@ -275,6 +276,7 @@ class WsRunner:
                     clicker_id,
                     self._feishu,
                     self._session_mgr,
+                    parent_msg_id=parent_msg_id_v,
                 ),
                 self._loop,
             )
