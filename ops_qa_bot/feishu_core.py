@@ -32,6 +32,36 @@ FEISHU_BASE = "https://open.feishu.cn/open-apis"
 POST_TITLE = "运维文档助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 
+# 图片输入：Anthropic vision 支持 png/jpeg/gif/webp；超过 5MB 大概率被 API 拒
+# （像素 + 字节双重限制），让 bot 友好提示用户压缩，而不是甩 LLM 报错原文
+_SUPPORTED_IMAGE_TYPES: set[str] = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# 用户只发图无文字时，bot 用这条默认 prompt 推动 agent："识别 → 找文档 → 答"
+DEFAULT_IMAGE_PROMPT = (
+    "用户发了一张运维相关的截图。请先识别图中的关键信息"
+    "（报错文本、命令、指标值、配置项、UI 状态等），"
+    "再按这些线索去文档里查解决办法。"
+)
+
+
+def _normalize_image_media_type(content_type: str, data: bytes) -> str:
+    """归一化 image media_type 到 Anthropic vision 接受的集合内。
+
+    优先看 HTTP 响应 Content-Type；不在白名单时按 magic bytes 嗅探；都识别
+    不出来 fallback 到 image/jpeg（飞书截图绝大多数是 jpeg）。
+    """
+    if content_type in _SUPPORTED_IMAGE_TYPES:
+        return content_type
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
 
 def _placeholder_text(question: str, queued: bool) -> str:
     """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
@@ -232,6 +262,34 @@ class FeishuClient:
             chat_id, "interactive", card, parent_id=parent_id
         )
 
+    async def download_message_resource(
+        self, message_id: str, file_key: str, resource_type: str = "image"
+    ) -> tuple[bytes, str]:
+        """下载消息附件，返回 (bytes, media_type)。
+
+        API: GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=...
+        要求飞书应用配置 `im:resource` scope，bot 是该消息所在群成员。
+
+        media_type 优先取响应 Content-Type（去掉 charset 等参数），缺失或非
+        Anthropic 支持的 image/* 类型时按 magic bytes 嗅探，再 fallback 到
+        image/jpeg（最常见的截图格式）。
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            token = await self._get_token(client)
+            resp = await client.get(
+                f"{FEISHU_BASE}/im/v1/messages/{message_id}/resources/{file_key}",
+                params={"type": resource_type},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"download resource failed: status={resp.status_code} "
+                    f"body={resp.text[:200]}"
+                )
+            data = resp.content
+            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            return data, _normalize_image_media_type(ct, data)
+
 
 class _SessionEntry:
     __slots__ = ("bot", "lock", "last_used")
@@ -376,6 +434,88 @@ def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -
     ]
     post["zh_cn"]["content"].insert(0, mention_paragraph)
     return post
+
+
+async def handle_image_question(
+    chat_id: str,
+    user_id: str,
+    image_key: str,
+    parent_msg_id: str | None,
+    feishu: "FeishuClient",
+    session_mgr: "SessionManager",
+) -> None:
+    """处理 image 类型消息：下载 → 视觉答题。
+
+    任何前置失败（下载报错 / 超大 / 内容为空）都用普通 post 回友好提示，不走
+    答题流程，避免把 LLM 报错原文甩给用户。下载成功后用 DEFAULT_IMAGE_PROMPT
+    作为引导问题，调用 `handle_question(images=...)` 复用占位 / 反馈卡 / 追问
+    等所有现有逻辑。
+    """
+    if not parent_msg_id:
+        # 没有原消息 id 拿不到资源端点（API 必须 message_id + file_key）
+        logger.warning(
+            "image without parent_msg_id, skip: chat=%s user=%s key=%s",
+            chat_id,
+            user_id,
+            image_key,
+        )
+        return
+
+    try:
+        img_bytes, media_type = await feishu.download_message_resource(
+            parent_msg_id, image_key, "image"
+        )
+    except Exception as e:
+        logger.exception(
+            "image download failed: chat=%s user=%s key=%s", chat_id, user_id, image_key
+        )
+        await feishu.send_post(
+            chat_id,
+            _mention_post(
+                user_id,
+                f"图片下载失败 🙏 {e}\n你可以把截图里的关键报错或现象用文字描述出来再发。",
+            ),
+            parent_id=parent_msg_id,
+        )
+        return
+
+    if len(img_bytes) > MAX_IMAGE_BYTES:
+        size_mb = len(img_bytes) / (1024 * 1024)
+        await feishu.send_post(
+            chat_id,
+            _mention_post(
+                user_id,
+                f"图片太大（{size_mb:.1f}MB，上限 {MAX_IMAGE_BYTES // (1024 * 1024)}MB）"
+                "🙏 请压缩后重发，或者把关键内容用文字描述出来。",
+            ),
+            parent_id=parent_msg_id,
+        )
+        return
+    if not img_bytes:
+        await feishu.send_post(
+            chat_id,
+            _mention_post(user_id, "图片内容为空，请重新发送 🙏"),
+            parent_id=parent_msg_id,
+        )
+        return
+
+    logger.info(
+        "image question: chat=%s user=%s key=%s size=%dB type=%s",
+        chat_id,
+        user_id,
+        image_key,
+        len(img_bytes),
+        media_type,
+    )
+    await handle_question(
+        chat_id,
+        user_id,
+        DEFAULT_IMAGE_PROMPT,
+        feishu,
+        session_mgr,
+        parent_msg_id=parent_msg_id,
+        images=[(media_type, img_bytes)],
+    )
 
 
 async def handle_unsupported_message(
@@ -1019,6 +1159,7 @@ async def handle_question(
     session_mgr: SessionManager,
     *,
     parent_msg_id: str | None = None,
+    images: list[tuple[str, bytes]] | None = None,
 ) -> None:
     """处理单条用户提问（完整流程：重置 / 占位 / 答题 / 编辑 / 反馈卡片）。
 
@@ -1028,11 +1169,14 @@ async def handle_question(
     反馈卡 / 追问卡 / 归档卡）都会"引用回复"这条原消息，飞书群里每条 bot 消息头部
     会显示原问题的引用条，连发多条问题时归属一目了然。followup-trigger 走来的不带
     parent_msg_id（无锚点消息），自然按 top-level 发送。
+
+    `images` 给定时走视觉路径（image content block 喂给底层模型），占位文本切到
+    "🖼️ 识别图片中…" 而不是问题摘要（用户发图时通常没有文字摘要可展示）。
     """
     key = (chat_id, user_id)
 
-    # 重置指令：清掉该用户的会话
-    if question in RESET_TRIGGERS:
+    # 重置指令：清掉该用户的会话（仅 text 输入有效；图片消息不走重置语义）
+    if not images and question in RESET_TRIGGERS:
         existed = await session_mgr.reset(key)
         reply = (
             "已清空你的对话历史，下一个问题会开启新会话。"
@@ -1047,9 +1191,16 @@ async def handle_question(
     # 1. 立即发占位消息：带问题摘要 + 排队/翻文档状态前缀，让用户能识别这条占位
     # 是为哪一句问题、是否在排队等前一条
     queued = await session_mgr.queued(key)
+    if images:
+        # 图片场景没有可摘要的"用户问题"，统一用图标占位；排队状态仍提示
+        placeholder_init = (
+            "🕒 排队中：识别图片" if queued else "🖼️ 识别图片中…"
+        )
+    else:
+        placeholder_init = _placeholder_text(question, queued)
     placeholder_mid = await feishu.send_post(
         chat_id,
-        _mention_post(user_id, _placeholder_text(question, queued)),
+        _mention_post(user_id, placeholder_init),
         parent_id=parent_msg_id,
     )
 
@@ -1060,11 +1211,14 @@ async def handle_question(
         async with entry.lock:
             # 拿到锁意味着前面的问题已答完，把占位从"排队中"刷成"翻文档中"
             if queued and placeholder_mid is not None:
+                refresh = (
+                    "🖼️ 识别图片中…" if images else _placeholder_text(question, False)
+                )
                 await feishu.update_post(
                     placeholder_mid,
-                    _mention_post(user_id, _placeholder_text(question, False)),
+                    _mention_post(user_id, refresh),
                 )
-            result = await entry.bot.answer(question)
+            result = await entry.bot.answer(question, images=images)
             entry.last_used = time.time()
         answer = result.text
     except Exception as e:

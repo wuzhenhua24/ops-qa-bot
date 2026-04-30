@@ -1,3 +1,4 @@
+import base64
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -96,7 +97,11 @@ class OpsQABot:
         await self._client.__aexit__(exc_type, exc, tb)
         self._client = None
 
-    async def ask(self, question: str) -> AsyncIterator[dict]:
+    async def ask(
+        self,
+        question: str,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> AsyncIterator[dict]:
         """向 bot 提问。流式返回事件字典：
 
         - {"type": "tool", "name": str, "input": dict}        —— agent 调用的工具
@@ -105,11 +110,40 @@ class OpsQABot:
           "usage": dict | None, "num_turns": int | None,
           "duration_ms": int | None,
           "duration_api_ms": int | None}                       —— 本轮结束
+
+        `images` 给定时（list of (media_type, raw_bytes)），把每张图作为 image
+        content block + 文本一起发给 Claude（要求底层模型/代理支持视觉）。
+        没有 images 时走原 string 路径，不改变历史行为。
         """
         if self._client is None:
             raise RuntimeError("OpsQABot 必须在 async with 块内使用")
 
-        await self._client.query(question)
+        if images:
+            content: list[dict[str, Any]] = []
+            for media_type, raw in images:
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        },
+                    }
+                )
+            # 文本放在图后：让模型先看到图，再读到引导问题，匹配 "看图 → 答" 的语序
+            content.append({"type": "text", "text": question})
+
+            async def _stream():
+                yield {
+                    "type": "user",
+                    "message": {"role": "user", "content": content},
+                    "parent_tool_use_id": None,
+                }
+
+            await self._client.query(_stream())
+        else:
+            await self._client.query(question)
 
         async for msg in self._client.receive_response():
             if isinstance(msg, AssistantMessage):
@@ -132,20 +166,31 @@ class OpsQABot:
                     "duration_api_ms": msg.duration_api_ms,
                 }
 
-    async def answer(self, question: str) -> AnswerResult:
+    async def answer(
+        self,
+        question: str,
+        images: list[tuple[str, bytes]] | None = None,
+    ) -> AnswerResult:
         """一次性返回完整答案 + 用量元数据。
 
         工具调用和成本写入 logger（INFO 级，不进入返回值）；token 用量等
         结构化字段塞进 AnswerResult，让上层（如飞书反馈日志）按需落库。
+
+        `images` 透传给 `ask()`，开启视觉路径。
         """
-        logger.info("question: %s", question)
+        if images:
+            logger.info(
+                "question (with %d image(s)): %s", len(images), question
+            )
+        else:
+            logger.info("question: %s", question)
         chunks: list[str] = []
         cost_usd: float | None = None
         usage: dict | None = None
         num_turns: int | None = None
         duration_ms: int | None = None
         duration_api_ms: int | None = None
-        async for event in self.ask(question):
+        async for event in self.ask(question, images=images):
             if event["type"] == "tool":
                 logger.info("  tool: %s", format_tool_call(event["name"], event["input"]))
             elif event["type"] == "text":

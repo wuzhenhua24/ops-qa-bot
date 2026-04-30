@@ -33,6 +33,7 @@ from .feishu_core import (
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
     handle_followup_click,
+    handle_image_question,
     handle_question,
     handle_unsupported_message,
 )
@@ -195,7 +196,34 @@ def create_app(config: AppConfig) -> FastAPI:
         if not chat_id or not sender_id or not message_type:
             return {"code": 0}
 
-        # 非 text 消息（image/file/post/sticker/audio…）：回友好提示，不进答题流程
+        # image 消息走视觉路径：解 image_key → 后台下载 → handle_question(images=...)
+        if message_type == "image":
+            try:
+                content_dict = json.loads(
+                    (event.get("message") or {}).get("content") or "{}"
+                )
+            except json.JSONDecodeError:
+                content_dict = {}
+            image_key = content_dict.get("image_key")
+            if not image_key or not msg_id:
+                logger.info(
+                    "image message missing key/msg_id: chat=%s user=%s",
+                    chat_id,
+                    sender_id,
+                )
+                return {"code": 0}
+            background.add_task(
+                handle_image_question,
+                chat_id,
+                sender_id,
+                image_key,
+                msg_id,
+                feishu,
+                session_mgr,
+            )
+            return {"code": 0}
+
+        # 其它非 text（file/post/sticker/audio…）：回友好提示，不进答题流程
         if message_type != "text":
             logger.info(
                 "non-text message: type=%s chat=%s user=%s",
