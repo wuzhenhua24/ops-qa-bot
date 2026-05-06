@@ -61,6 +61,11 @@ def _inline_spans(text: str) -> list[dict[str, Any]]:
     return spans
 
 
+# 已上传到飞书的图片占位行：bot 在答题流程里把 LLM 的 <<IMG:path>> 校验/上传后
+# 替换成 <<IMG_KEY:img_xxx>>，渲染层把这种独立行转成飞书 post 的 img 段。
+_IMG_KEY_LINE_RE = re.compile(r"^<<IMG_KEY:([A-Za-z0-9_-]+)>>$")
+
+
 def markdown_to_feishu_post(markdown: str, title: str = "") -> dict[str, Any]:
     """转为飞书 post 消息的 content 字典。
 
@@ -99,6 +104,13 @@ def markdown_to_feishu_post(markdown: str, title: str = "") -> dict[str, Any]:
             continue
         if in_code:
             code_lines.append(raw)
+            continue
+
+        # 已上传图占位：放在围栏判定后、空行/标题前，让 IMG_KEY 行不会被当作普通文本。
+        # 行内嵌入（行中混文字）不识别，要求 LLM 独立行写。
+        img_m = _IMG_KEY_LINE_RE.match(stripped)
+        if img_m:
+            paragraphs.append([{"tag": "img", "image_key": img_m.group(1)}])
             continue
 
         # 空行

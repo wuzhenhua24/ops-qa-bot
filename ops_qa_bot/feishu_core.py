@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 
 import httpx
-from cachetools import TTLCache
+from cachetools import LRUCache, TTLCache
 
 from .bot import AnswerResult, OpsQABot
 from .feishu_format import markdown_to_feishu_post
@@ -100,6 +100,19 @@ _FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([\w|]+)>>")
 # 反问轮：不发反馈卡 / 追问按钮 / 升级 @ / 归档卡，让用户专注回答反问；
 # 用户在同一 session 里答完，下一轮就按补充信息直接答。
 _CLARIFY_RE = re.compile(r"<<CLARIFY>>")
+
+# 答案内嵌图机制：步骤截图 / 标注图 / 强相关故障截图，文字转述不如直接展示。
+# LLM 在答案里独立一行写 <<IMG:redis/images/step1.png>>（路径相对 docs_root），
+# bot 校验路径 → 上传飞书拿 image_key → 把标记换成 <<IMG_KEY:img_xxx>>，渲染层
+# 把这种行渲染为飞书 post 的 img 段。每条最多 3 张，超限静默截断。
+# 路径正则放宽到非控制字符以兼容中文/带空格的文件名；安全校验在 _validate 里做。
+_IMG_RE = re.compile(r"<<IMG:([^<>\n\r]+?)>>")
+_IMG_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+_IMG_MAX_BYTES = 5 * 1024 * 1024  # 飞书消息图官方上限 10MB，留点余量
+_IMG_MAX_PER_ANSWER = 3
+# 同一 docs 图在多轮答案里会被反复引用，缓存 (绝对路径, mtime) → image_key 避免
+# 重复上传；mtime 变化（图被替换）天然失效。LRU 500 条对常规文档量够用。
+_image_key_cache: LRUCache = LRUCache(maxsize=500)
 _FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
     "troubleshoot": (
         "📋 排查步骤",
@@ -265,6 +278,34 @@ class FeishuClient:
         return await self._send(
             chat_id, "interactive", card, parent_id=parent_id
         )
+
+    async def upload_image(self, image_bytes: bytes) -> str | None:
+        """上传图片到飞书拿 image_key（用于 post 消息内嵌 img 段），失败返回 None。
+
+        API: POST /open-apis/im/v1/images，image_type=message。要求 `im:resource:upload`
+        scope（实际作用域名以飞书后台为准）。image_key 在飞书侧长期有效，调用方可放
+        心做内存级缓存，重启后再 lazy 重传即可。
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            token = await self._get_token(client)
+            files = {
+                "image_type": (None, "message"),
+                "image": ("image", image_bytes),
+            }
+            resp = await client.post(
+                f"{FEISHU_BASE}/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                files=files,
+            )
+            body = resp.json() if resp.content else {}
+            if resp.status_code != 200 or body.get("code") != 0:
+                logger.error(
+                    "feishu upload_image failed: status=%s body=%s",
+                    resp.status_code,
+                    resp.text,
+                )
+                return None
+            return (body.get("data") or {}).get("image_key")
 
     async def download_message_resource(
         self, message_id: str, file_key: str, resource_type: str = "image"
@@ -687,6 +728,108 @@ def _parse_clarify(answer: str) -> tuple[str, bool]:
     if _CLARIFY_RE.search(answer):
         return _CLARIFY_RE.sub("", answer).strip(), True
     return answer, False
+
+
+def _validate_image_path(rel: str, docs_root: Path) -> Path | None:
+    """校验 LLM 在 <<IMG:path>> 里给的路径：必须 docs_root 子目录下真实图片文件，
+    扩展名在白名单内，大小 ≤ _IMG_MAX_BYTES。
+
+    LLM 偶尔会写错路径 / 写绝对路径 / 写 ../ 跳出 docs_root，全部拒绝；上传飞书
+    的图必须保证是 docs_root 下的合法运维文档插图，不让 LLM 借此把任意本地文件
+    上传到飞书。
+    """
+    cleaned = (rel or "").strip().strip("/").rstrip("/")
+    if not cleaned or ".." in cleaned.split("/"):
+        return None
+    try:
+        target = (docs_root / cleaned).resolve()
+        root = docs_root.resolve()
+    except OSError:
+        return None
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    if not target.is_file():
+        return None
+    if target.suffix.lower() not in _IMG_ALLOWED_EXT:
+        return None
+    try:
+        if target.stat().st_size > _IMG_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    return target
+
+
+async def _upload_doc_image(
+    target: Path, feishu: "FeishuClient"
+) -> str | None:
+    """读 docs 下图片字节并上传飞书（带 LRU 缓存），返回 image_key 或 None。"""
+    try:
+        mtime = target.stat().st_mtime
+    except OSError:
+        return None
+    cache_key = (str(target), mtime)
+    cached = _image_key_cache.get(cache_key)
+    if cached:
+        return cached
+    try:
+        with target.open("rb") as f:
+            blob = f.read()
+    except OSError as e:
+        logger.warning("read doc image failed: path=%s err=%s", target, e)
+        return None
+    image_key = await feishu.upload_image(blob)
+    if image_key:
+        _image_key_cache[cache_key] = image_key
+    return image_key
+
+
+async def _resolve_image_markers(
+    answer: str, docs_root: Path, feishu: "FeishuClient"
+) -> tuple[str, list[str]]:
+    """剥答案里的 <<IMG:rel_path>>：校验路径 → 上传 → 把成功的标记换成
+    <<IMG_KEY:img_xxx>>，失败/超限的剥除。
+
+    返回 (改写后的答案, 已展示的相对路径列表)；后者只供日志统计 ROI 用。
+    保序去重：同一路径在答案里重复出现只上传一次、只展示一次（LLM 偶尔会把图
+    放在多个段落里），按出现顺序保留，超过 _IMG_MAX_PER_ANSWER 截断。
+    """
+    paths_in_order = _IMG_RE.findall(answer)
+    if not paths_in_order:
+        return answer, []
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in paths_in_order:
+        cleaned = p.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            uniq.append(cleaned)
+
+    path_to_key: dict[str, str] = {}
+    attached: list[str] = []
+    for rel in uniq[:_IMG_MAX_PER_ANSWER]:
+        target = _validate_image_path(rel, docs_root)
+        if target is None:
+            logger.warning("invalid IMG marker, dropped: rel=%s", rel)
+            continue
+        image_key = await _upload_doc_image(target, feishu)
+        if not image_key:
+            logger.warning("upload IMG failed, dropped: rel=%s", rel)
+            continue
+        path_to_key[rel] = image_key
+        attached.append(rel)
+
+    def _replace(m: re.Match) -> str:
+        rel = m.group(1).strip()
+        key = path_to_key.get(rel)
+        return f"<<IMG_KEY:{key}>>" if key else ""
+
+    new_answer = _IMG_RE.sub(_replace, answer)
+    # 剥除标记后可能留多余空行，归并相邻空行减少视觉噪音
+    new_answer = re.sub(r"\n{3,}", "\n\n", new_answer).strip()
+    return new_answer, attached
 
 
 def _followup_ack_card(label: str) -> dict:
@@ -1298,12 +1441,21 @@ async def handle_question(
     answer, followup_keys = _parse_followups(answer)
     # 解析反问标记：是否为"信息不足、需要用户补充"的反问轮
     answer, is_clarification = _parse_clarify(answer)
-    # 反问轮防御性清空：prompt 已要求反问时不输出 ESCALATE/FOLLOWUPS，但 LLM
+    # 反问轮防御性清空：prompt 已要求反问时不输出 ESCALATE/FOLLOWUPS/IMG，但 LLM
     # 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
     if is_clarification:
         escalate_owner = None
         escalate_dir_hint = None
         followup_keys = []
+        # 反问轮里 LLM 不应该塞图，但如果塞了直接剥掉标记不上传
+        answer = _IMG_RE.sub("", answer).strip()
+        attached_images: list[str] = []
+    else:
+        # 解析答案内嵌图：校验路径 → 上传飞书 → 把 <<IMG:path>> 换成 <<IMG_KEY:img_xxx>>
+        # 失败/超 3 张静默剥除（带 warning 日志），不阻塞答题主链路
+        answer, attached_images = await _resolve_image_markers(
+            answer, session_mgr.docs_root, feishu
+        )
     final_post = _mention_post(user_id, answer)
     escalated_now = False
     if escalate_owner is not None:
@@ -1349,6 +1501,9 @@ async def handle_question(
         qa_record["escalated_to"] = escalate_owner
     if is_clarification:
         qa_record["clarification"] = True
+    if attached_images:
+        # 用相对路径而不是 image_key，事后能直接定位到具体哪些图被引用
+        qa_record["images_attached"] = attached_images
     # 模型用量：直接转发 SDK 给的字段，对接第三方 Claude 兼容代理时可以拿
     # input_tokens / output_tokens / cache_* 套自己的单价表算成本。
     if result is not None:
