@@ -17,6 +17,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import httpx
 from cachetools import LRUCache, TTLCache
@@ -63,6 +64,16 @@ def _normalize_image_media_type(content_type: str, data: bytes) -> str:
     return "image/jpeg"
 
 
+# 进度占位限频参数：飞书 update_post 是 PUT API，短时间高频会触发 999911404 类
+# 限流；中间一连串同目录 Read 折叠成累计计数靠节流压平闪烁。
+# - _PROGRESS_MIN_INTERVAL：非强制刷新的最小间隔（秒）。强制档（跨工具/跨目录）
+#   立刻刷，不受这个间隔限制。
+# - _PROGRESS_MAX_UPDATES：一次回答最多刷几次占位，避免 LLM 跑 20 个工具时
+#   占位被刷 20 次让用户晕。超出后停刷，等最终答案 update_post。
+_PROGRESS_MIN_INTERVAL = 1.5
+_PROGRESS_MAX_UPDATES = 5
+
+
 def _placeholder_text(question: str, queued: bool) -> str:
     """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
 
@@ -74,6 +85,100 @@ def _placeholder_text(question: str, queued: bool) -> str:
         excerpt = excerpt[:40] + "…"
     icon = "🕒 排队中" if queued else "🔍 翻文档中"
     return f"{icon}：'{excerpt}'"
+
+
+class ProgressTracker:
+    """吃 bot.ask() 流式工具事件，给出占位文案更新决策。
+
+    三档文案：
+    - Glob 命中组件目录 → "🔍 已定位 redis/，正在列文档…"
+    - 首个 Read（跨目录/跨工具） → "📖 正在查看 redis/troubleshooting.md…"
+    - 后续同目录 Read → "📖 正在查看 redis/ 下 N 个文件…"（计数累加）
+    - Grep → "🔎 正在搜索 'pattern'…"
+    - INDEX.md → "📖 正在读路由表…"
+
+    返回 (新文案, force_update) 或 None。force_update 用于跨阶段/跨目录这种
+    用户感知强的关键节点，调用方可绕过节流限频立刻 update；同档内的累计更新
+    是 force=False，靠时间窗口限频。
+    """
+
+    def __init__(self, docs_root: Path):
+        self._docs_root = str(docs_root.resolve())
+        self._last_dir: str | None = None
+        self._last_phase: str | None = None  # "glob" | "read" | "grep" | "index"
+        self._read_count_in_dir: int = 0
+
+    def _extract_top_dir(self, path_or_pattern: str) -> str | None:
+        """从相对路径 / glob pattern / 绝对路径里抽出 docs_root 下的一级目录名。
+
+        - "redis/troubleshooting.md"            → "redis"
+        - "redis/*.md"                          → "redis"
+        - "/abs/.../docs/redis/x.md"            → "redis"
+        - "INDEX.md" / "*.md"                   → None（顶层无组件归属）
+        - "redis/images/x.png"                  → "redis"（嵌套不影响）
+        """
+        if not path_or_pattern:
+            return None
+        p = path_or_pattern
+        # 绝对路径相对化：如果在 docs_root 下，剥前缀
+        if p.startswith(self._docs_root):
+            p = p[len(self._docs_root):]
+        p = p.lstrip("/")
+        if "/" not in p:
+            return None
+        head = p.split("/", 1)[0]
+        # 通配符开头的"目录"不算（罕见但避免误判）
+        if any(c in head for c in "*?["):
+            return None
+        return head
+
+    def consume(self, tool_name: str, tool_input: dict) -> tuple[str, bool] | None:
+        """处理一个工具调用事件，返回 (placeholder_text, force_update) 或 None。"""
+        if tool_name == "Glob":
+            pattern = str(tool_input.get("pattern", ""))
+            d = self._extract_top_dir(pattern)
+            if d:
+                # 跨目录强制刷新，同目录重复 Glob 不抖动
+                if d != self._last_dir or self._last_phase != "glob":
+                    self._last_dir = d
+                    self._last_phase = "glob"
+                    self._read_count_in_dir = 0
+                    return f"🔍 已定位 {d}/，正在列文档…", True
+            return None
+
+        if tool_name == "Read":
+            file_path = str(tool_input.get("file_path", ""))
+            base = file_path.rsplit("/", 1)[-1]
+            d = self._extract_top_dir(file_path)
+            if not d:
+                # 顶层文件：INDEX.md 单独标识，其它顶层 md 不展示
+                if base.lower() == "index.md" and self._last_phase != "index":
+                    self._last_phase = "index"
+                    self._last_dir = None
+                    self._read_count_in_dir = 0
+                    return "📖 正在读路由表…", True
+                return None
+            if d != self._last_dir or self._last_phase != "read":
+                # 跨组件 / 从 Glob/Grep 切到 Read：展示具体文件名
+                self._last_dir = d
+                self._last_phase = "read"
+                self._read_count_in_dir = 1
+                return f"📖 正在查看 {d}/{base}…", True
+            # 同目录连读：折叠成计数，靠节流防抖动
+            self._read_count_in_dir += 1
+            return f"📖 正在查看 {d}/ 下 {self._read_count_in_dir} 个文件…", False
+
+        if tool_name == "Grep":
+            pattern = str(tool_input.get("pattern", ""))
+            short = pattern[:30] + ("…" if len(pattern) > 30 else "")
+            if self._last_phase != "grep":
+                self._last_phase = "grep"
+                self._last_dir = None
+                self._read_count_in_dir = 0
+                return f"🔎 正在搜索 '{short}'…", True
+            return None
+
+        return None
 
 SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 
@@ -1411,8 +1516,10 @@ async def handle_question(
         parent_id=parent_msg_id,
     )
 
-    # 2. 生成答案
+    # 2. 生成答案：直接消费 bot.ask() 流式事件，边攒文本边按节流刷占位文案，
+    # 让用户从"翻文档中"看到具体进度（已定位 redis/、正在查 troubleshooting.md…）
     result: AnswerResult | None = None
+    answer = ""
     try:
         entry = await session_mgr.get(key)
         async with entry.lock:
@@ -1425,7 +1532,51 @@ async def handle_question(
                     placeholder_mid,
                     _mention_post(user_id, refresh),
                 )
-            result = await entry.bot.answer(question, images=images)
+
+            # 流式消费 + 节流占位更新。视觉路径不挂进度（图通常一两步就出答案，
+            # 且占位文案是"识别图片中"语义更直观）；文字路径才挂。
+            tracker = (
+                ProgressTracker(session_mgr.docs_root) if not images else None
+            )
+            text_chunks: list[str] = []
+            done_meta: dict[str, Any] = {}
+            last_update_at = time.time()
+            update_count = 0
+            async for event in entry.bot.ask(question, images=images):
+                etype = event.get("type")
+                if etype == "tool":
+                    if (
+                        tracker is not None
+                        and placeholder_mid is not None
+                        and update_count < _PROGRESS_MAX_UPDATES
+                    ):
+                        decision = tracker.consume(
+                            event.get("name", ""), event.get("input") or {}
+                        )
+                        if decision is not None:
+                            new_text, force = decision
+                            now = time.time()
+                            if force or (
+                                now - last_update_at >= _PROGRESS_MIN_INTERVAL
+                            ):
+                                ok = await feishu.update_post(
+                                    placeholder_mid,
+                                    _mention_post(user_id, new_text),
+                                )
+                                if ok:
+                                    last_update_at = now
+                                    update_count += 1
+                elif etype == "text":
+                    text_chunks.append(event.get("text", ""))
+                elif etype == "done":
+                    done_meta = {
+                        "cost_usd": event.get("cost_usd"),
+                        "usage": event.get("usage"),
+                        "num_turns": event.get("num_turns"),
+                        "duration_ms": event.get("duration_ms"),
+                        "duration_api_ms": event.get("duration_api_ms"),
+                    }
+            result = AnswerResult(text="".join(text_chunks).strip(), **done_meta)
             entry.last_used = time.time()
         answer = result.text
     except Exception as e:
