@@ -1829,7 +1829,31 @@ def handle_feedback_click(
     👍：返回简单 ack 卡（v1，流程结束）。
     👎：先记 rating=down，再返回原因收集表单（v2 form）；用户填完按"提交"
     或"跳过"会触发第二次回调（feedback_reason_submit / _skip）记 reason 行。
+
+    非提问者点击会被拒绝（群里反馈卡保持开放，否则任何人都能给打分污染 rating）。
+    返回原反馈卡保持按钮可用，让真正的 asker 仍能投票。
     """
+    if clicker_id and asker_id and clicker_id != asker_id:
+        feedback_logger.info(
+            json.dumps(
+                {
+                    "event": "feedback_rejected",
+                    "qid": qid,
+                    "rating": rating,
+                    "clicker_id": clicker_id,
+                    "asker_id": asker_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+        logger.info(
+            "feedback rejected (not asker): qid=%s rating=%s by=%s asker=%s",
+            qid,
+            rating,
+            clicker_id,
+            asker_id,
+        )
+        return _feedback_card(qid, asker_id)
     feedback_logger.info(
         json.dumps(
             {
@@ -1860,7 +1884,28 @@ def handle_feedback_reason_submit(
     reason 不在白名单（None / 注入 / SDK 字段名变了）会写一行 invalid 标记的
     日志，但仍返回 ack，避免 UI 卡住。grep `event=feedback_reason invalid=true`
     可发现这类异常。
+
+    非提问者提交会被拒绝并返回原表单卡，避免污染 reason 数据 / 把 asker 的表单顶掉。
     """
+    if clicker_id and asker_id and clicker_id != asker_id:
+        feedback_logger.info(
+            json.dumps(
+                {
+                    "event": "feedback_reason_rejected",
+                    "qid": qid,
+                    "clicker_id": clicker_id,
+                    "asker_id": asker_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+        logger.info(
+            "feedback reason rejected (not asker): qid=%s by=%s asker=%s",
+            qid,
+            clicker_id,
+            asker_id,
+        )
+        return _feedback_reason_form_card(qid, asker_id)
     valid = reason in _FEEDBACK_REASONS
     feedback_logger.info(
         json.dumps(
@@ -1896,7 +1941,28 @@ def handle_feedback_reason_skip(
 
     skipped 计数能告诉我们"愿不愿意填原因"的整体比例；如果绝大多数都跳过，
     说明这个二次表单要么时机不对要么选项不对，需要再调。
+
+    非提问者跳过会被拒绝并返回原表单卡，避免污染 skipped 计数 / 把 asker 的表单顶掉。
     """
+    if clicker_id and asker_id and clicker_id != asker_id:
+        feedback_logger.info(
+            json.dumps(
+                {
+                    "event": "feedback_reason_rejected",
+                    "qid": qid,
+                    "clicker_id": clicker_id,
+                    "asker_id": asker_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+        logger.info(
+            "feedback reason skip rejected (not asker): qid=%s by=%s asker=%s",
+            qid,
+            clicker_id,
+            asker_id,
+        )
+        return _feedback_reason_form_card(qid, asker_id)
     feedback_logger.info(
         json.dumps(
             {
