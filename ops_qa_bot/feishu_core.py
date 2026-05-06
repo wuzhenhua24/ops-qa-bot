@@ -550,42 +550,67 @@ def _feedback_card(qid: str, user_id: str) -> dict:
     """问答结束后附带的反馈卡片：纯 👍 / 👎。
 
     追问按钮拆到独立的 `_followup_card`，避免点追问把整张反馈卡顶掉、用户失去打分入口。
+
+    用 v2 schema：👎 后要替换成带 form 的原因表单（form 是 v2 才有），原卡和替换卡
+    schema 不一致飞书侧渲染会失败。v2 不再支持 `tag:action` 容器，按钮直接放进
+    column_set 并排，回调走 `behaviors:[{type:"callback", value:...}]`。
     """
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": [
+    btn_up = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "👍 有帮助"},
+        "type": "primary",
+        "behaviors": [
             {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": "这次回答是否有帮助？"},
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "👍 有帮助"},
-                        "type": "primary",
-                        "value": {
-                            "action": "feedback",
-                            "qid": qid,
-                            "rating": "up",
-                            "asker_id": user_id,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "👎 待改进"},
-                        "type": "default",
-                        "value": {
-                            "action": "feedback",
-                            "qid": qid,
-                            "rating": "down",
-                            "asker_id": user_id,
-                        },
-                    },
-                ],
-            },
+                "type": "callback",
+                "value": {
+                    "action": "feedback",
+                    "qid": qid,
+                    "rating": "up",
+                    "asker_id": user_id,
+                },
+            }
         ],
+    }
+    btn_down = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "👎 待改进"},
+        "type": "default",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": {
+                    "action": "feedback",
+                    "qid": qid,
+                    "rating": "down",
+                    "asker_id": user_id,
+                },
+            }
+        ],
+    }
+    return {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "这次回答是否有帮助？"},
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [btn_up],
+                        },
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [btn_down],
+                        },
+                    ],
+                },
+            ]
+        },
     }
 
 
@@ -752,15 +777,20 @@ async def handle_followup_click(
 
 
 def _feedback_ack_card(rating: str, clicker_name: str | None = None) -> dict:
-    """点击后用来替换原卡片的"已收到反馈"提示。"""
+    """点击后用来替换原卡片的"已收到反馈"提示。
+
+    v2 schema，对齐 `_feedback_card` / `_feedback_reason_form_card`。
+    """
     msg = "✅ 感谢反馈！" if rating == "up" else "🙏 已收到，我们会持续改进。"
     if clicker_name:
         msg = f"{msg}（by {clicker_name}）"
     return {
-        "config": {"wide_screen_mode": True},
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": msg}},
-        ],
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": msg},
+            ]
+        },
     }
 
 
@@ -814,7 +844,7 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                         {
                             "tag": "input",
                             "name": "comment",
-                            "input_type": "multiline_text",
+                            "multiline": True,
                             "rows": 3,
                             "max_length": 500,
                             "placeholder": {
@@ -829,39 +859,52 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                             "columns": [
                                 {
                                     "tag": "column",
+                                    "width": "weighted",
+                                    "weight": 1,
                                     "elements": [
                                         {
                                             "tag": "button",
+                                            "name": "submit_btn",
                                             "text": {
                                                 "tag": "plain_text",
                                                 "content": "提交",
                                             },
                                             "type": "primary",
-                                            "action_type": "form_submit",
-                                            "name": "submit_btn",
-                                            "value": {
-                                                "action": "feedback_reason_submit",
-                                                **btn_common,
-                                            },
+                                            "form_action_type": "submit",
+                                            "behaviors": [
+                                                {
+                                                    "type": "callback",
+                                                    "value": {
+                                                        "action": "feedback_reason_submit",
+                                                        **btn_common,
+                                                    },
+                                                }
+                                            ],
                                         }
                                     ],
                                 },
                                 {
                                     "tag": "column",
+                                    "width": "weighted",
+                                    "weight": 1,
                                     "elements": [
                                         {
                                             "tag": "button",
+                                            "name": "skip_btn",
                                             "text": {
                                                 "tag": "plain_text",
                                                 "content": "跳过",
                                             },
                                             "type": "default",
-                                            "action_type": "form_submit",
-                                            "name": "skip_btn",
-                                            "value": {
-                                                "action": "feedback_reason_skip",
-                                                **btn_common,
-                                            },
+                                            "behaviors": [
+                                                {
+                                                    "type": "callback",
+                                                    "value": {
+                                                        "action": "feedback_reason_skip",
+                                                        **btn_common,
+                                                    },
+                                                }
+                                            ],
                                         }
                                     ],
                                 },
