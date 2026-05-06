@@ -990,6 +990,7 @@ def _archive_form_card(
     """
     return {
         "schema": "2.0",
+        "config": {"update_multi": True},
         "header": {
             "title": {"tag": "plain_text", "content": "📝 问答归档"},
             "template": "blue",
@@ -1019,16 +1020,22 @@ def _archive_form_card(
                                 "content": "粘贴整理后的答案文本…",
                             },
                             "required": True,
-                            "label": {"tag": "plain_text", "content": "答案"},
-                            "label_position": "top",
                         },
                         {
                             "tag": "button",
+                            "name": "submit_btn",
                             "text": {"tag": "plain_text", "content": "提交并归档"},
                             "type": "primary",
-                            "action_type": "form_submit",
-                            "name": "submit_btn",
-                            "value": {"action": "archive_submit", "qid": qid},
+                            "form_action_type": "submit",
+                            "behaviors": [
+                                {
+                                    "type": "callback",
+                                    "value": {
+                                        "action": "archive_submit",
+                                        "qid": qid,
+                                    },
+                                }
+                            ],
                         },
                     ],
                 },
