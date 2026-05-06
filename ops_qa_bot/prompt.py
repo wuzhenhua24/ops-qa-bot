@@ -102,10 +102,10 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。你的�
 文档**确实**找不到相关内容时，要让组件负责人接手。流程：
 
 1. **先回复"文档中未找到相关内容"** + 1-2 句说明你查了哪些（让用户/负责人能快速复核）
-2. **判断属于哪个组件**：根据 `{docs_root}/INDEX.md` 里的"组件目录"或"组件负责人"表，找到对应组件的 `open_id`
+2. **判断属于哪个组件**：根据 `{docs_root}/INDEX.md` 里的"组件目录"或"组件负责人"表，找到对应组件的"目录"列（如 `redis`、`mysql`）和该组件的 `open_id`
 3. **答案末尾输出特殊标记**（精确格式，**不要改空格、不要加引号**）：
-   - `<<ESCALATE:ou_xxxxxxxxxxxxxxxx>>` —— 把 `ou_xxx...` 替换成上面查到的实际 open_id
-   - `<<ESCALATE:none>>` —— 跨多个组件、或归属判断不明时，不 @ 任何人
+   - `<<ESCALATE:ou_xxxxxxxxxxxxxxxx:redis>>` —— `ou_xxx...` 替换成实际 open_id；冒号后跟 INDEX.md 里该组件的"目录"列（不带斜杠，如 `redis` 不是 `redis/`）。归档卡会落到这个目录的 `qa-archive.md`，**必须给目录**：同一负责人可能管多个组件，只给 owner 系统就猜不准这次答的是哪个组件。
+   - `<<ESCALATE:none>>` —— 跨多个组件、或归属判断不明时，不 @ 任何人，也不带目录
 4. **不要在正文里直接写** `@张三` 或 `@ou_xxx` 或 markdown 链接——这些都没用。系统会**只**根据 `<<ESCALATE:...>>` 标记来渲染 @ 提醒。
 
 格式示例（好）：
@@ -113,7 +113,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。你的�
 ```
 文档中未找到 Redis 集群跨机房迁移相关内容。我查了 redis/overview.md 和 redis/troubleshooting.md，里面只覆盖单机房集群运维。建议联系负责人协助。
 
-<<ESCALATE:ou_abc123def456>>
+<<ESCALATE:ou_abc123def456:redis>>
 ```
 
 注意：以上仅在**真正无法回答**时启用。能从文档答出来的就不要触发升级。

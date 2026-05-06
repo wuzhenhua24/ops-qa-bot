@@ -77,10 +77,14 @@ def _placeholder_text(question: str, queued: bool) -> str:
 
 SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 
-# 升级机制：bot 答不上来时，按 prompt 输出 <<ESCALATE:ou_xxx>> 标记，
-# handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
-# 只接受形如 ou_xxxx 或字面量 none 两种值，防止注入。
-_ESCALATE_RE = re.compile(r"<<ESCALATE:(ou_[A-Za-z0-9_-]+|none)>>")
+# 升级机制：bot 答不上来时，按 prompt 输出 <<ESCALATE:ou_xxx:component_dir>>
+# 标记，handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
+# owner 接受 ou_xxx 或 none；后缀目录可选，由 LLM 基于"问题归属哪个组件"给出，
+# 用于归档卡选目录。owner / dir 都做白名单校验防注入和路径穿越。
+_ESCALATE_RE = re.compile(
+    r"<<ESCALATE:(?P<who>ou_[A-Za-z0-9_-]+|none)"
+    r"(?::(?P<dir>[A-Za-z0-9._/-]+))?>>"
+)
 _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
 _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
@@ -898,18 +902,46 @@ def _excerpt(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-def _parse_escalate(answer: str) -> tuple[str, str | None]:
-    """从答案里抽 <<ESCALATE:xxx>> 标记。
+def _parse_escalate(answer: str) -> tuple[str, str | None, str | None]:
+    """从答案里抽 <<ESCALATE:owner[:component_dir]>> 标记。
 
-    返回 (清理后的答案文本, 要 @ 的 open_id 或 None)。
-    none 视作 "不 @ 任何人"，与"未匹配到标记"等价。
+    返回 (清理后的答案文本, 要 @ 的 open_id 或 None, LLM 给的组件目录 hint 或 None)。
+    none 视作"不 @ 任何人"，与"未匹配到标记"等价。component_dir 是 LLM 基于答案
+    路由判断给出的归档目录提示，调用方需先 `_resolve_component_dir` 校验落地。
     """
     m = _ESCALATE_RE.search(answer)
     if not m:
-        return answer, None
+        return answer, None, None
     cleaned = _ESCALATE_RE.sub("", answer).strip()
-    target = m.group(1)
-    return cleaned, (target if target != "none" else None)
+    who = m.group("who")
+    dir_hint = m.group("dir")
+    return cleaned, (who if who != "none" else None), dir_hint
+
+
+def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
+    """把 LLM 给的目录 hint 校验成"docs_root 下真实存在的相对目录"，否则返回 None。
+
+    LLM 输出可能写错目录名 / 写绝对路径 / 写 ../../etc，必须把真实写盘路径限制在
+    docs_root 子目录下，否则归档会落到任意位置。匹配失败的 hint 直接丢弃，调用方
+    自行 fallback 到按 owner 反查 INDEX。
+    """
+    if not dir_hint:
+        return None
+    cleaned = dir_hint.strip().strip("/").rstrip("/")
+    if not cleaned or ".." in cleaned.split("/"):
+        return None
+    try:
+        target = (docs_root / cleaned).resolve()
+        root = docs_root.resolve()
+    except OSError:
+        return None
+    if not target.is_dir():
+        return None
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    return cleaned
 
 
 def _append_escalate_at(post: dict, owner_id: str) -> None:
@@ -1253,7 +1285,9 @@ async def handle_question(
     answer = answer or "（无回答内容）"
 
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
-    answer, escalate_owner = _parse_escalate(answer)
+    # escalate_dir_hint 是 LLM 直接给的归档目录（基于答案命中的组件，准确性高于
+    # 按 owner 反查；同一负责人挂多组件时只有 LLM 自己知道这次答的是哪个组件）。
+    answer, escalate_owner, escalate_dir_hint = _parse_escalate(answer)
     # 解析快捷追问标记，挂在反馈卡上面让用户一键发起新一轮
     answer, followup_keys = _parse_followups(answer)
     # 解析反问标记：是否为"信息不足、需要用户补充"的反问轮
@@ -1262,6 +1296,7 @@ async def handle_question(
     # 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
     if is_clarification:
         escalate_owner = None
+        escalate_dir_hint = None
         followup_keys = []
     final_post = _mention_post(user_id, answer)
     escalated_now = False
@@ -1336,9 +1371,11 @@ async def handle_question(
 
     # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
     if escalated_now:
-        component_dir = _index_owner_to_dir(session_mgr.docs_root).get(
-            escalate_owner or ""
-        )
+        # 优先用 LLM 给的 component_dir hint（与读文档时的判断一致），无效或缺失时
+        # fallback 到按 owner 反查 INDEX；都没有就落到 docs_root/qa-archive.md
+        component_dir = _resolve_component_dir(
+            escalate_dir_hint, session_mgr.docs_root
+        ) or _index_owner_to_dir(session_mgr.docs_root).get(escalate_owner or "")
         archive_path_repr = (
             f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
         )
