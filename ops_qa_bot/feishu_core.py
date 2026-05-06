@@ -105,12 +105,26 @@ _ERROR_PATTERNS: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 
-def _friendly_error(e: BaseException, *, context: str = "处理") -> str:
-    """归类异常 → 用户友好提示。原异常仍走 logger.exception 上报。"""
+def _friendly_error(
+    e: BaseException, *, context: str = "处理", suggest_reset: bool = False
+) -> str:
+    """归类异常 → 用户友好提示。原异常仍走 logger.exception 上报。
+
+    suggest_reset：仅 catch-all 分支生效——预分类（rate limit / timeout / 网络等）的
+    根因明确不是会话状态，重试即可，不混入 reset 建议。catch-all 里恰好包含"session
+    被 LLM 输出搞拧了 / SDK 内部状态污染"这类只能靠重启 session 恢复的场景，把已有的
+    /reset 通道在错误时机教给用户，先自救一步再走"联系管理员"。仅 QA 流程的调用处
+    传 True，图片下载 / 归档写入这种无 session 状态的上下文不传，避免误导。
+    """
     blob = (type(e).__name__ + " " + str(e)).lower()
     for keywords, friendly in _ERROR_PATTERNS:
         if any(k in blob for k in keywords):
             return friendly
+    if suggest_reset:
+        return (
+            f"❗ {context}临时出错，请稍后重试；"
+            "如反复出现可发 /reset 清空当前会话再试，仍不行请联系管理员。"
+        )
     return f"❗ {context}临时出错，请稍后重试；如持续出现请联系管理员。"
 
 
@@ -1677,7 +1691,7 @@ async def handle_question(
         answer = result.text
     except Exception as e:
         logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
-        answer = _friendly_error(e, context="问答")
+        answer = _friendly_error(e, context="问答", suggest_reset=True)
     answer = answer or "（无回答内容）"
 
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
