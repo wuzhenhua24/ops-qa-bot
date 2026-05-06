@@ -496,6 +496,12 @@ class SessionManager:
     - 首次提问时 lazy 创建 bot
     - 同一 key 内的提问串行（per-session lock）
     - 空闲超 idle_ttl 秒的会话由后台任务回收
+
+    回收是静默的，但需要给"过期回来追问"的用户显式提示。`_last_seen` 表独立
+    于 session 生命周期保留 24h，记录每个 (chat, user) 上次活跃的 unix 时间戳；
+    `take_expired_notice` 用 last_seen + session 缺失 + 距今 ≥ idle_ttl 三联
+    判定"上一轮上下文已被回收"，调用方据此在新答案里挂一行提示。`/reset`
+    主动清掉 last_seen 不算过期，避免给主动重置的用户再补一条提示。
     """
 
     def __init__(self, docs_root: Path, idle_ttl: float = 1800.0):
@@ -504,6 +510,9 @@ class SessionManager:
         self._sessions: dict[SessionKey, _SessionEntry] = {}
         self._manager_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
+        # 24h TTL：再往前的回访就当全新用户，不再提示"上下文已过期"——
+        # 隔一天才回来一般是新场景，提示反而显得啰嗦
+        self._last_seen: TTLCache = TTLCache(maxsize=10000, ttl=86400)
 
     async def start(self) -> None:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -530,12 +539,37 @@ class SessionManager:
                 self._sessions[key] = entry
                 logger.info("session created: chat=%s user=%s", *key)
             entry.last_used = time.time()
+            self._last_seen[key] = entry.last_used
             return entry
 
+    async def take_expired_notice(self, key: SessionKey) -> bool:
+        """若上一次见过该用户但 session 已被空闲回收，返回 True 并消费一次性
+        标记。**必须在 get(key) 之前调用**——get 会刷新 last_seen，调用顺序错
+        了就检测不到。
+
+        判定三条件：(1) last_seen 存在 (2) 当前 session 不在 (3) 距今 ≥ idle_ttl。
+        命中后 pop 掉 last_seen，本轮答完 get 会写回 now，下一轮自然不再触发。
+        """
+        async with self._manager_lock:
+            if key in self._sessions:
+                return False
+            last = self._last_seen.get(key)
+            if last is None:
+                return False
+            if time.time() - last < self._idle_ttl:
+                return False
+            self._last_seen.pop(key, None)
+            return True
+
     async def reset(self, key: SessionKey) -> bool:
-        """关闭并移除指定 session。返回 True 表示之前存在。"""
+        """关闭并移除指定 session。返回 True 表示之前存在。
+
+        同时清 last_seen：用户主动 /reset 不算"过期回收"，下一轮提问按全新会话
+        处理，不要再追加"上下文已过期"提示徒增噪音。
+        """
         async with self._manager_lock:
             entry = self._sessions.pop(key, None)
+            self._last_seen.pop(key, None)
         if entry is None:
             return False
         await self._close_entry(key, entry)
@@ -1543,6 +1577,11 @@ async def handle_question(
         )
         return
 
+    # 上一轮 session 已被空闲回收时一次性消费这个标记，等会儿挂在答案最前面
+    # 让用户知道"那一句『接着上面的』bot 不会按追问处理"。必须在 get(key) 前
+    # 调用，get 会刷新 last_seen 让判定失效。
+    session_expired = await session_mgr.take_expired_notice(key)
+
     # 1. 立即发占位消息：带问题摘要 + 排队/翻文档状态前缀，让用户能识别这条占位
     # 是为哪一句问题、是否在排队等前一条
     queued = await session_mgr.queued(key)
@@ -1649,6 +1688,16 @@ async def handle_question(
         # 失败/超 3 张静默剥除（带 warning 日志），不阻塞答题主链路
         answer, attached_images = await _resolve_image_markers(
             answer, session_mgr.docs_root, feishu
+        )
+    # 上一轮上下文已过期时在答案最前面加一行提示，让用户立刻知道"那句『接着
+    # 上面的』bot 没拿到上下文，本次按全新问题答的"。注入放在嵌图标记解析之后、
+    # _mention_post 之前，提示成为飞书 post 的第一段，最显眼。
+    if session_expired:
+        idle_minutes = max(1, int(session_mgr.idle_ttl // 60))
+        answer = (
+            f"⏱️ 上一轮上下文已过期（{idle_minutes} 分钟未活跃自动重置），"
+            "本次按新问题处理。\n\n"
+            + answer
         )
     final_post = _mention_post(user_id, answer)
     escalated_now = False
