@@ -263,12 +263,12 @@ _CLARIFY_RE = re.compile(r"<<CLARIFY>>")
 # 答案内嵌图机制：步骤截图 / 标注图 / 强相关故障截图，文字转述不如直接展示。
 # LLM 在答案里独立一行写 <<IMG:redis/images/step1.png>>（路径相对 docs_root），
 # bot 校验路径 → 上传飞书拿 image_key → 把标记换成 <<IMG_KEY:img_xxx>>，渲染层
-# 把这种行渲染为飞书 post 的 img 段。每条最多 3 张，超限静默截断。
+# 把这种行渲染为飞书 post 的 img 段。每条最多 5 张，超限剥除 + 末尾告知用户。
 # 路径正则放宽到非控制字符以兼容中文/带空格的文件名；安全校验在 _validate 里做。
 _IMG_RE = re.compile(r"<<IMG:([^<>\n\r]+?)>>")
 _IMG_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 _IMG_MAX_BYTES = 5 * 1024 * 1024  # 飞书消息图官方上限 10MB，留点余量
-_IMG_MAX_PER_ANSWER = 3
+_IMG_MAX_PER_ANSWER = 5
 # 同一 docs 图在多轮答案里会被反复引用，缓存 (绝对路径, mtime) → image_key 避免
 # 重复上传；mtime 变化（图被替换）天然失效。LRU 500 条对常规文档量够用。
 _image_key_cache: LRUCache = LRUCache(maxsize=500)
@@ -982,17 +982,19 @@ async def _upload_doc_image(
 
 async def _resolve_image_markers(
     answer: str, docs_root: Path, feishu: "FeishuClient"
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[str]]:
     """剥答案里的 <<IMG:rel_path>>：校验路径 → 上传 → 把成功的标记换成
     <<IMG_KEY:img_xxx>>，失败/超限的剥除。
 
-    返回 (改写后的答案, 已展示的相对路径列表)；后者只供日志统计 ROI 用。
+    返回 (改写后的答案, 已展示的相对路径列表, 因 cap 被截断的相对路径列表)。
+    `attached` 供日志统计展示 ROI；`truncated` 让调用方在答案末尾告知用户
+    "另有 N 张图未展示"，避免出现"按下图操作"但底下没图的脱节体验。
     保序去重：同一路径在答案里重复出现只上传一次、只展示一次（LLM 偶尔会把图
     放在多个段落里），按出现顺序保留，超过 _IMG_MAX_PER_ANSWER 截断。
     """
     paths_in_order = _IMG_RE.findall(answer)
     if not paths_in_order:
-        return answer, []
+        return answer, [], []
     seen: set[str] = set()
     uniq: list[str] = []
     for p in paths_in_order:
@@ -1000,6 +1002,11 @@ async def _resolve_image_markers(
         if cleaned and cleaned not in seen:
             seen.add(cleaned)
             uniq.append(cleaned)
+
+    # 严格按 cap 切：只有"超出 cap 被吞掉"的算 truncated；前 N 张里因路径无效 /
+    # 上传失败丢的算"失败"（已有 warning 日志），不汇总成用户可见提示——失败是
+    # 偶发/可疑事件，混进"另有 N 张图未展示"会让用户以为是 cap 截断。
+    truncated = uniq[_IMG_MAX_PER_ANSWER:]
 
     path_to_key: dict[str, str] = {}
     attached: list[str] = []
@@ -1023,7 +1030,7 @@ async def _resolve_image_markers(
     new_answer = _IMG_RE.sub(_replace, answer)
     # 剥除标记后可能留多余空行，归并相邻空行减少视觉噪音
     new_answer = re.sub(r"\n{3,}", "\n\n", new_answer).strip()
-    return new_answer, attached
+    return new_answer, attached, truncated
 
 
 def _followup_ack_card(label: str) -> dict:
@@ -1711,12 +1718,31 @@ async def handle_question(
         # 反问轮里 LLM 不应该塞图，但如果塞了直接剥掉标记不上传
         answer = _IMG_RE.sub("", answer).strip()
         attached_images: list[str] = []
+        truncated_images: list[str] = []
     else:
         # 解析答案内嵌图：校验路径 → 上传飞书 → 把 <<IMG:path>> 换成 <<IMG_KEY:img_xxx>>
         # 失败/超 3 张静默剥除（带 warning 日志），不阻塞答题主链路
-        answer, attached_images = await _resolve_image_markers(
+        answer, attached_images, truncated_images = await _resolve_image_markers(
             answer, session_mgr.docs_root, feishu
         )
+        # 超 cap 截断时在答案末尾告知用户少了几张、是哪些（取 basename，不暴露
+        # 完整文档路径）。用 set 去重 basename 在不同目录重名的极端情况；列举
+        # 5 张内全列，更多只列前 5 张 + 省略号，避免提示行本身刷屏。
+        if truncated_images:
+            names_unique: list[str] = []
+            seen_names: set[str] = set()
+            for p in truncated_images:
+                base = p.rsplit("/", 1)[-1]
+                if base not in seen_names:
+                    seen_names.add(base)
+                    names_unique.append(base)
+            shown = "、".join(names_unique[:5])
+            if len(names_unique) > 5:
+                shown += "…"
+            answer = (
+                answer.rstrip()
+                + f"\n\n（另有 {len(truncated_images)} 张图未展示：{shown}）"
+            )
     # 上一轮上下文已过期时在答案最前面加一行提示，让用户立刻知道"那句『接着
     # 上面的』bot 没拿到上下文，本次按全新问题答的"。注入放在嵌图标记解析之后、
     # _mention_post 之前，提示成为飞书 post 的第一段，最显眼。
@@ -1804,6 +1830,10 @@ async def handle_question(
     if attached_images:
         # 用相对路径而不是 image_key，事后能直接定位到具体哪些图被引用
         qa_record["images_attached"] = attached_images
+    if truncated_images:
+        # 监控 cap=3 命中频率：grep `images_truncated` 看 LLM 多频繁超量、
+        # 是不是该把上限从 3 调高
+        qa_record["images_truncated"] = truncated_images
     # 模型用量：直接转发 SDK 给的字段，对接第三方 Claude 兼容代理时可以拿
     # input_tokens / output_tokens / cache_* 套自己的单价表算成本。
     if result is not None:
