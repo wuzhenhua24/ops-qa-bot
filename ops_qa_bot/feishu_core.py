@@ -844,7 +844,7 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                         {
                             "tag": "input",
                             "name": "comment",
-                            "multiline": True,
+                            "input_type": "multiline_text",
                             "rows": 3,
                             "max_length": 500,
                             "placeholder": {
@@ -855,59 +855,34 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                             "label_position": "top",
                         },
                         {
-                            "tag": "column_set",
-                            "columns": [
+                            "tag": "button",
+                            "name": "submit_btn",
+                            "text": {"tag": "plain_text", "content": "提交"},
+                            "type": "primary",
+                            "form_action_type": "submit",
+                            "behaviors": [
                                 {
-                                    "tag": "column",
-                                    "width": "weighted",
-                                    "weight": 1,
-                                    "elements": [
-                                        {
-                                            "tag": "button",
-                                            "name": "submit_btn",
-                                            "text": {
-                                                "tag": "plain_text",
-                                                "content": "提交",
-                                            },
-                                            "type": "primary",
-                                            "form_action_type": "submit",
-                                            "behaviors": [
-                                                {
-                                                    "type": "callback",
-                                                    "value": {
-                                                        "action": "feedback_reason_submit",
-                                                        **btn_common,
-                                                    },
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
+                                    "type": "callback",
+                                    "value": {
+                                        "action": "feedback_reason_submit",
+                                        **btn_common,
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "tag": "button",
+                            "name": "skip_btn",
+                            "text": {"tag": "plain_text", "content": "跳过"},
+                            "type": "default",
+                            "behaviors": [
                                 {
-                                    "tag": "column",
-                                    "width": "weighted",
-                                    "weight": 1,
-                                    "elements": [
-                                        {
-                                            "tag": "button",
-                                            "name": "skip_btn",
-                                            "text": {
-                                                "tag": "plain_text",
-                                                "content": "跳过",
-                                            },
-                                            "type": "default",
-                                            "behaviors": [
-                                                {
-                                                    "type": "callback",
-                                                    "value": {
-                                                        "action": "feedback_reason_skip",
-                                                        **btn_common,
-                                                    },
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
+                                    "type": "callback",
+                                    "value": {
+                                        "action": "feedback_reason_skip",
+                                        **btn_common,
+                                    },
+                                }
                             ],
                         },
                     ],
