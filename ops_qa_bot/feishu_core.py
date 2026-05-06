@@ -1267,10 +1267,13 @@ def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
     return cleaned
 
 
-def _append_escalate_at(post: dict, owner_id: str) -> None:
-    """在 post 内容末尾追加一段 "📣 已通知负责人 @xxx 协助回答"。
+def _append_escalate_at(post: dict, owner_id: str, archive_path: str) -> None:
+    """在 post 末尾追加 "📣 已通知负责人 @xxx" + "📁 归档去向" 两行。
 
-    用独立段落（一行）展示，不和答案正文挤在一起。
+    archive_path 是相对 docs_root 的路径（如 "redis/qa-archive.md"），与紧随其后
+    发出的归档表单卡 (_archive_form_card) 一致。告诉 asker 答案最终会落到哪、下次
+    类似问题 bot 能从哪里直接答，避免"通知完就没下文"的预期空白。归档依赖 owner
+    填表单，措辞用条件式（"填写后会归档"）不要说死。
     """
     post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
     post["zh_cn"]["content"].append(
@@ -1278,6 +1281,17 @@ def _append_escalate_at(post: dict, owner_id: str) -> None:
             {"tag": "text", "text": "📣 已通知负责人 "},
             {"tag": "at", "user_id": owner_id},
             {"tag": "text", "text": " 协助回答 🙏"},
+        ]
+    )
+    post["zh_cn"]["content"].append(
+        [
+            {
+                "tag": "text",
+                "text": (
+                    f"📁 负责人填写后会归档到 {archive_path}，"
+                    "下次类似问题我能直接从这里答。"
+                ),
+            }
         ]
     )
 
@@ -1701,6 +1715,11 @@ async def handle_question(
         )
     final_post = _mention_post(user_id, answer)
     escalated_now = False
+    # component_dir / archive_path_repr 在 cooldown 不命中时需要喂给 _append_escalate_at
+    # （让 asker 知道答案会归档到哪），escalated_now=True 时还要复用给后面的归档表单卡，
+    # 保证两边路径完全一致。cooldown 命中走不到，留默认值即可。
+    component_dir: str | None = None
+    archive_path_repr = "qa-archive.md"
     if escalate_owner is not None:
         cooldown_key = (chat_id, escalate_owner)
         if cooldown_key in _escalate_cooldown:
@@ -1710,8 +1729,32 @@ async def handle_question(
                 escalate_owner,
             )
         else:
+            # 优先用 LLM 给的 component_dir hint（与读文档时的判断一致）；hint 无效或
+            # 缺失时按 owner 反查 INDEX，**且仅在 owner 唯一对应一个目录时才 fallback**
+            # ——多对一情况下反查会猜错（同一负责人挂多个组件，只能押一个），不如直接
+            # 落公共 docs_root/qa-archive.md 让人事后挪，比静默落到错的组件目录强。
+            component_dir = _resolve_component_dir(
+                escalate_dir_hint, session_mgr.docs_root
+            )
+            if not component_dir:
+                owner_dirs = _index_owner_to_dirs(session_mgr.docs_root).get(
+                    escalate_owner, []
+                )
+                if len(owner_dirs) == 1:
+                    component_dir = owner_dirs[0]
+                elif len(owner_dirs) > 1:
+                    logger.info(
+                        "owner has multiple dirs, falling back to public archive: "
+                        "owner=%s dirs=%s",
+                        escalate_owner,
+                        owner_dirs,
+                    )
+            archive_path_repr = (
+                f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
+            )
+
             _escalate_cooldown[cooldown_key] = True
-            _append_escalate_at(final_post, escalate_owner)
+            _append_escalate_at(final_post, escalate_owner, archive_path_repr)
             escalated_now = True
             logger.info(
                 "escalated to owner: chat=%s owner=%s", chat_id, escalate_owner
@@ -1773,31 +1816,10 @@ async def handle_question(
             parent_id=parent_msg_id,
         )
 
-    # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
+    # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）。
+    # component_dir / archive_path_repr 已在 _append_escalate_at 之前算好，这里直接复用，
+    # 与答案末尾告知 asker 的归档路径保持一致。
     if escalated_now:
-        # 优先用 LLM 给的 component_dir hint（与读文档时的判断一致）；hint 无效或
-        # 缺失时按 owner 反查 INDEX，**且仅在 owner 唯一对应一个目录时才 fallback**
-        # ——多对一情况下反查会猜错（同一负责人挂多个组件，只能押一个），不如直接
-        # 落公共 docs_root/qa-archive.md 让人事后挪，比静默落到错的组件目录强。
-        component_dir = _resolve_component_dir(
-            escalate_dir_hint, session_mgr.docs_root
-        )
-        if not component_dir and escalate_owner:
-            owner_dirs = _index_owner_to_dirs(session_mgr.docs_root).get(
-                escalate_owner, []
-            )
-            if len(owner_dirs) == 1:
-                component_dir = owner_dirs[0]
-            elif len(owner_dirs) > 1:
-                logger.info(
-                    "owner has multiple dirs, falling back to public archive: "
-                    "owner=%s dirs=%s",
-                    escalate_owner,
-                    owner_dirs,
-                )
-        archive_path_repr = (
-            f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
-        )
         _pending_archives[qid] = {
             "chat_id": chat_id,
             "asker_id": user_id,
