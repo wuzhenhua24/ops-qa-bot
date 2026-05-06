@@ -861,10 +861,15 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                             "text": {"tag": "plain_text", "content": "提交"},
                             "type": "primary",
                             "form_action_type": "submit",
-                            "value": {
-                                "action": "feedback_reason_submit",
-                                **btn_common,
-                            },
+                            "behaviors": [
+                                {
+                                    "type": "callback",
+                                    "value": {
+                                        "action": "feedback_reason_submit",
+                                        **btn_common,
+                                    },
+                                }
+                            ],
                         },
                     ],
                 },
