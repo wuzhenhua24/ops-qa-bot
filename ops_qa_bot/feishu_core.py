@@ -133,7 +133,7 @@ _FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
 # 24h 没人填写就过期，重启后清空（测试环境不持久化）。
 _pending_archives: TTLCache = TTLCache(maxsize=1000, ttl=86400)
 # INDEX.md 解析缓存：路径 → (mtime, {open_id: 目录名})
-_archive_index_cache: dict[Path, tuple[float, dict[str, str]]] = {}
+_archive_index_cache: dict[Path, tuple[float, dict[str, list[str]]]] = {}
 # 每个归档文件一把 asyncio.Lock，避免并发提交撕裂内容
 _archive_locks: dict[Path, asyncio.Lock] = {}
 
@@ -959,8 +959,12 @@ def _append_escalate_at(post: dict, owner_id: str) -> None:
     )
 
 
-def _index_owner_to_dir(docs_root: Path) -> dict[str, str]:
-    """解析 docs_root/INDEX.md 的"组件目录"表 → {open_id: 目录名}。
+def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
+    """解析 docs_root/INDEX.md 的"组件目录"表 → {open_id: [目录1, 目录2, ...]}。
+
+    一个 owner 在表里挂多个组件时所有目录都保留（保序去重），不再后写覆盖前写。
+    调用方在 owner 反查兜底时只接受唯一映射，多目录场景下让 LLM 给的 hint 决定，
+    避免归档静默落到"该 owner 名下另一个组件"。
 
     依赖 mtime 缓存：文件没改就直接返回上次的结果。
     解析容错：表头需要同时含"目录"和"open_id"两列；分隔行（|---|）跳过；
@@ -975,7 +979,7 @@ def _index_owner_to_dir(docs_root: Path) -> dict[str, str]:
     if cached is not None and cached[0] == mtime:
         return cached[1]
 
-    mapping: dict[str, str] = {}
+    mapping: dict[str, list[str]] = {}
     in_table = False
     dir_idx = -1
     open_id_idx = -1
@@ -1003,7 +1007,9 @@ def _index_owner_to_dir(docs_root: Path) -> dict[str, str]:
                 open_id_cell = cols[open_id_idx].strip("`").strip()
                 if not dir_cell or not _OPEN_ID_RE.match(open_id_cell):
                     continue
-                mapping[open_id_cell] = dir_cell
+                dirs = mapping.setdefault(open_id_cell, [])
+                if dir_cell not in dirs:
+                    dirs.append(dir_cell)
     except OSError as e:
         logger.warning("read INDEX.md for archive mapping failed: %s", e)
         return _archive_index_cache.get(index_path, (0.0, {}))[1]
@@ -1371,11 +1377,26 @@ async def handle_question(
 
     # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）
     if escalated_now:
-        # 优先用 LLM 给的 component_dir hint（与读文档时的判断一致），无效或缺失时
-        # fallback 到按 owner 反查 INDEX；都没有就落到 docs_root/qa-archive.md
+        # 优先用 LLM 给的 component_dir hint（与读文档时的判断一致）；hint 无效或
+        # 缺失时按 owner 反查 INDEX，**且仅在 owner 唯一对应一个目录时才 fallback**
+        # ——多对一情况下反查会猜错（同一负责人挂多个组件，只能押一个），不如直接
+        # 落公共 docs_root/qa-archive.md 让人事后挪，比静默落到错的组件目录强。
         component_dir = _resolve_component_dir(
             escalate_dir_hint, session_mgr.docs_root
-        ) or _index_owner_to_dir(session_mgr.docs_root).get(escalate_owner or "")
+        )
+        if not component_dir and escalate_owner:
+            owner_dirs = _index_owner_to_dirs(session_mgr.docs_root).get(
+                escalate_owner, []
+            )
+            if len(owner_dirs) == 1:
+                component_dir = owner_dirs[0]
+            elif len(owner_dirs) > 1:
+                logger.info(
+                    "owner has multiple dirs, falling back to public archive: "
+                    "owner=%s dirs=%s",
+                    escalate_owner,
+                    owner_dirs,
+                )
         archive_path_repr = (
             f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
         )
