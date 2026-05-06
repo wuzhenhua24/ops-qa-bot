@@ -74,6 +74,46 @@ _PROGRESS_MIN_INTERVAL = 1.5
 _PROGRESS_MAX_UPDATES = 5
 
 
+# 错误归类：把底层异常翻译成"用户能看懂、知道下一步怎么做"的提示，避免把
+# traceback / API code / SDK 内部消息泄漏到飞书。判定靠"异常类名 + str(e)"
+# 关键词嗅探，httpx / SDK / 第三方 Claude 兼容代理的异常类型各异，硬绑类型
+# 反而会漏；未命中归通用兜底。raw exception 仍由 logger.exception 进日志。
+_ERROR_PATTERNS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("rate limit", "rate_limit", "ratelimit", "429", "overloaded", "too many requests"),
+        "🙇 模型当前繁忙，请稍等几秒再试一次。",
+    ),
+    (
+        ("timeout", "timed out", "deadline exceeded"),
+        "⏱️ 处理超时，请稍后重试；如反复出现请把问题简化或拆成几条问。",
+    ),
+    (
+        ("payload too large", "request entity too large", "413"),
+        "📦 请求过大，请压缩附件或简化问题后重试。",
+    ),
+    (
+        ("unauthorized", "401", "permission denied", "forbidden", "403"),
+        "🔒 权限或鉴权出错，请联系机器人管理员核对配置。",
+    ),
+    (
+        # 上游连接 / 网关错误。注意 "connection" 关键词放在 401/403 之后，避免
+        # "Connection refused / 401" 之类混合消息被错归到网络档
+        ("connection refused", "connect error", "network is unreachable",
+         "bad gateway", "502", "503", "504", "gateway timeout"),
+        "🌐 网络或上游服务不稳定，稍后重试一次。",
+    ),
+)
+
+
+def _friendly_error(e: BaseException, *, context: str = "处理") -> str:
+    """归类异常 → 用户友好提示。原异常仍走 logger.exception 上报。"""
+    blob = (type(e).__name__ + " " + str(e)).lower()
+    for keywords, friendly in _ERROR_PATTERNS:
+        if any(k in blob for k in keywords):
+            return friendly
+    return f"❗ {context}临时出错，请稍后重试；如持续出现请联系管理员。"
+
+
 def _placeholder_text(question: str, queued: bool) -> str:
     """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
 
@@ -623,7 +663,8 @@ async def handle_image_question(
             chat_id,
             _mention_post(
                 user_id,
-                f"图片下载失败 🙏 {e}\n你可以把截图里的关键报错或现象用文字描述出来再发。",
+                f"📎 附件读取失败：{_friendly_error(e, context='图片下载')}\n"
+                "你可以把截图里的关键报错或现象用文字描述出来再发。",
             ),
             parent_id=parent_msg_id,
         )
@@ -1429,7 +1470,9 @@ async def handle_archive_submit(
         )
     except Exception as e:
         logger.exception("archive write failed: qid=%s path=%s", qid, file_path)
-        return _archive_ack_card("❌", f"归档写入失败：{e}")
+        return _archive_ack_card(
+            "❌", _friendly_error(e, context="归档写入")
+        )
 
     # 完成（写入或幂等命中）：从 pending 里清掉，避免重复处理
     _pending_archives.pop(qid, None)
@@ -1581,7 +1624,7 @@ async def handle_question(
         answer = result.text
     except Exception as e:
         logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
-        answer = f"抱歉，处理失败：{e}"
+        answer = _friendly_error(e, context="问答")
     answer = answer or "（无回答内容）"
 
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
