@@ -589,6 +589,7 @@ def _feedback_card(qid: str, user_id: str) -> dict:
     }
     return {
         "schema": "2.0",
+        "config": {"update_multi": True},
         "body": {
             "elements": [
                 {"tag": "markdown", "content": "这次回答是否有帮助？"},
@@ -807,7 +808,10 @@ _FEEDBACK_REASONS: dict[str, str] = {
 def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
     """👎 后替换原卡的原因收集表单（card v2 form）。
 
-    select 选原因 + 多行 input 写备注（可选）+ 提交/跳过两个按钮。
+    select 选原因 + 多行 input 写备注（可选）+ 提交按钮，跳过按钮放 form 外（form 内
+    放无 form_action_type 的纯 callback button 行为不明确，官方 demo 没这种写法）。
+    submit 不挂 behaviors callback，仅靠 form_action_type:"submit" + button.value
+    触发提交回调；事件里 action.value 带 payload，action.form_value 带字段值。
     qid / asker_id 透过按钮 value 带回，不依赖服务端状态。
     """
     options = [
@@ -817,6 +821,7 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
     btn_common = {"qid": qid, "asker_id": asker_id}
     return {
         "schema": "2.0",
+        "config": {"update_multi": True},
         "body": {
             "elements": [
                 {
@@ -836,8 +841,6 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                                 "tag": "plain_text",
                                 "content": "请选择原因",
                             },
-                            "label": {"tag": "plain_text", "content": "原因"},
-                            "label_position": "top",
                             "required": True,
                             "options": options,
                         },
@@ -851,8 +854,6 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                                 "tag": "plain_text",
                                 "content": "可选：举例哪步错了 / 哪条步骤少了 / 哪段过时了",
                             },
-                            "label": {"tag": "plain_text", "content": "备注（可选）"},
-                            "label_position": "top",
                         },
                         {
                             "tag": "button",
@@ -860,31 +861,26 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                             "text": {"tag": "plain_text", "content": "提交"},
                             "type": "primary",
                             "form_action_type": "submit",
-                            "behaviors": [
-                                {
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "feedback_reason_submit",
-                                        **btn_common,
-                                    },
-                                }
-                            ],
+                            "value": {
+                                "action": "feedback_reason_submit",
+                                **btn_common,
+                            },
                         },
+                    ],
+                },
+                {
+                    "tag": "button",
+                    "name": "skip_btn",
+                    "text": {"tag": "plain_text", "content": "跳过"},
+                    "type": "default",
+                    "behaviors": [
                         {
-                            "tag": "button",
-                            "name": "skip_btn",
-                            "text": {"tag": "plain_text", "content": "跳过"},
-                            "type": "default",
-                            "behaviors": [
-                                {
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "feedback_reason_skip",
-                                        **btn_common,
-                                    },
-                                }
-                            ],
-                        },
+                            "type": "callback",
+                            "value": {
+                                "action": "feedback_reason_skip",
+                                **btn_common,
+                            },
+                        }
                     ],
                 },
             ]
