@@ -175,13 +175,13 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 - **答案内嵌图（把原图展示给用户）**：步骤截图配箭头标注、UI 控制台界面图、强相关故障截图，文字转述不如直接发原图。LLM 在答案里独立行写 `<<IMG:redis/images/step1.png>>`，bot 校验路径（必须 docs_root 子目录下真实存在的 .png/.jpg/.jpeg/.gif/.webp，≤5MB，防 `..` 路径穿越）→ 通过 `POST /im/v1/images` 上传飞书拿 image_key（`(绝对路径, mtime)` 做 LRU 缓存 500 条避免重复上传）→ 飞书 post 渲染层把这种行转成 `{tag:img, image_key:...}` 段。每条回答最多 3 张，超限静默截断。架构图/概念图 LLM 一般转述成文字步骤更有用，prompt 里明确不要回显这类图。`logs/feedback.log` 里 `qa` 事件多个 `images_attached: ['rel/path.png',...]` 字段，事后能算触发率和具体哪些图被引用得多。
 - **非 text 消息友好提示**：除 image 走视觉路径外，其它非 text 消息（file / sticker / audio / 转发合并消息等）入口直接回一条提示 "目前只支持文字提问，关键报错请用文字描述"，避免静默丢弃让用户以为 bot 没看见。
 - **快捷追问**：答完后 LLM 按问题类型挑 1-3 个追问按钮**单独发一张追问卡**（与反馈卡解耦，避免点追问把反馈卡顶掉、用户失去打分入口）。如故障类挂"排查步骤/风险点/示例命令"，变更类挂"回滚方案/风险点/示例命令"，用户一键即发起新一轮。追问卡的按钮 value 里带原问题 message_id，新一轮的占位/答案/反馈卡都引用回原问题，线程感不断。可选项库 6 个，prompt 端枚举给 LLM 选；标记 `<<FOLLOWUPS:k1|k2|k3>>` 写在答案末尾，bot 解析剥离后渲染按钮，注入防御靠 key 白名单。仅原提问者能点（开放给整群会乱）。
-- **反馈收集**：答案后紧跟一条 interactive 卡片，带 👍 / 👎 两个按钮。用户点击 → 飞书回调 `/feishu/card` → 服务侧记录 + 返回新卡片替换按钮（防重复点击）。点 👎 时会再弹一张 v2 表单卡，让用户从 5 类原因（文档过时 / 步骤不完整 / 事实错误 / 答案啰嗦 / 其他）里选一个，可附备注；用户填完点提交或跳过都计入日志。问答和反馈都落在 `logs/feedback.log`，每行 JSON，用 `qid` 关联：
+- **反馈收集**：答案后紧跟一条 interactive 卡片，带 👍 / 👎 两个按钮。用户点击 → 飞书回调 `/feishu/card` → 服务侧记录 + 返回新卡片替换按钮（防重复点击）。点 👎 时会再弹一张 v2 表单卡，让用户从 5 类原因（文档过时 / 步骤不完整 / 事实错误 / 答案啰嗦 / 其他）里**多选一个或多个**（如"过时 + 不完整"经常同时成立），可附备注；用户填完点提交或跳过都计入日志。问答和反馈都落在 `logs/feedback.log`，每行 JSON，用 `qid` 关联：
 
   ```
   2026-04-24 ... {"event": "qa", "qid": "abc123", ...}
   2026-04-24 ... {"event": "followup", "qid": "abc123", "key": "rollback", "label": "↩️ 回滚方案", "asker_id": "...", "clicker_id": "..."}
   2026-04-24 ... {"event": "feedback", "qid": "abc123", "rating": "down", "clicker_id": "...", "asker_id": "..."}
-  2026-04-24 ... {"event": "feedback_reason", "qid": "abc123", "reason": "outdated", "reason_label": "文档过时", "comment": "示例命令是旧版的", "clicker_id": "...", "invalid": false}
+  2026-04-24 ... {"event": "feedback_reason", "qid": "abc123", "reasons": ["outdated", "incomplete"], "reason_labels": ["文档过时", "步骤不完整"], "comment": "示例命令是旧版的", "clicker_id": "...", "invalid": false}
   2026-04-24 ... {"event": "archive", "qid": "abc123", "owner_id": "...", "path": "redis/qa-archive.md", ...}
   ```
 

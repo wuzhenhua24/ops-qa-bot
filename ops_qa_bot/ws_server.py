@@ -278,10 +278,18 @@ class WsRunner:
                 ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
             else:
                 form_value = data.action.form_value or {}
-                reason = form_value.get("reason") or None
+                # multi_select_static 返回 list[str]；防御兼容历史 str 值（飞书 SDK
+                # 调整或回放旧事件时可能塞单字符串），统一归并成 list 喂给下游
+                raw_reasons = form_value.get("reasons")
+                if isinstance(raw_reasons, str):
+                    reasons = [raw_reasons]
+                elif isinstance(raw_reasons, list):
+                    reasons = [r for r in raw_reasons if isinstance(r, str)]
+                else:
+                    reasons = None
                 comment = form_value.get("comment") or None
                 ack_card = handle_feedback_reason_submit(
-                    qid, reason, comment, clicker_id, asker_id
+                    qid, reasons, comment, clicker_id, asker_id
                 )
             return P2CardActionTriggerResponse(
                 {"card": {"type": "raw", "data": ack_card}}

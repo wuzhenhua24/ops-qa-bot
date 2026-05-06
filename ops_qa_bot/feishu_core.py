@@ -1156,11 +1156,11 @@ _FEEDBACK_REASONS: dict[str, str] = {
 def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
     """👎 后替换原卡的原因收集表单（card v2 form）。
 
-    select 选原因 + 多行 input 写备注（可选）+ 提交按钮，跳过按钮放 form 外（form 内
-    放无 form_action_type 的纯 callback button 行为不明确，官方 demo 没这种写法）。
-    submit 不挂 behaviors callback，仅靠 form_action_type:"submit" + button.value
-    触发提交回调；事件里 action.value 带 payload，action.form_value 带字段值。
-    qid / asker_id 透过按钮 value 带回，不依赖服务端状态。
+    multi_select 多选原因 + 多行 input 写备注（可选）+ 提交按钮，跳过按钮放 form 外
+    （form 内放无 form_action_type 的纯 callback button 行为不明确，官方 demo 没这种
+    写法）。submit 不挂 behaviors callback，仅靠 form_action_type:"submit" + button.value
+    触发提交回调；事件里 action.value 带 payload，action.form_value 带字段值（多选返回
+    数组）。qid / asker_id 透过按钮 value 带回，不依赖服务端状态。
     """
     options = [
         {"text": {"tag": "plain_text", "content": label}, "value": value}
@@ -1183,11 +1183,11 @@ def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
                     "name": "feedback_reason_form",
                     "elements": [
                         {
-                            "tag": "select_static",
-                            "name": "reason",
+                            "tag": "multi_select_static",
+                            "name": "reasons",
                             "placeholder": {
                                 "tag": "plain_text",
-                                "content": "请选择原因",
+                                "content": "可多选（如过时 + 不完整）",
                             },
                             "required": True,
                             "options": options,
@@ -1940,16 +1940,16 @@ def handle_feedback_click(
 
 def handle_feedback_reason_submit(
     qid: str | None,
-    reason: str | None,
+    reasons: list[str] | None,
     comment: str | None,
     clicker_id: str | None,
     asker_id: str | None,
 ) -> dict:
     """处理 👎 后原因表单的提交，返回最终 ack 卡。
 
-    reason 不在白名单（None / 注入 / SDK 字段名变了）会写一行 invalid 标记的
-    日志，但仍返回 ack，避免 UI 卡住。grep `event=feedback_reason invalid=true`
-    可发现这类异常。
+    reasons 是多选返回的 value 列表，按白名单过滤后落 reasons / reason_labels（list）。
+    全部不在白名单或为空（None / 注入 / SDK 字段名变了）会写一行 invalid 标记的日志，
+    但仍返回 ack 避免 UI 卡住。grep `event=feedback_reason invalid=true` 可发现这类异常。
 
     非提问者提交会被拒绝并返回原表单卡，避免污染 reason 数据 / 把 asker 的表单顶掉。
     """
@@ -1972,14 +1972,23 @@ def handle_feedback_reason_submit(
             asker_id,
         )
         return _feedback_reason_form_card(qid, asker_id)
-    valid = reason in _FEEDBACK_REASONS
+    # 白名单过滤 + 保序去重，防 SDK 字段抖动 / 注入塞乱码 / 用户重复勾选
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for r in reasons or []:
+        if r in _FEEDBACK_REASONS and r not in seen:
+            seen.add(r)
+            cleaned.append(r)
+    valid = bool(cleaned)
     feedback_logger.info(
         json.dumps(
             {
                 "event": "feedback_reason",
                 "qid": qid,
-                "reason": reason if valid else None,
-                "reason_label": _FEEDBACK_REASONS.get(reason or "") if valid else None,
+                "reasons": cleaned if valid else None,
+                "reason_labels": (
+                    [_FEEDBACK_REASONS[r] for r in cleaned] if valid else None
+                ),
                 "comment": _excerpt(comment, 500) if comment else None,
                 "clicker_id": clicker_id,
                 "asker_id": asker_id,
@@ -1989,9 +1998,9 @@ def handle_feedback_reason_submit(
         )
     )
     logger.info(
-        "feedback reason qid=%s reason=%s by=%s comment_len=%d",
+        "feedback reasons qid=%s reasons=%s by=%s comment_len=%d",
         qid,
-        reason,
+        cleaned,
         clicker_id,
         len(comment or ""),
     )
