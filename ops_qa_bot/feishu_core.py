@@ -1014,10 +1014,10 @@ def _archive_form_card(
                             "name": "answer",
                             "input_type": "multiline_text",
                             "rows": 6,
-                            "max_length": 10000,
+                            "max_length": 1000,
                             "placeholder": {
                                 "tag": "plain_text",
-                                "content": "粘贴整理后的答案文本…",
+                                "content": "粘贴整理后的答案文本（最多 1000 字）…",
                             },
                             "required": True,
                         },
