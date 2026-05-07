@@ -45,6 +45,21 @@ DEFAULT_IMAGE_PROMPT = (
 )
 
 
+def _extract_image_caption(content_dict: dict) -> str | None:
+    """从 image 消息 content 里抽 caption-like 字段。
+
+    飞书标准 image 消息 schema 只有 `{"image_key": "..."}`，没有 caption 字段；
+    但转发 / 富文本中转 / 部分第三方客户端会把说明文字塞到 caption / text /
+    description 之一。全部尝试，第一个非空字符串就用，都没有返回 None。
+    防御性读取——多数场景这是 no-op，少数场景能多兜住一段用户语义。
+    """
+    for k in ("caption", "text", "description"):
+        v = content_dict.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
 def _normalize_image_media_type(content_type: str, data: bytes) -> str:
     """归一化 image media_type 到 Anthropic vision 接受的集合内。
 
@@ -691,6 +706,8 @@ async def handle_image_question(
     parent_msg_id: str | None,
     feishu: "FeishuClient",
     session_mgr: "SessionManager",
+    *,
+    caption: str | None = None,
 ) -> None:
     """处理 image 类型消息：下载 → 视觉答题。
 
@@ -698,6 +715,10 @@ async def handle_image_question(
     答题流程，避免把 LLM 报错原文甩给用户。下载成功后用 DEFAULT_IMAGE_PROMPT
     作为引导问题，调用 `handle_question(images=...)` 复用占位 / 反馈卡 / 追问
     等所有现有逻辑。
+
+    `caption` 由 server 层 `_extract_image_caption` 防御性抽出来：标准 image 消息
+    没这个字段，但转发 / 富文本 / 第三方客户端偶有；非空时把它当成用户真正问的
+    内容，DEFAULT_IMAGE_PROMPT 退化成"先识别再答"的格式说明。
     """
     if not parent_msg_id:
         # 没有原消息 id 拿不到资源端点（API 必须 message_id + file_key）
@@ -749,17 +770,26 @@ async def handle_image_question(
         return
 
     logger.info(
-        "image question: chat=%s user=%s key=%s size=%dB type=%s",
+        "image question: chat=%s user=%s key=%s size=%dB type=%s caption_len=%d",
         chat_id,
         user_id,
         image_key,
         len(img_bytes),
         media_type,
+        len(caption or ""),
     )
+    if caption:
+        question = (
+            f"{caption}\n\n"
+            "（同时附了一张截图。先从图里识别关键信息（报错 / 命令 / 指标 / 配置等），"
+            "再结合上面的问题去文档里查解决办法。）"
+        )
+    else:
+        question = DEFAULT_IMAGE_PROMPT
     await handle_question(
         chat_id,
         user_id,
-        DEFAULT_IMAGE_PROMPT,
+        question,
         feishu,
         session_mgr,
         parent_msg_id=parent_msg_id,

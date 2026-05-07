@@ -24,6 +24,7 @@ from .feishu_core import (
     SessionManager,
     _archive_ack_card,
     _clarify_giveup_ack_card,
+    _extract_image_caption,
     _feedback_ack_card,
     _feedback_reason_form_card,
     _FOLLOWUP_LIBRARY,
@@ -214,6 +215,7 @@ def create_app(config: AppConfig) -> FastAPI:
                     sender_id,
                 )
                 return {"code": 0}
+            caption = _extract_image_caption(content_dict)
             background.add_task(
                 handle_image_question,
                 chat_id,
@@ -222,6 +224,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 msg_id,
                 feishu,
                 session_mgr,
+                caption=caption,
             )
             return {"code": 0}
 

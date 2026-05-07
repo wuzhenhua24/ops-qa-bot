@@ -40,6 +40,7 @@ from .feishu_core import (
     _archive_ack_card,
     _feedback_ack_card,
     _clarify_giveup_ack_card,
+    _extract_image_caption,
     _feedback_reason_form_card,
     _FOLLOWUP_LIBRARY,
     _followup_ack_card,
@@ -144,6 +145,7 @@ class WsRunner:
                     sender_id,
                 )
                 return
+            caption = _extract_image_caption(content_dict)
             if self._loop is not None:
                 asyncio.run_coroutine_threadsafe(
                     handle_image_question(
@@ -153,6 +155,7 @@ class WsRunner:
                         msg_id,
                         self._feishu,
                         self._session_mgr,
+                        caption=caption,
                     ),
                     self._loop,
                 )
