@@ -23,12 +23,14 @@ from .feishu_core import (
     FeishuClient,
     SessionManager,
     _archive_ack_card,
+    _clarify_giveup_ack_card,
     _feedback_ack_card,
     _feedback_reason_form_card,
     _FOLLOWUP_LIBRARY,
     _followup_ack_card,
     _followup_error_card,
     handle_archive_submit,
+    handle_clarify_giveup_click,
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
@@ -356,6 +358,29 @@ def create_app(config: AppConfig) -> FastAPI:
             ack_card = await handle_followup_click(
                 qid,
                 key,
+                chat_id_v,
+                asker_id,
+                clicker_id,
+                feishu,
+                session_mgr,
+                parent_msg_id=parent_msg_id_v,
+            )
+            return {"card": {"type": "raw", "data": ack_card}}
+
+        if action_name == "clarify_giveup":
+            qid = value.get("qid")
+            chat_id_v = value.get("chat_id")
+            asker_id = value.get("asker_id")
+            parent_msg_id_v = value.get("parent_msg_id")
+            click_key = f"{msg_id}|clarify_giveup|{qid}|{clicker_id}"
+            if click_key in seen_clicks:
+                logger.info("duplicate clarify_giveup click, skip: key=%s", click_key)
+                return {
+                    "card": {"type": "raw", "data": _clarify_giveup_ack_card()}
+                }
+            seen_clicks[click_key] = True
+            ack_card = await handle_clarify_giveup_click(
+                qid,
                 chat_id_v,
                 asker_id,
                 clicker_id,

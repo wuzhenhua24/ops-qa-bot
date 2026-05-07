@@ -260,6 +260,16 @@ _FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([\w|]+)>>")
 # 用户在同一 session 里答完，下一轮就按补充信息直接答。
 _CLARIFY_RE = re.compile(r"<<CLARIFY>>")
 
+# 反问"我也说不清"出口：用户没法回填版本/环境等关键差异时点这个按钮，触发新一轮
+# handle_question 喂这段 preset prompt——告诉 LLM 用户无法提供更多信息，按最常见
+# 场景假设直接答 + 在答案首行用 ⚠️ 假设 列出关键假设。session 上下文已经带着原始
+# 问题 + 反问内容（bot.ask 走 SDK 对话历史），LLM 自然衔接，不需要回灌问题文本。
+_CLARIFY_GIVEUP_PROMPT = (
+    "我没法提供更细的信息（不知道版本 / 环境 / 具体配置等）。"
+    "请按你认为最常见的运维场景假设直接答这次的问题，"
+    '并在答案最前面用一行 "⚠️ 假设：xxx；如有不同请告知" 列出你做的关键假设。'
+)
+
 # 答案内嵌图机制：步骤截图 / 标注图 / 强相关故障截图，文字转述不如直接展示。
 # LLM 在答案里独立一行写 <<IMG:redis/images/step1.png>>（路径相对 docs_root），
 # bot 校验路径 → 上传飞书拿 image_key → 把标记换成 <<IMG_KEY:img_xxx>>，渲染层
@@ -1062,6 +1072,76 @@ def _followup_error_card(message: str) -> dict:
     }
 
 
+def _clarify_giveup_card(
+    qid: str,
+    user_id: str,
+    chat_id: str,
+    parent_msg_id: str | None,
+) -> dict:
+    """反问轮卡片：单按钮 "🤷 说不清楚，按常见情况直接答"。
+
+    用 v2 schema 单按钮（与反馈卡 / 反馈原因表单卡一致），点击触发 clarify_giveup
+    回调，后台跑新一轮 handle_question 喂 _CLARIFY_GIVEUP_PROMPT。chat_id /
+    parent_msg_id 透过 button value 带回，新一轮按原问题引用回复维持线程。
+    asker-only 校验在 handle_clarify_giveup_click 里做。
+    """
+    btn = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "🤷 说不清楚，按常见情况直接答"},
+        "type": "default",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": {
+                    "action": "clarify_giveup",
+                    "qid": qid,
+                    "asker_id": user_id,
+                    "chat_id": chat_id,
+                    "parent_msg_id": parent_msg_id,
+                },
+            }
+        ],
+    }
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "答不上来？点下面这颗按钮让 bot 按最常见情况假设直接答，"
+                        "答案会标 ⚠️ 假设。"
+                    ),
+                },
+                {"tag": "column_set", "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [btn],
+                    }
+                ]},
+            ]
+        },
+    }
+
+
+def _clarify_giveup_ack_card() -> dict:
+    """点完"说不清"按钮替换原卡：v2 简单 ack。"""
+    return {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "✅ 收到，按常见情况重新作答中…",
+                }
+            ]
+        },
+    }
+
+
 async def handle_followup_click(
     qid: str | None,
     key: str | None,
@@ -1123,6 +1203,58 @@ async def handle_followup_click(
         asker_id,
     )
     return _followup_ack_card(label)
+
+
+async def handle_clarify_giveup_click(
+    qid: str | None,
+    chat_id: str | None,
+    asker_id: str | None,
+    clicker_id: str | None,
+    feishu: "FeishuClient",
+    session_mgr: "SessionManager",
+    parent_msg_id: str | None = None,
+) -> dict:
+    """处理反问轮"🤷 说不清"按钮点击。后台触发新一轮 handle_question 喂
+    `_CLARIFY_GIVEUP_PROMPT`，立即返回 ack 卡。
+
+    与 handle_followup_click 同构：校验 chat_id+asker_id 都存在 / 点击者就是
+    原提问者；后台 asyncio.create_task 跑新一轮。session 上下文带着原问题 +
+    LLM 上一轮反问内容，新一轮 LLM 自然衔接按假设直接答。
+    """
+    if not chat_id or not asker_id:
+        return _followup_error_card("参数缺失，请重试。")
+    if clicker_id and clicker_id != asker_id:
+        return _followup_error_card(
+            f"只有 <at id={asker_id}></at> 能点这个按钮，要追问请重新发一条消息。"
+        )
+    asyncio.create_task(
+        handle_question(
+            chat_id,
+            asker_id,
+            _CLARIFY_GIVEUP_PROMPT,
+            feishu,
+            session_mgr,
+            parent_msg_id=parent_msg_id,
+        )
+    )
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "clarify_giveup",
+                "qid": qid,
+                "asker_id": asker_id,
+                "clicker_id": clicker_id,
+            },
+            ensure_ascii=False,
+        )
+    )
+    logger.info(
+        "clarify giveup triggered: qid=%s chat=%s asker=%s",
+        qid,
+        chat_id,
+        asker_id,
+    )
+    return _clarify_giveup_ack_card()
 
 
 def _feedback_ack_card(rating: str, clicker_name: str | None = None) -> dict:
@@ -1846,7 +1978,9 @@ async def handle_question(
 
     # 5. 追问卡（如果有候选 key）+ 反馈卡（每次都发）。两张独立的 interactive
     # 消息，都引用回到 parent_msg_id：点追问只替换追问卡，反馈卡照样能 👍/👎。
-    # 反问轮跳过：让用户专注答反问，下一轮按补充信息再答 + 那时再挂反馈/追问
+    # 反问轮跳过：让用户专注答反问，下一轮按补充信息再答 + 那时再挂反馈/追问。
+    # 反问轮额外发一张"我说不清"出口卡：用户如果答不出反问的关键点（不知道版本/
+    # 环境等），点一下让 bot 按假设直接答，免得对话卡死。
     if not is_clarification:
         if followup_keys:
             await feishu.send_interactive(
@@ -1857,6 +1991,12 @@ async def handle_question(
         await feishu.send_interactive(
             chat_id,
             _feedback_card(qid, user_id),
+            parent_id=parent_msg_id,
+        )
+    else:
+        await feishu.send_interactive(
+            chat_id,
+            _clarify_giveup_card(qid, user_id, chat_id, parent_msg_id),
             parent_id=parent_msg_id,
         )
 
