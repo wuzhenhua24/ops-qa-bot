@@ -237,15 +237,29 @@ class WsRunner:
         if action_name == "feedback":
             qid = value.get("qid")
             rating = value.get("rating")
+            asker_id = value.get("asker_id")
             if not qid or rating not in ("up", "down"):
                 return P2CardActionTriggerResponse({})
+            # 非 asker 点击不进 dedup 缓存：缓存了之后第二次点击会被认作"重试"走 replay
+            # 路径返回 form/ack（错的），把 asker 的原卡顶掉。直接走 handler 走拒绝
+            # 路径，它会记 feedback_rejected 日志 + 返回原反馈卡（视觉无变化）。
+            if clicker_id and asker_id and clicker_id != asker_id:
+                ack_card = handle_feedback_click(
+                    qid=qid,
+                    rating=rating,
+                    clicker_id=clicker_id,
+                    asker_id=asker_id,
+                )
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": ack_card}}
+                )
             # 去重：点击重试场景
             click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
             if click_key in self._seen_clicks:
                 logger.info("duplicate card click, skip: key=%s", click_key)
                 # 重试要返回和首次一致的卡片，否则 👎 的原因表单会被 ack 顶掉
                 replay = (
-                    _feedback_reason_form_card(qid, value.get("asker_id"))
+                    _feedback_reason_form_card(qid, asker_id)
                     if rating == "down"
                     else _feedback_ack_card(rating)
                 )
@@ -257,7 +271,7 @@ class WsRunner:
                 qid=qid,
                 rating=rating,
                 clicker_id=clicker_id,
-                asker_id=value.get("asker_id"),
+                asker_id=asker_id,
             )
             # v2 卡片回调响应格式：{"type": "raw", "data": <card json>}
             return P2CardActionTriggerResponse(
@@ -267,6 +281,27 @@ class WsRunner:
         if action_name in ("feedback_reason_submit", "feedback_reason_skip"):
             qid = value.get("qid")
             asker_id = value.get("asker_id")
+            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。reason 表单这边
+            # 风险更高——缓存了之后 replay 直接返回 ack，会把 asker 还在填的表单顶成 ack。
+            if clicker_id and asker_id and clicker_id != asker_id:
+                if action_name == "feedback_reason_skip":
+                    ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
+                else:
+                    form_value = data.action.form_value or {}
+                    raw_reasons = form_value.get("reasons")
+                    if isinstance(raw_reasons, str):
+                        reasons = [raw_reasons]
+                    elif isinstance(raw_reasons, list):
+                        reasons = [r for r in raw_reasons if isinstance(r, str)]
+                    else:
+                        reasons = None
+                    comment = form_value.get("comment") or None
+                    ack_card = handle_feedback_reason_submit(
+                        qid, reasons, comment, clicker_id, asker_id
+                    )
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": ack_card}}
+                )
             click_key = f"{msg_id}|reason|{qid}|{clicker_id}|{action_name}"
             if click_key in self._seen_clicks:
                 logger.info("duplicate reason click, skip: key=%s", click_key)
@@ -306,6 +341,36 @@ class WsRunner:
             chat_id_v = value.get("chat_id")
             asker_id = value.get("asker_id")
             parent_msg_id_v = value.get("parent_msg_id")
+            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。
+            if (
+                clicker_id
+                and asker_id
+                and clicker_id != asker_id
+                and self._loop is not None
+            ):
+                fut = asyncio.run_coroutine_threadsafe(
+                    handle_followup_click(
+                        qid,
+                        key,
+                        chat_id_v,
+                        asker_id,
+                        clicker_id,
+                        self._feishu,
+                        self._session_mgr,
+                        parent_msg_id=parent_msg_id_v,
+                    ),
+                    self._loop,
+                )
+                try:
+                    ack_card = fut.result(timeout=5)
+                except Exception:
+                    logger.exception(
+                        "followup click failed: qid=%s key=%s", qid, key
+                    )
+                    ack_card = _followup_error_card("追问触发失败，请重试。")
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": ack_card}}
+                )
             click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
             if click_key in self._seen_clicks:
                 logger.info("duplicate followup click, skip: key=%s", click_key)
@@ -353,6 +418,33 @@ class WsRunner:
             chat_id_v = value.get("chat_id")
             asker_id = value.get("asker_id")
             parent_msg_id_v = value.get("parent_msg_id")
+            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。
+            if (
+                clicker_id
+                and asker_id
+                and clicker_id != asker_id
+                and self._loop is not None
+            ):
+                fut = asyncio.run_coroutine_threadsafe(
+                    handle_clarify_giveup_click(
+                        qid,
+                        chat_id_v,
+                        asker_id,
+                        clicker_id,
+                        self._feishu,
+                        self._session_mgr,
+                        parent_msg_id=parent_msg_id_v,
+                    ),
+                    self._loop,
+                )
+                try:
+                    ack_card = fut.result(timeout=5)
+                except Exception:
+                    logger.exception("clarify_giveup click failed: qid=%s", qid)
+                    ack_card = _followup_error_card("触发失败，请重试。")
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": ack_card}}
+                )
             click_key = f"{msg_id}|clarify_giveup|{qid}|{clicker_id}"
             if click_key in self._seen_clicks:
                 logger.info(

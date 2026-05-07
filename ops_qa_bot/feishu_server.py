@@ -290,15 +290,27 @@ def create_app(config: AppConfig) -> FastAPI:
         if action_name == "feedback":
             qid = value.get("qid")
             rating = value.get("rating")
+            asker_id = value.get("asker_id")
             if not qid or rating not in ("up", "down"):
                 return {}
+            # 非 asker 点击不进 dedup 缓存：缓存了之后第二次点击会被认作"重试"走 replay
+            # 路径返回 form/ack（错的），把 asker 的原卡顶掉。直接走 handler 走拒绝路径，
+            # 它会记 feedback_rejected 日志 + 返回原反馈卡（视觉无变化），asker 的按钮还在。
+            if clicker_id and asker_id and clicker_id != asker_id:
+                ack_card = handle_feedback_click(
+                    qid=qid,
+                    rating=rating,
+                    clicker_id=clicker_id,
+                    asker_id=asker_id,
+                )
+                return {"card": {"type": "raw", "data": ack_card}}
             # 去重：卡片回调同样会重试（无 event_id，用 message + qid + 点击人 + 方向作组合键）。
             click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
             if click_key in seen_clicks:
                 logger.info("duplicate card click, skip: key=%s", click_key)
                 # 重试要返回和首次一致的卡片，否则 👎 的原因表单会被 ack 顶掉
                 replay = (
-                    _feedback_reason_form_card(qid, value.get("asker_id"))
+                    _feedback_reason_form_card(qid, asker_id)
                     if rating == "down"
                     else _feedback_ack_card(rating)
                 )
@@ -308,7 +320,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 qid=qid,
                 rating=rating,
                 clicker_id=clicker_id,
-                asker_id=value.get("asker_id"),
+                asker_id=asker_id,
             )
             # 用 raw 包一层兼容 v1（👍 ack）与 v2（👎 表单）两种 schema
             return {"card": {"type": "raw", "data": ack_card}}
@@ -316,6 +328,26 @@ def create_app(config: AppConfig) -> FastAPI:
         if action_name in ("feedback_reason_submit", "feedback_reason_skip"):
             qid = value.get("qid")
             asker_id = value.get("asker_id")
+            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。reason 表单这边
+            # 风险更高——缓存了之后 replay 直接返回 _feedback_ack_card("down")，会把
+            # asker 还在填的 reason 表单顶成 ack。
+            if clicker_id and asker_id and clicker_id != asker_id:
+                if action_name == "feedback_reason_skip":
+                    ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
+                else:
+                    form_value = action.get("form_value") or {}
+                    raw_reasons = form_value.get("reasons")
+                    if isinstance(raw_reasons, str):
+                        reasons = [raw_reasons]
+                    elif isinstance(raw_reasons, list):
+                        reasons = [r for r in raw_reasons if isinstance(r, str)]
+                    else:
+                        reasons = None
+                    comment = form_value.get("comment") or None
+                    ack_card = handle_feedback_reason_submit(
+                        qid, reasons, comment, clicker_id, asker_id
+                    )
+                return {"card": {"type": "raw", "data": ack_card}}
             click_key = f"{msg_id}|reason|{qid}|{clicker_id}|{action_name}"
             if click_key in seen_clicks:
                 logger.info("duplicate reason click, skip: key=%s", click_key)
@@ -348,6 +380,19 @@ def create_app(config: AppConfig) -> FastAPI:
             chat_id_v = value.get("chat_id")
             asker_id = value.get("asker_id")
             parent_msg_id_v = value.get("parent_msg_id")
+            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。
+            if clicker_id and asker_id and clicker_id != asker_id:
+                ack_card = await handle_followup_click(
+                    qid,
+                    key,
+                    chat_id_v,
+                    asker_id,
+                    clicker_id,
+                    feishu,
+                    session_mgr,
+                    parent_msg_id=parent_msg_id_v,
+                )
+                return {"card": {"type": "raw", "data": ack_card}}
             click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
             if click_key in seen_clicks:
                 logger.info("duplicate followup click, skip: key=%s", click_key)
@@ -375,6 +420,18 @@ def create_app(config: AppConfig) -> FastAPI:
             chat_id_v = value.get("chat_id")
             asker_id = value.get("asker_id")
             parent_msg_id_v = value.get("parent_msg_id")
+            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。
+            if clicker_id and asker_id and clicker_id != asker_id:
+                ack_card = await handle_clarify_giveup_click(
+                    qid,
+                    chat_id_v,
+                    asker_id,
+                    clicker_id,
+                    feishu,
+                    session_mgr,
+                    parent_msg_id=parent_msg_id_v,
+                )
+                return {"card": {"type": "raw", "data": ack_card}}
             click_key = f"{msg_id}|clarify_giveup|{qid}|{clicker_id}"
             if click_key in seen_clicks:
                 logger.info("duplicate clarify_giveup click, skip: key=%s", click_key)
