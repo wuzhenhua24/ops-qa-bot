@@ -874,37 +874,52 @@ def _followup_card(
     """问答结束后附带的追问按钮卡：独立卡片，与反馈卡解耦。
 
     `followup_keys` 来自 LLM 输出的 `<<FOLLOWUPS:...>>`，已过滤到白名单内、最多 3 个。
-    每个 button value 自带 chat_id 和 parent_msg_id：parent_msg_id 是用户原始问题的
-    message_id，回调时透传给新一轮 `handle_question`，让追问的占位/答案/卡片继续
-    引用回到原问题，线程感不断。
+    每个 button.behaviors.callback.value 自带 chat_id 和 parent_msg_id：parent_msg_id
+    是用户原始问题的 message_id，回调时透传给新一轮 `handle_question`，让追问的
+    占位/答案/卡片继续引用回到原问题，线程感不断。
+
+    v2 schema：与同模式的 `_feedback_card` / `_clarify_giveup_card` 对齐。原卡 v1 +
+    替换卡 v2 的跨版本切换在飞书上不是官方推荐做法，统一到 v2 后未来 SDK / 飞书侧
+    schema 校验收紧也不会突然炸。
     """
-    btns: list[dict] = []
+    columns: list[dict] = []
     for k in followup_keys:
         label, _ = _FOLLOWUP_LIBRARY[k]
-        btns.append(
+        btn = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": "default",
+            "behaviors": [
+                {
+                    "type": "callback",
+                    "value": {
+                        "action": "followup",
+                        "qid": qid,
+                        "key": k,
+                        "asker_id": user_id,
+                        "chat_id": chat_id,
+                        "parent_msg_id": parent_msg_id,
+                    },
+                }
+            ],
+        }
+        columns.append(
             {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": label},
-                "type": "default",
-                "value": {
-                    "action": "followup",
-                    "qid": qid,
-                    "key": k,
-                    "asker_id": user_id,
-                    "chat_id": chat_id,
-                    "parent_msg_id": parent_msg_id,
-                },
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [btn],
             }
         )
     return {
-        "config": {"wide_screen_mode": True},
-        "elements": [
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": "**想再深入？**"},
-            },
-            {"tag": "action", "actions": btns},
-        ],
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "**想再深入？**"},
+                {"tag": "column_set", "columns": columns},
+            ]
+        },
     }
 
 
