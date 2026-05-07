@@ -43,6 +43,10 @@ DEFAULT_IMAGE_PROMPT = (
     "（报错文本、命令、指标值、配置项、UI 状态等），"
     "再按这些线索去文档里查解决办法。"
 )
+# post 消息一次最多读取的图片张数。飞书移动端"@bot + 多张截图"会打成 post，
+# 单条问题塞多图既贵也违反 LLM 视觉上下文人体工学，5 张是经验上限——超出截断
+# 走日志告警，不报给用户（用户不会期望"我发了 8 张但 bot 只答了 5 张"这种细节）。
+_POST_MAX_IMAGES = 5
 
 
 def _extract_image_caption(content_dict: dict) -> str | None:
@@ -58,6 +62,54 @@ def _extract_image_caption(content_dict: dict) -> str | None:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
+
+
+def _parse_post_content(content_dict: dict) -> tuple[str, list[str]]:
+    """从 post 消息 content 抽出 (text, image_keys)。
+
+    post 是飞书富文本：`content` 是 list[list[element]]，外层是段落，内层是
+    段内元素（text / at / img / a / code / emotion ...）。这里只关心：
+
+    - tag:text → 文本拼接
+    - tag:a    → 取链接显示文本（href 不暴露给 LLM，简化注入面）
+    - tag:img  → 收集 image_key（按出现顺序保序）
+    - tag:at   → **整段跳过**：@ 是路由标记不是用户输入；多数场景就是 @bot 自己
+
+    其它 tag（emotion / hr / code_inline 等）暂不抽取——常见场景里这些不是
+    问题主语；将来发现需要再补。
+
+    段内拼接不加分隔符（at 被剥后留下的空白由 strip 收掉），段间用 \\n。
+    """
+    paragraphs = content_dict.get("content") or []
+    if not isinstance(paragraphs, list):
+        return "", []
+    text_lines: list[str] = []
+    image_keys: list[str] = []
+    for para in paragraphs:
+        if not isinstance(para, list):
+            continue
+        line_parts: list[str] = []
+        for el in para:
+            if not isinstance(el, dict):
+                continue
+            tag = el.get("tag")
+            if tag == "text":
+                t = el.get("text")
+                if isinstance(t, str):
+                    line_parts.append(t)
+            elif tag == "a":
+                t = el.get("text")
+                if isinstance(t, str):
+                    line_parts.append(t)
+            elif tag == "img":
+                k = el.get("image_key")
+                if isinstance(k, str) and k:
+                    image_keys.append(k)
+            # at / emotion / hr / code_inline / code 等暂不抽取
+        line = "".join(line_parts).strip()
+        if line:
+            text_lines.append(line)
+    return "\n".join(text_lines).strip(), image_keys
 
 
 def _normalize_image_media_type(content_type: str, data: bytes) -> str:
@@ -795,6 +847,117 @@ async def handle_image_question(
         parent_msg_id=parent_msg_id,
         images=[(media_type, img_bytes)],
     )
+
+
+async def handle_post_question(
+    chat_id: str,
+    user_id: str,
+    text: str,
+    image_keys: list[str],
+    parent_msg_id: str | None,
+    feishu: "FeishuClient",
+    session_mgr: "SessionManager",
+) -> None:
+    """处理 post 类型消息（@bot + 文字 + 截图 的常见组合）。
+
+    串行下载所有 image_key（最多 _POST_MAX_IMAGES 张），过滤超大 / 空 / 失败的，
+    剩下的喂给 handle_question 走视觉答题。任何一张图下载失败只丢那一张，不阻塞
+    主链路（文字 + 其它图照样能答）。
+
+    text + 图都为空（用户只发了 sticker / 表情 / 链接等暂不抽取的元素）兜底回
+    unsupported hint，避免 bot 静默无反应。
+    """
+    if not parent_msg_id:
+        # 资源 API 必须 message_id + image_key，没 parent 拿不到图；纯文字仍可继续
+        if image_keys:
+            logger.warning(
+                "post without parent_msg_id, drop images: chat=%s user=%s n=%d",
+                chat_id,
+                user_id,
+                len(image_keys),
+            )
+        image_keys = []
+
+    truncated = max(0, len(image_keys) - _POST_MAX_IMAGES)
+    image_keys = image_keys[:_POST_MAX_IMAGES]
+
+    images: list[tuple[str, bytes]] = []
+    failed = 0
+    for key in image_keys:
+        try:
+            blob, media_type = await feishu.download_message_resource(
+                parent_msg_id, key, "image"
+            )
+        except Exception:
+            logger.exception(
+                "post image download failed: chat=%s user=%s key=%s",
+                chat_id,
+                user_id,
+                key,
+            )
+            failed += 1
+            continue
+        if not blob:
+            logger.warning("post image empty: chat=%s key=%s", chat_id, key)
+            failed += 1
+            continue
+        if len(blob) > MAX_IMAGE_BYTES:
+            logger.info(
+                "post image too large, skip: chat=%s key=%s size=%dB",
+                chat_id,
+                key,
+                len(blob),
+            )
+            failed += 1
+            continue
+        images.append((media_type, blob))
+
+    text = text.strip()
+    if not text and not images:
+        # 啥可用内容都没有：用 unsupported hint 让用户明白看到了但没法处理
+        await handle_unsupported_message(
+            chat_id, user_id, parent_msg_id, "post", feishu
+        )
+        return
+
+    logger.info(
+        "post question: chat=%s user=%s text_len=%d images=%d truncated=%d failed=%d",
+        chat_id,
+        user_id,
+        len(text),
+        len(images),
+        truncated,
+        failed,
+    )
+
+    if images:
+        if text:
+            question = (
+                f"{text}\n\n"
+                f"（同时附了 {len(images)} 张截图。先从图里识别关键信息（报错 / "
+                "命令 / 指标 / 配置等），再结合上面的问题去文档里查解决办法。）"
+            )
+        else:
+            question = DEFAULT_IMAGE_PROMPT
+        await handle_question(
+            chat_id,
+            user_id,
+            question,
+            feishu,
+            session_mgr,
+            parent_msg_id=parent_msg_id,
+            images=images,
+        )
+    else:
+        # 只有文字（图全失败 / 用户原本就只发文字带格式）→ 走纯文本路径
+        await handle_question(
+            chat_id,
+            user_id,
+            text,
+            feishu,
+            session_mgr,
+            parent_msg_id=parent_msg_id,
+        )
 
 
 async def handle_unsupported_message(

@@ -30,6 +30,7 @@ from .feishu_core import (
     _FOLLOWUP_LIBRARY,
     _followup_ack_card,
     _followup_error_card,
+    _parse_post_content,
     get_archive_expected_owner,
     handle_archive_submit,
     handle_clarify_giveup_click,
@@ -38,6 +39,7 @@ from .feishu_core import (
     handle_feedback_reason_submit,
     handle_followup_click,
     handle_image_question,
+    handle_post_question,
     handle_question,
     handle_unsupported_message,
 )
@@ -229,7 +231,30 @@ def create_app(config: AppConfig) -> FastAPI:
             )
             return {"code": 0}
 
-        # 其它非 text（file/post/sticker/audio…）：回友好提示，不进答题流程
+        # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
+        # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
+        # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
+        if message_type == "post":
+            try:
+                content_dict = json.loads(
+                    (event.get("message") or {}).get("content") or "{}"
+                )
+            except json.JSONDecodeError:
+                content_dict = {}
+            text, image_keys = _parse_post_content(content_dict)
+            background.add_task(
+                handle_post_question,
+                chat_id,
+                sender_id,
+                text,
+                image_keys,
+                msg_id,
+                feishu,
+                session_mgr,
+            )
+            return {"code": 0}
+
+        # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
         if message_type != "text":
             logger.info(
                 "non-text message: type=%s chat=%s user=%s",
