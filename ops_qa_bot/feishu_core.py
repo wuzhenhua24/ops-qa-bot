@@ -1668,6 +1668,18 @@ async def _write_qa_archive(
         return True
 
 
+def get_archive_expected_owner(qid: str | None) -> str | None:
+    """callback 层用来 peek "这个 qid 的归档表单期望的负责人是谁"。
+
+    返回 None 表示 qid 不存在 / 已过期 / 已处理——这种情况让正常 handler 走
+    qid-missing / expired ack 路径，不需要 callback 提前介入。
+    """
+    if not qid:
+        return None
+    ctx = _pending_archives.get(qid)
+    return ctx.get("owner_id") if ctx else None
+
+
 async def handle_archive_submit(
     qid: str | None,
     answer: str,
@@ -1676,8 +1688,9 @@ async def handle_archive_submit(
 ) -> dict:
     """处理归档表单提交。返回应替换原表单卡的 ack 卡片（card v2）。
 
-    所有失败路径（参数缺失、过期、非负责人点击、空答案、写盘异常）都
-    用 ack 卡片告诉点击者，原卡片被替换，避免重复提交困惑。
+    多数失败路径（参数缺失、过期、空答案、写盘异常）都用 ack 卡告诉点击者，
+    原卡片被替换避免重复提交困惑。**唯一例外是"非负责人点击"**：返回原表单卡保持
+    可见，让真正的负责人还能填——否则其他人误点提交会把负责人的表单顶掉。
     """
     if not qid:
         return _archive_ack_card("⚠️", "归档参数缺失，请联系管理员。")
@@ -1689,8 +1702,31 @@ async def handle_archive_submit(
 
     expected_owner = ctx["owner_id"]
     if clicker_id and clicker_id != expected_owner:
-        return _archive_ack_card(
-            "🔒", f"只有 <at id={expected_owner}></at> 能归档此问答。"
+        # 重建原表单卡返回，保持负责人那张表单可见；同时记一条 archive_rejected
+        # 日志便于事后 grep 看"非负责人误点"频率。
+        feedback_logger.info(
+            json.dumps(
+                {
+                    "event": "archive_rejected",
+                    "qid": qid,
+                    "clicker_id": clicker_id,
+                    "expected_owner": expected_owner,
+                },
+                ensure_ascii=False,
+            )
+        )
+        logger.info(
+            "archive submit rejected (not owner): qid=%s by=%s expected=%s",
+            qid,
+            clicker_id,
+            expected_owner,
+        )
+        component_dir = ctx.get("component_dir")
+        archive_path_repr = (
+            f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
+        )
+        return _archive_form_card(
+            qid, ctx["question"], expected_owner, archive_path_repr
         )
 
     answer_text = (answer or "").strip()

@@ -30,6 +30,7 @@ from .feishu_core import (
     _FOLLOWUP_LIBRARY,
     _followup_ack_card,
     _followup_error_card,
+    get_archive_expected_owner,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
@@ -454,6 +455,19 @@ def create_app(config: AppConfig) -> FastAPI:
             qid = value.get("qid")
             form_value = action.get("form_value") or {}
             answer = form_value.get("answer") or ""
+            # 非 owner 提交不进 dedup 缓存：见 feedback 分支同样的注释。这里风险更高
+            # ——dedup 命中后 replay 直接返回 _archive_ack_card("已处理")，会把 owner
+            # 还在填的归档表单顶成 ack。
+            expected_owner = get_archive_expected_owner(qid)
+            if (
+                clicker_id
+                and expected_owner
+                and clicker_id != expected_owner
+            ):
+                ack_card = await handle_archive_submit(
+                    qid, answer, clicker_id, docs_root
+                )
+                return {"card": {"type": "raw", "data": ack_card}}
             click_key = f"{msg_id}|archive|{qid}|{clicker_id}"
             if click_key in seen_clicks:
                 logger.info("duplicate archive submit, skip: key=%s", click_key)

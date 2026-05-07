@@ -45,6 +45,7 @@ from .feishu_core import (
     _FOLLOWUP_LIBRARY,
     _followup_ack_card,
     _followup_error_card,
+    get_archive_expected_owner,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
@@ -488,6 +489,29 @@ class WsRunner:
             qid = value.get("qid")
             form_value = data.action.form_value or {}
             answer = form_value.get("answer") or ""
+            # 非 owner 提交不进 dedup 缓存：见 feedback 分支同样的注释。这里风险更高
+            # ——dedup 命中后 replay 直接返回 ack，会把 owner 还在填的表单顶成 ack。
+            expected_owner = get_archive_expected_owner(qid)
+            if (
+                clicker_id
+                and expected_owner
+                and clicker_id != expected_owner
+                and self._loop is not None
+            ):
+                fut = asyncio.run_coroutine_threadsafe(
+                    handle_archive_submit(
+                        qid, answer, clicker_id, self._config.docs_root
+                    ),
+                    self._loop,
+                )
+                try:
+                    ack_card = fut.result(timeout=15)
+                except Exception:
+                    logger.exception("archive submit failed: qid=%s", qid)
+                    ack_card = _archive_ack_card("❌", "归档失败，请联系管理员。")
+                return P2CardActionTriggerResponse(
+                    {"card": {"type": "raw", "data": ack_card}}
+                )
             click_key = f"{msg_id}|archive|{qid}|{clicker_id}"
             if click_key in self._seen_clicks:
                 logger.info("duplicate archive submit, skip: key=%s", click_key)
