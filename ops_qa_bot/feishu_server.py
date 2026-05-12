@@ -480,6 +480,7 @@ def create_app(config: AppConfig) -> FastAPI:
             qid = value.get("qid")
             form_value = action.get("form_value") or {}
             answer = form_value.get("answer") or ""
+            question = form_value.get("question") or ""
             # 非 owner 提交不进 dedup 缓存：见 feedback 分支同样的注释。这里风险更高
             # ——dedup 命中后 replay 直接返回 _archive_ack_card("已处理")，会把 owner
             # 还在填的归档表单顶成 ack。
@@ -490,7 +491,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 and clicker_id != expected_owner
             ):
                 ack_card = await handle_archive_submit(
-                    qid, answer, clicker_id, docs_root
+                    qid, question, answer, clicker_id, docs_root
                 )
                 return {"card": {"type": "raw", "data": ack_card}}
             click_key = f"{msg_id}|archive|{qid}|{clicker_id}"
@@ -504,7 +505,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 }
             seen_clicks[click_key] = True
             ack_card = await handle_archive_submit(
-                qid, answer, clicker_id, docs_root
+                qid, question, answer, clicker_id, docs_root
             )
             # v2 卡片用 type:raw 包一层，确保飞书按 v2 渲染
             return {"card": {"type": "raw", "data": ack_card}}

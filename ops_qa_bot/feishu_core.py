@@ -349,6 +349,16 @@ _IMG_MAX_PER_ANSWER = 5
 # 同一 docs 图在多轮答案里会被反复引用，缓存 (绝对路径, mtime) → image_key 避免
 # 重复上传；mtime 变化（图被替换）天然失效。LRU 500 条对常规文档量够用。
 _image_key_cache: LRUCache = LRUCache(maxsize=500)
+
+# 归档问题标题草稿：升级到负责人时，答题那轮 LLM 顺带在答案里输出
+# <<ARCHIVE_Q:归一化后的问题标题>>，bot 剥掉标记、把内容当成归档表单里那个
+# 可编辑的"问题"输入框的默认值——用户原话往往口语化、带个人上下文，LLM 的
+# 归一化标题做归档标题/检索关键词更合适，负责人提交前还能再改。marker 缺失
+# 或内容为空时自动回退到用户原话。路径正则放宽到非控制字符，长度/空白净化
+# 在 _parse_archive_q 里做；标记只在 <<ESCALATE:ou_xxx>> 那一支要求输出
+# （<<ESCALATE:none>> / 无升级都不发归档表单，吐了也没用）。
+_ARCHIVE_Q_RE = re.compile(r"<<ARCHIVE_Q:([^<>\n\r]+?)>>")
+_ARCHIVE_Q_MAX_LEN = 80  # 字符；超长截断而不是丢弃，负责人可在表单里改
 _FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
     "troubleshoot": (
         "📋 排查步骤",
@@ -1602,6 +1612,25 @@ def _parse_escalate(answer: str) -> tuple[str, str | None, str | None]:
     return cleaned, (who if who != "none" else None), dir_hint
 
 
+def _parse_archive_q(answer: str) -> tuple[str, str | None]:
+    """抽 <<ARCHIVE_Q:...>> 标记，返回 (清理后的答案文本, 净化后的问题标题草稿 or None)。
+
+    草稿净化：折叠内部空白/换行、去首尾空白；清理后为空则当没给（返回 None）；
+    超 _ARCHIVE_Q_MAX_LEN 截断加省略号（不丢弃——它会成为归档表单问题框的
+    默认值，负责人可再改）。多次出现取第一处，全部从答案里剥掉。
+    """
+    m = _ARCHIVE_Q_RE.search(answer)
+    if not m:
+        return answer, None
+    cleaned = _ARCHIVE_Q_RE.sub("", answer).strip()
+    draft = " ".join(m.group(1).split()).strip()
+    if not draft:
+        return cleaned, None
+    if len(draft) > _ARCHIVE_Q_MAX_LEN:
+        draft = draft[:_ARCHIVE_Q_MAX_LEN].rstrip() + "…"
+    return cleaned, draft
+
+
 def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
     """把 LLM 给的目录 hint 校验成"docs_root 下真实存在的相对目录"，否则返回 None。
 
@@ -1717,10 +1746,12 @@ def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
 
 
 def _archive_form_card(
-    qid: str, question: str, owner_id: str, archive_path_repr: str
+    qid: str, question_default: str, owner_id: str, archive_path_repr: str
 ) -> dict:
-    """归档表单卡（card v2 form）：展示问题 + 多行答案输入框 + 提交按钮。
+    """归档表单卡（card v2 form）：可编辑问题标题 + 多行答案输入框 + 提交按钮。
 
+    question_default：预填进"问题"输入框的标题——优先是答题那轮 LLM 给的归一化
+    标题，否则是用户原话。负责人可在框里改成更通用的说法再提交；最终写盘用框里的值。
     archive_path_repr：展示给 owner 的相对路径（如 "redis/qa-archive.md"），
     让他知道答案会落到哪个文件再决定写多详细。
     """
@@ -1736,8 +1767,9 @@ def _archive_form_card(
                 {
                     "tag": "markdown",
                     "content": (
-                        f"**Q:** {_excerpt(question, 300)}\n\n"
-                        f"<at id={owner_id}></at> 答完后请把整理过的答案填进下方输入框，"
+                        f"<at id={owner_id}></at> 下面的「问题」是系统自动整理的，"
+                        "可改成更通用的说法（它会作为归档标题和以后的检索关键词）；"
+                        "把整理过的答案填进答案框，"
                         f"提交后会追加进 `{archive_path_repr}`。"
                     ),
                 },
@@ -1745,6 +1777,17 @@ def _archive_form_card(
                     "tag": "form",
                     "name": "archive_form",
                     "elements": [
+                        {
+                            "tag": "input",
+                            "name": "question",
+                            "default_value": _excerpt(question_default, 100),
+                            "max_length": 120,
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "归档用的问题标题（可修订）…",
+                            },
+                            "required": True,
+                        },
                         {
                             "tag": "input",
                             "name": "answer",
@@ -1820,8 +1863,11 @@ async def _write_qa_archive(
         meta_parts = [f"回答者：<@{owner_id}>", ts, f"qid: {qid}"]
         if asker_id:
             meta_parts.append(f"提问者：<@{asker_id}>")
+        # 问题作为 `## ` 标题写一行：折叠掉换行/多余空白，否则多行会把 markdown
+        # 标题撑坏（单行 input 一般进不来换行，这里兜底）
+        question_line = " ".join(question.split()) or "（无标题）"
         block = (
-            f"\n## Q: {question.strip()}\n\n"
+            f"\n## Q: {question_line}\n\n"
             f"*{' · '.join(meta_parts)}*\n\n"
             f"{answer.strip()}\n\n"
             f"---\n"
@@ -1845,11 +1891,16 @@ def get_archive_expected_owner(qid: str | None) -> str | None:
 
 async def handle_archive_submit(
     qid: str | None,
+    question: str,
     answer: str,
     clicker_id: str | None,
     docs_root: Path,
 ) -> dict:
     """处理归档表单提交。返回应替换原表单卡的 ack 卡片（card v2）。
+
+    `question` 是表单里那个（预填、可编辑）问题框的值——负责人没改就是预填值，
+    改了就是改后的；为空时按 question_default → 用户原话依次回退（旧的 pending
+    项可能没 question_default，所以两层都兜）。
 
     多数失败路径（参数缺失、过期、空答案、写盘异常）都用 ack 卡告诉点击者，
     原卡片被替换避免重复提交困惑。**唯一例外是"非负责人点击"**：返回原表单卡保持
@@ -1864,6 +1915,7 @@ async def handle_archive_submit(
         )
 
     expected_owner = ctx["owner_id"]
+    question_default = ctx.get("question_default") or ctx["question"]
     if clicker_id and clicker_id != expected_owner:
         # 重建原表单卡返回，保持负责人那张表单可见；同时记一条 archive_rejected
         # 日志便于事后 grep 看"非负责人误点"频率。
@@ -1889,7 +1941,7 @@ async def handle_archive_submit(
             f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
         )
         return _archive_form_card(
-            qid, ctx["question"], expected_owner, archive_path_repr
+            qid, question_default, expected_owner, archive_path_repr
         )
 
     answer_text = (answer or "").strip()
@@ -1897,6 +1949,15 @@ async def handle_archive_submit(
         return _archive_ack_card("⚠️", "答案不能为空，请填写后再提交。")
     if len(answer_text) > 10_000:
         return _archive_ack_card("⚠️", "答案过长（>10KB），请精简后再提交。")
+
+    # 表单里那个"问题"框是 required，正常路径拿到的就是负责人确认/改过的值；
+    # 为空只可能是 API 重放等异常路径，按 question_default → 原话兜底。折叠成一行
+    # 并截断（标题最终写成 `## Q: ...`），不因为 fallback 是长串就报错拒掉。
+    question_text = " ".join(((question or "").strip() or question_default).split())
+    if not question_text:
+        question_text = "（无标题）"
+    if len(question_text) > 200:
+        question_text = question_text[:200].rstrip() + "…"
 
     component_dir = ctx.get("component_dir")
     if component_dir:
@@ -1908,7 +1969,7 @@ async def handle_archive_submit(
         wrote = await _write_qa_archive(
             file_path=file_path,
             qid=qid,
-            question=ctx["question"],
+            question=question_text,
             answer=answer_text,
             owner_id=expected_owner,
             asker_id=ctx.get("asker_id"),
@@ -1926,6 +1987,13 @@ async def handle_archive_submit(
         rel = file_path.relative_to(docs_root)
     except ValueError:
         rel = file_path
+    # had_draft：答题那轮 LLM 有没有给出（区别于原话的）归一化标题。
+    # question_edited：负责人在表单里改没改预填值。两个一起看就知道 LLM 草稿
+    # 命中率 + 负责人采纳率，用来判断 <<ARCHIVE_Q:>> 这套值不值 / 要不要再调 prompt。
+    had_draft = question_default.strip() != ctx["question"].strip()
+    question_edited = (
+        " ".join(question_text.split()) != " ".join(question_default.split())
+    )
     feedback_logger.info(
         json.dumps(
             {
@@ -1935,6 +2003,9 @@ async def handle_archive_submit(
                 "asker_id": ctx.get("asker_id"),
                 "path": str(rel),
                 "answer_excerpt": _excerpt(answer_text, 500),
+                "question_final": _excerpt(question_text, 200),
+                "had_draft": had_draft,
+                "question_edited": question_edited,
                 "duplicate": not wrote,
             },
             ensure_ascii=False,
@@ -2081,15 +2152,19 @@ async def handle_question(
     # escalate_dir_hint 是 LLM 直接给的归档目录（基于答案命中的组件，准确性高于
     # 按 owner 反查；同一负责人挂多组件时只有 LLM 自己知道这次答的是哪个组件）。
     answer, escalate_owner, escalate_dir_hint = _parse_escalate(answer)
+    # 解析归档问题标题草稿（仅在升级时有意义；marker 缺失/为空则为 None，
+    # 后面会回退到用户原话）
+    answer, archive_q_draft = _parse_archive_q(answer)
     # 解析快捷追问标记，挂在反馈卡上面让用户一键发起新一轮
     answer, followup_keys = _parse_followups(answer)
     # 解析反问标记：是否为"信息不足、需要用户补充"的反问轮
     answer, is_clarification = _parse_clarify(answer)
-    # 反问轮防御性清空：prompt 已要求反问时不输出 ESCALATE/FOLLOWUPS/IMG，但 LLM
-    # 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
+    # 反问轮防御性清空：prompt 已要求反问时不输出 ESCALATE/FOLLOWUPS/IMG/ARCHIVE_Q，
+    # 但 LLM 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
     if is_clarification:
         escalate_owner = None
         escalate_dir_hint = None
+        archive_q_draft = None
         followup_keys = []
         # 反问轮里 LLM 不应该塞图，但如果塞了直接剥掉标记不上传
         answer = _IMG_RE.sub("", answer).strip()
@@ -2248,16 +2323,23 @@ async def handle_question(
     # component_dir / archive_path_repr 已在 _append_escalate_at 之前算好，这里直接复用，
     # 与答案末尾告知 asker 的归档路径保持一致。
     if escalated_now:
+        # question_default：归档表单"问题"框的预填值——优先用 LLM 给的归一化标题，
+        # 没给则回退到用户原话。提交时负责人改了就用改后的；question（原话）单纯
+        # 留作最终 fallback + 日志对照。
+        question_default = archive_q_draft or question
         _pending_archives[qid] = {
             "chat_id": chat_id,
             "asker_id": user_id,
             "question": question,
+            "question_default": question_default,
             "owner_id": escalate_owner,
             "component_dir": component_dir,
         }
         await feishu.send_interactive(
             chat_id,
-            _archive_form_card(qid, question, escalate_owner, archive_path_repr),
+            _archive_form_card(
+                qid, question_default, escalate_owner, archive_path_repr
+            ),
             parent_id=parent_msg_id,
         )
         logger.info(

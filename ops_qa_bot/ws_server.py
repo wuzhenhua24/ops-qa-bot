@@ -515,6 +515,7 @@ class WsRunner:
             qid = value.get("qid")
             form_value = data.action.form_value or {}
             answer = form_value.get("answer") or ""
+            question = form_value.get("question") or ""
             # 非 owner 提交不进 dedup 缓存：见 feedback 分支同样的注释。这里风险更高
             # ——dedup 命中后 replay 直接返回 ack，会把 owner 还在填的表单顶成 ack。
             expected_owner = get_archive_expected_owner(qid)
@@ -526,7 +527,7 @@ class WsRunner:
             ):
                 fut = asyncio.run_coroutine_threadsafe(
                     handle_archive_submit(
-                        qid, answer, clicker_id, self._config.docs_root
+                        qid, question, answer, clicker_id, self._config.docs_root
                     ),
                     self._loop,
                 )
@@ -564,7 +565,7 @@ class WsRunner:
             # SDK 在线程池里同步调本回调，转发到 asyncio 主 loop 跑写盘逻辑
             fut = asyncio.run_coroutine_threadsafe(
                 handle_archive_submit(
-                    qid, answer, clicker_id, self._config.docs_root
+                    qid, question, answer, clicker_id, self._config.docs_root
                 ),
                 self._loop,
             )
