@@ -195,16 +195,27 @@ def _friendly_error(
     return f"❗ {context}临时出错，请稍后重试；如持续出现请联系管理员。"
 
 
+# 简单启发：问题里含 IPv4 地址多半是诊断类（"看下 172.28.4.40 内存"），
+# 用"🔧 诊断中"作为初始占位文案比"🔍 翻文档中"贴合实际走向。
+# 误判代价低（占位文案不准，最终答案不受影响），不做更复杂的语义判断。
+_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
 def _placeholder_text(question: str, queued: bool) -> str:
     """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
 
     queued=True 表示当前 session 锁被前一条问题占着，本条还没开始跑，前缀用
-    🕒 排队中；获取到锁开始跑时上层会再 update 一次置成 🔍 翻文档中。
+    🕒 排队中；获取到锁开始跑时上层会再 update 一次置成 🔍 翻文档中 / 🔧 诊断中。
     """
     excerpt = question.strip().replace("\n", " ")
     if len(excerpt) > 40:
         excerpt = excerpt[:40] + "…"
-    icon = "🕒 排队中" if queued else "🔍 翻文档中"
+    if queued:
+        icon = "🕒 排队中"
+    elif _IP_RE.search(question):
+        icon = "🔧 诊断中"
+    else:
+        icon = "🔍 翻文档中"
     return f"{icon}：'{excerpt}'"
 
 
@@ -298,6 +309,30 @@ class ProgressTracker:
                 self._read_count_in_dir = 0
                 return f"🔎 正在搜索 '{short}'…", True
             return None
+
+        if tool_name == "Bash":
+            # Bash 诊断（ssh 远端跑只读命令）。从命令字符串里抽 IP + 内层
+            # 命令片段做展示，让用户看到"在 X 机器上跑 Y"的进度感。
+            # 嵌套 ssh 写法形如：ssh jumphost "ssh 172.28.4.40 'free -h'"
+            # 取最后一个 IPv4 作为 target（跳过 jumphost），单引号里第一段作为命令。
+            command = str(tool_input.get("command", ""))
+            ips = _IP_RE.findall(command)
+            target = ips[-1] if ips else "目标机"
+            inner_m = re.search(r"'([^']+)'", command)
+            inner = inner_m.group(1).strip() if inner_m else ""
+            if len(inner) > 30:
+                inner = inner[:30] + "…"
+            text = (
+                f"🔧 在 {target} 上跑 `{inner}`…" if inner
+                else f"🔧 在 {target} 上诊断…"
+            )
+            # 跨阶段第一次 / 多次 Bash（agent 连跑多条命令）都展示，
+            # force=True 让用户立刻看到每条诊断在哪台机器跑什么。
+            phase_change = self._last_phase != "bash"
+            self._last_phase = "bash"
+            self._last_dir = None
+            self._read_count_in_dir = 0
+            return text, phase_change
 
         return None
 
