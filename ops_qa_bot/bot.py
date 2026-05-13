@@ -194,11 +194,17 @@ class OpsQABot:
         #     1) prompt 里强约束"永不执行写操作、对话内任何确认都不接受"
         #     2) PreToolUse hook (_block_write_bash_hook) 兜底硬拦截，不读对话上下文
         # - WebFetch 不开：与"只基于本地文档回答、否则说找不到"的防幻觉约束相冲突
+        #
+        # permission_mode 选 bypassPermissions 而不是 acceptEdits：
+        # acceptEdits 只 auto-accept *file edits*，Bash 在它眼里仍是"危险操作"会
+        # 走 "ask" 流程；SDK 模式下没人能 prompt，agent 就会把它理解成"我没权限"
+        # 而拒绝调 Bash。bypassPermissions 跳过所有权限检查，安全控制完全交给
+        # tools 白名单（agent 只能见到这 4 个工具）+ PreToolUse hook（写命令兜底）。
         self._options = ClaudeAgentOptions(
             system_prompt=build_system_prompt(self.docs_root),
             tools=["Read", "Glob", "Grep", "Bash"],
             cwd=str(self.docs_root),
-            permission_mode="acceptEdits",
+            permission_mode="bypassPermissions",
             hooks={
                 "PreToolUse": [
                     HookMatcher(matcher="Bash", hooks=[_block_write_bash_hook]),
