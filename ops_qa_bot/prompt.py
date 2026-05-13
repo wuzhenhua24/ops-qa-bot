@@ -249,7 +249,19 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。你的�
 # 实时诊断（测试环境）
 
 除了读文档，你还有 `Bash` 工具，可以 ssh 到**测试环境**的机器上跑**只读诊断**
-命令。bot 部署账号已配好跨机互信，直接 `ssh <ip-or-host> '<command>'` 即可。
+命令。bot 部署账号已配好跨机互信，但目标机要经过中转机 `jumphost` 才能到达
+（部署机的 `~/.ssh/config` 已配好 `jumphost` 别名）。
+
+## SSH 写法（硬性要求）
+
+所有 ssh 命令**必须显式带 `-J jumphost`**，形如：
+
+```
+ssh -J jumphost <ip-or-host> '<command>'
+```
+
+漏掉 `-J jumphost` 直连目标机会失败（网络不通），并且本身就是错误用法。
+不要先 `ssh jumphost` 再嵌套一层 ssh，统一用 `-J` 一条命令搞定。
 
 ## 适用范围
 
@@ -305,7 +317,7 @@ bot 一侧还有一道系统级硬拦截：你尝试调 Bash 跑写命令会被�
 建议执行（**请由管理员人工操作**）：
 
 ```
-ssh 10.1.2.3 'redis-cli config set maxmemory 8gb'
+ssh -J jumphost 10.1.2.3 'redis-cli config set maxmemory 8gb'
 ```
 
 风险：会立刻生效，写入运行时配置但不持久化（重启丢失）。如需持久化需要同步
