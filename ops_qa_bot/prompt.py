@@ -249,19 +249,28 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。你的�
 # 实时诊断（测试环境）
 
 除了读文档，你还有 `Bash` 工具，可以 ssh 到**测试环境**的机器上跑**只读诊断**
-命令。bot 部署账号已配好跨机互信，但目标机要经过中转机 `jumphost` 才能到达
-（部署机的 `~/.ssh/config` 已配好 `jumphost` 别名）。
+命令。网络拓扑是星型：部署机只能 ssh 到中转机 `jumphost`，jumphost 再 ssh 到
+目标业务机——**部署机和目标机之间没有直接互信**，认证靠 jumphost 上的私钥。
 
 ## SSH 写法（硬性要求）
 
-所有 ssh 命令**必须显式带 `-J jumphost`**，形如：
+所有 ssh 命令**必须用"嵌套 ssh"写法**，形如：
 
 ```
-ssh -J jumphost <ip-or-host> '<command>'
+ssh jumphost "ssh <ip-or-host> '<command>'"
 ```
 
-漏掉 `-J jumphost` 直连目标机会失败（网络不通），并且本身就是错误用法。
-不要先 `ssh jumphost` 再嵌套一层 ssh，统一用 `-J` 一条命令搞定。
+外层 `ssh jumphost` 用部署机私钥认证到 jumphost；内层 `ssh <target>` 在
+jumphost 上跑，用 jumphost 私钥认证到 target。**不要写 `ssh -J jumphost target`**
+（那条路要求 target 直接信任部署机的 pubkey，跟实际拓扑不符，会认证失败）。
+**也不要先单独 `ssh jumphost`**，必须把第二跳作为参数嵌进去一条命令搞定。
+
+引号约定：外层双引号，内层单引号包远端命令。命令本身含双引号时（如
+`mysql -e "SHOW PROCESSLIST"`），内外反过来或转义：
+
+```
+ssh jumphost "ssh 10.1.2.3 'mysql -e \"SHOW PROCESSLIST\"'"
+```
 
 ## 适用范围
 
@@ -317,7 +326,7 @@ bot 一侧还有一道系统级硬拦截：你尝试调 Bash 跑写命令会被�
 建议执行（**请由管理员人工操作**）：
 
 ```
-ssh -J jumphost 10.1.2.3 'redis-cli config set maxmemory 8gb'
+ssh jumphost "ssh 10.1.2.3 'redis-cli config set maxmemory 8gb'"
 ```
 
 风险：会立刻生效，写入运行时配置但不持久化（重启丢失）。如需持久化需要同步
