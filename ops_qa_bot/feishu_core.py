@@ -334,6 +334,17 @@ class ProgressTracker:
             self._read_count_in_dir = 0
             return text, phase_change
 
+        if tool_name == "mcp__feishu_doc__ask_feishu_doc":
+            # 远程协作工具：通过飞书 IM 让 lark-copilot 读文档并回答，单次 10–30s
+            # 是常态。本地工具是亚秒级、用户感知不到沉默；这条工具不给专门占位
+            # 用户会以为 bot 卡死。doc URL 太长、question 是 agent 提炼后的措辞，
+            # 都不适合直接展示，给一句明确的"远程"语义即可。
+            phase_change = self._last_phase != "feishu_doc"
+            self._last_phase = "feishu_doc"
+            self._last_dir = None
+            self._read_count_in_dir = 0
+            return "📄 远程取飞书文档中…", phase_change
+
         return None
 
 SessionKey = tuple[str, str]  # (chat_id, user_open_id)
@@ -461,13 +472,21 @@ class FeishuClient:
 
     async def _send(
         self,
-        chat_id: str,
+        receive_id: str,
         msg_type: str,
         content: dict,
         *,
         parent_id: str | None = None,
+        receive_id_type: str = "chat_id",
     ) -> str | None:
         """发消息。成功返回 message_id，失败返回 None（已打日志）。
+
+        `receive_id_type` 控制 receive_id 的解释方式：
+        - `chat_id`（默认）：发到群/会话
+        - `open_id`：直接按个人 open_id 发 DM，飞书会自动建/找 p2p 会话——
+          不需要也无法预先拿到 chat_id（agent-to-agent 协作通道用）
+        - 其他取值（user_id/email 等）飞书也支持，按需透传
+        仅在 send 端点生效；reply 端点根据 parent_id 定位会话，没有 receive_id 概念。
 
         `parent_id` 给定时走 reply 端点（飞书"引用回复"），消息头部带原消息引用条；
         不给定时走普通 send 端点。reply 端点的 chat 默认就是父消息所在 chat，不再
@@ -485,9 +504,9 @@ class FeishuClient:
                 }
             else:
                 url = f"{FEISHU_BASE}/im/v1/messages"
-                params = {"receive_id_type": "chat_id"}
+                params = {"receive_id_type": receive_id_type}
                 payload = {
-                    "receive_id": chat_id,
+                    "receive_id": receive_id,
                     "msg_type": msg_type,
                     "content": json.dumps(content, ensure_ascii=False),
                 }
@@ -500,8 +519,10 @@ class FeishuClient:
             body = resp.json() if resp.content else {}
             if resp.status_code != 200 or body.get("code") != 0:
                 logger.error(
-                    "feishu send(%s, parent=%s) failed: status=%s body=%s",
+                    "feishu send(%s, recv=%s/%s, parent=%s) failed: status=%s body=%s",
                     msg_type,
+                    receive_id_type,
+                    receive_id,
                     parent_id,
                     resp.status_code,
                     resp.text,
@@ -513,6 +534,18 @@ class FeishuClient:
         self, chat_id: str, text: str, *, parent_id: str | None = None
     ) -> str | None:
         return await self._send(chat_id, "text", {"text": text}, parent_id=parent_id)
+
+    async def send_text_to_open_id(self, open_id: str, text: str) -> str | None:
+        """直接按 open_id 给某个用户发 DM，不需要预先存 chat_id。
+
+        agent-to-agent 协作通道用：bot 给 lark-copilot 这个 user 发 envelope，
+        既不知道也不需要 chat_id（飞书自动建/找 p2p 会话）。复用 `_send` 的 token
+        获取 + 错误日志通路，未来加 retry / 99991663 token 刷新等也只改一处。
+        成功返回 message_id；失败返回 None（已打日志）。
+        """
+        return await self._send(
+            open_id, "text", {"text": text}, receive_id_type="open_id"
+        )
 
     async def send_post(
         self,
@@ -640,9 +673,17 @@ class SessionManager:
     主动清掉 last_seen 不算过期，避免给主动重置的用户再补一条提示。
     """
 
-    def __init__(self, docs_root: Path, idle_ttl: float = 1800.0):
+    def __init__(
+        self,
+        docs_root: Path,
+        idle_ttl: float = 1800.0,
+        *,
+        bot_extra_kwargs: dict[str, Any] | None = None,
+    ):
         self._docs_root = docs_root
         self._idle_ttl = idle_ttl
+        # extras 在每次 lazy 创建 OpsQABot 时透传（如飞书协作 MCP server）
+        self._bot_extra_kwargs: dict[str, Any] = dict(bot_extra_kwargs or {})
         self._sessions: dict[SessionKey, _SessionEntry] = {}
         self._manager_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
@@ -669,7 +710,7 @@ class SessionManager:
         async with self._manager_lock:
             entry = self._sessions.get(key)
             if entry is None:
-                bot = OpsQABot(docs_root=self._docs_root)
+                bot = OpsQABot(docs_root=self._docs_root, **self._bot_extra_kwargs)
                 await bot.__aenter__()
                 entry = _SessionEntry(bot)
                 self._sessions[key] = entry

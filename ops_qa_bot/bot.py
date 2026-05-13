@@ -11,6 +11,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
+    McpSdkServerConfig,
     ResultMessage,
     TextBlock,
     ToolUseBlock,
@@ -178,7 +179,17 @@ class OpsQABot:
             text = await bot.answer("Redis 内存告警怎么处理？")
     """
 
-    def __init__(self, docs_root: str | Path):
+    def __init__(
+        self,
+        docs_root: str | Path,
+        *,
+        extra_mcp_servers: dict[str, McpSdkServerConfig] | None = None,
+        extra_tool_names: list[str] | None = None,
+    ):
+        """`extra_*` 用于按部署形态注入额外能力（如飞书文档协作工具）。
+        cli/单测路径不传，行为完全不变；ws_server 启动时把 feishu_doc_tool
+        的 MCP server + 工具名带进来，agent 才能看到 `ask_feishu_doc`。
+        """
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
             raise ValueError(f"docs_root 不存在或不是目录: {self.docs_root}")
@@ -200,9 +211,22 @@ class OpsQABot:
         # 走 "ask" 流程；SDK 模式下没人能 prompt，agent 就会把它理解成"我没权限"
         # 而拒绝调 Bash。bypassPermissions 跳过所有权限检查，安全控制完全交给
         # tools 白名单（agent 只能见到这 4 个工具）+ PreToolUse hook（写命令兜底）。
+        tools_list: list[str] = ["Read", "Glob", "Grep", "Bash"]
+        if extra_tool_names:
+            tools_list.extend(extra_tool_names)
+        mcp_servers: dict[str, McpSdkServerConfig] = dict(extra_mcp_servers or {})
+
+        # 用 tools_list 是否真的含 ask_feishu_doc 作为单一事实源决定 prompt 是否
+        # 渲染该节——避免"环境变量设了/工具没注册"或反过来让 prompt 与 tools 脱钩，
+        # 导致 agent 调一个不存在的工具或看到工具却没用法指引。
+        feishu_doc_enabled = "mcp__feishu_doc__ask_feishu_doc" in tools_list
+
         self._options = ClaudeAgentOptions(
-            system_prompt=build_system_prompt(self.docs_root),
-            tools=["Read", "Glob", "Grep", "Bash"],
+            system_prompt=build_system_prompt(
+                self.docs_root, feishu_doc_enabled=feishu_doc_enabled
+            ),
+            tools=tools_list,
+            mcp_servers=mcp_servers,
             cwd=str(self.docs_root),
             permission_mode="bypassPermissions",
             hooks={

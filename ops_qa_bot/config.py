@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,18 @@ class HealthConfig:
 
 
 @dataclass
+class FeishuDocCollabConfig:
+    """飞书文档协作（ask_feishu_doc 工具）配置。
+
+    peer_open_id 未设 → ws_server 不注入该工具、bot 行为完全不变；
+    设了就必须是合法的 open_id 格式，否则 load_config 阶段就抛——
+    比等到运行时 ask 发出去、超时 60s 才发现错填了 union_id/user_id/邮箱 友好。
+    """
+
+    peer_open_id: str | None = None
+
+
+@dataclass
 class AppConfig:
     docs_root: Path
     feishu: FeishuConfig
@@ -53,6 +66,12 @@ class AppConfig:
     admin_token: str | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    feishu_doc: FeishuDocCollabConfig = field(default_factory=FeishuDocCollabConfig)
+
+
+# 飞书 open_id 严格格式：以 ou_ 起头 + 字母数字/下划线/连字符。长度上限放 64 防止
+# 误把整段邮箱/JSON 塞进来导致日志被污染。
+_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]{1,64}$")
 
 
 def _pick(env_key: str, cfg_value: Any, default: Any = None) -> Any:
@@ -121,6 +140,26 @@ def load_config(path: Path) -> AppConfig:
     health_host = _pick("HEALTH_HOST", health_raw.get("host"), "127.0.0.1")
     health_port = int(_pick("HEALTH_PORT", health_raw.get("port"), 8001))
 
+    feishu_doc_raw = data.get("feishu_doc") or {}
+    peer_open_id_raw = _pick(
+        "FEISHU_DOC_PEER_OPEN_ID", feishu_doc_raw.get("peer_open_id")
+    ) or None
+    if peer_open_id_raw and not _OPEN_ID_RE.match(peer_open_id_raw):
+        # 启动时硬报错而不是日志 warning + 跳过：peer_open_id 配错了，工具看似启用、
+        # 调用时 100% 失败，对用户和 agent 都不友好。让运维当场看到配置错误。
+        source = (
+            "环境变量 FEISHU_DOC_PEER_OPEN_ID"
+            if os.environ.get("FEISHU_DOC_PEER_OPEN_ID")
+            else f"{path} [feishu_doc].peer_open_id"
+        )
+        raise RuntimeError(
+            f"feishu_doc.peer_open_id 格式不合法（来自 {source}）："
+            f"'{peer_open_id_raw}'。\n"
+            f"必须是飞书 open_id，形如 ou_xxxxxxxx（不是 union_id / user_id / "
+            f"邮箱 / 手机号）。让 lark-copilot 那个 user 给本 bot 发一条消息，"
+            f"在日志里抓 sender.open_id 即是本 app 视角下对应的 open_id。"
+        )
+
     return AppConfig(
         docs_root=docs_root,
         feishu=FeishuConfig(
@@ -139,4 +178,5 @@ def load_config(path: Path) -> AppConfig:
             host=health_host,
             port=health_port,
         ),
+        feishu_doc=FeishuDocCollabConfig(peer_open_id=peer_open_id_raw),
     )

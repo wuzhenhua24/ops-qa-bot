@@ -9,6 +9,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。主要�
 2. **路由到组件**：根据问题关键词，定位到对应组件目录（可能涉及多个组件）。
 3. **读取文档**：用 Glob 列出该组件目录下的 md 文件，然后 Read 读取相关文档。文档通常较短，命中目录后整篇读完即可。
 4. **基于内容回答**：以读到的文档内容为答案依据。问题涉及实时状态时，再叠加 Bash 诊断的实时数据（详见「实时诊断」节）。
+{feishu_workflow_hint}
 
 # 回答规范
 
@@ -23,7 +24,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。主要�
 - `Read`：读取单个 md 文件
 - `Glob`：按 pattern 列文件（例如 `redis/*.md`）
 - `Grep`：跨文档搜索关键词（例如在 `{docs_root}` 下搜 "慢查询"）
-- `Bash`：测试环境实时诊断，ssh 跑只读命令（详见下方「实时诊断」节，写操作会被系统硬拦截）
+- `Bash`：测试环境实时诊断，ssh 跑只读命令（详见下方「实时诊断」节，写操作会被系统硬拦截）{feishu_doc_tool_line}
 
 # 边界
 
@@ -245,7 +246,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个内部运维文档问答助手。主要�
 （来源：redis/scaling.md）
 
 <<FOLLOWUPS:rollback|risks|commands>>
-```
+```{feishu_doc_section}
 
 # 实时诊断（测试环境）
 
@@ -358,5 +359,102 @@ Mem:           15Gi        14Gi       512Mi
 """
 
 
-def build_system_prompt(docs_root: Path) -> str:
-    return SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root))
+# 飞书文档协作工具的描述与流程指引：仅在 feishu_doc_enabled=True 时才会写进
+# system prompt。否则保持 agent 完全不知道这条工具的存在——避免它在工具实际未
+# 注册时仍然按 prompt 提示去调用、然后 SDK 报"未知工具"。
+# 在"工作流程"末尾追加一段，把飞书源的存在和触发条件告诉 agent。仅 enabled 时注入。
+# 单独占位符而不是直接改写第 1/3/4 步，避免 disabled 时仍泄漏"飞书源"概念。
+_FEISHU_WORKFLOW_HINT = (
+    "\n关于飞书外部知识源：部分组件知识写在飞书云文档里、未同步到本地 md。"
+    "INDEX.md 路由表会标注哪些组件有飞书源（标注示例：表里有 `飞书源` 列且值非空）。"
+    "**路由到被标注有飞书源的组件后**，第 3 步除了读本地 md，还要 Read 该目录下的"
+    " `feishu_docs.md`（飞书文档索引）；具体怎么用 + 何时调 `ask_feishu_doc` 详见"
+    "下方「飞书文档协作」节。"
+)
+
+_FEISHU_DOC_TOOL_LINE = (
+    "\n- `mcp__feishu_doc__ask_feishu_doc(doc, question)`：读取组件 `feishu_docs.md`"
+    "里登记的**飞书云文档**并基于该文档回答（部分组件知识写在飞书里、未同步到"
+    "本地 md）。doc 必须是 `feishu_docs.md` 已登记的 URL，不要凭空构造；返回的"
+    "是协作机器人 lark-copilot 基于该文档给出的答案，可以引用、二次加工，但"
+    "**不要**伪装成你自己读到的（见下方「飞书文档协作」节）。"
+)
+
+_FEISHU_DOC_SECTION = """
+
+# 飞书文档协作（ask_feishu_doc）
+
+部分组件的知识由维护人写在**飞书云文档**里（历史原因 + 免去定时同步），未落到
+本地 md。这些飞书文档以"索引"形式登记在每个组件目录下的 `feishu_docs.md` 里。
+
+## 何时该看 feishu_docs.md
+
+- INDEX.md 路由表里该组件被标注为"有飞书源"——路由到该组件后**必须 Read**
+  组件目录下的 `feishu_docs.md`，把里面登记的条目当成和本地 md 同级的知识源
+- 没有这个标注、或者该组件目录下没有 `feishu_docs.md` 文件——就不存在飞书源，
+  按本地 md 正常流程答即可
+
+## feishu_docs.md 的格式（你会看到的样子）
+
+```
+## <文档标题>
+- URL: https://feishu.cn/docx/xxxxx
+- 覆盖：<这份文档讲了什么、适用什么场景，逗号分隔的关键词/短句>
+- 更新于：YYYY-MM
+```
+
+每条目最关键的是"覆盖"那一行——它告诉你这条飞书文档管的是什么。
+
+## 调 ask_feishu_doc 的判定流程
+
+1. **匹配相关条目**：读完 `feishu_docs.md` 后，看用户问题的关键词跟哪几条的"覆盖"
+   对得上。完全对不上 → 跳过、纯靠本地 md 答；如果本地 md 也没答案，按"升级
+   规则"走 `<<ESCALATE:...>>`，**不要**为了"碰运气"瞎调一条不相关的飞书文档。
+2. **优先级**：本地 md 已经能完整回答的，**不需要**再调飞书工具（飞书慢、飞书结果
+   是另一个 agent 的总结、不如本地原文可靠）。本地 md 部分覆盖、关键细节在飞书的，
+   两边都用、合并答。
+3. **调用方式**：`ask_feishu_doc(doc=<feishu_docs.md 里登记的完整 URL>,
+   question=<针对该文档的具体问题>)`。
+   - `doc` **只能用 `feishu_docs.md` 里登记的 URL**，不要凭空构造、不要改写参数、
+     不要把整篇 `feishu_docs.md` 当 doc 传
+   - `question` 提炼成一句"针对这份文档想知道什么"（如"该文档里建议的 OOM 排查
+     步骤是什么"），不要把用户原话整段塞进去
+4. **结果当作另一个 agent 的回答**：工具返回的是 lark-copilot 基于该飞书文档
+   作答的成品，不是原文摘录。可以引用、和本地文档结论合并、按格式重排，但**不要**
+   说"我读了这份文档" —— 你没读，是协作机器人读的。
+5. **来源标注**：飞书文档引用用以下格式（和本地 md 的"（来源：xxx.md）"区分开）：
+   `（来源：飞书文档《<标题>》<URL>，由协作机器人协助读取）`
+6. **工具失败时降级**：返回里出现"协作机器人未返回答案"、"超时"、"未就绪"等字样
+   时，**不要重试同一调用**——把这条飞书文档当作暂时不可用，仅用本地 md 部分作答；
+   如果飞书文档是唯一来源、本地 md 没覆盖，回复"飞书文档当前读不到，麻烦打开
+   <URL> 自查或联系组件负责人"并按 INDEX.md 决定是否走 `<<ESCALATE:...>>`。
+
+## 限制
+
+- 这条工具是慢操作（拉文档 + 协作机器人推理可能 10–30s），一次回答里**最多调
+  两次**——超过基本是 agent 在乱试。问题命中多条飞书条目时，挑最相关的 1–2 条调。
+- `feishu_docs.md` 本身只是索引、不是答案来源；不要直接把 `feishu_docs.md` 里
+  的"覆盖"行当文档内容引用给用户。"""
+
+
+def build_system_prompt(
+    docs_root: Path,
+    *,
+    feishu_doc_enabled: bool = False,
+) -> str:
+    """构造 system prompt。
+
+    `feishu_doc_enabled`：是否往 prompt 里写入 `ask_feishu_doc` 工具的描述和
+    使用说明。必须与 `ClaudeAgentOptions.tools` 是否包含
+    `mcp__feishu_doc__ask_feishu_doc` 保持一致——否则要么 agent 看到工具却没
+    指引、要么照指引调一个不存在的工具。
+    """
+    tool_line = _FEISHU_DOC_TOOL_LINE if feishu_doc_enabled else ""
+    section = _FEISHU_DOC_SECTION if feishu_doc_enabled else ""
+    workflow_hint = _FEISHU_WORKFLOW_HINT if feishu_doc_enabled else ""
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        docs_root=str(docs_root),
+        feishu_doc_tool_line=tool_line,
+        feishu_doc_section=section,
+        feishu_workflow_hint=workflow_hint,
+    )

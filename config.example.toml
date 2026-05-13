@@ -42,3 +42,11 @@ feedback_log = "./logs/feedback.log"    # env: FEEDBACK_LOG
 enabled = true                          # env: HEALTH_ENABLED；不需要监控时设 false
 host    = "127.0.0.1"                   # env: HEALTH_HOST；接外部监控时改 0.0.0.0
 port    = 8001                          # env: HEALTH_PORT
+
+# 飞书文档协作（可选）：把"读飞书云文档"的能力委托给另一个跑 user 账号的协作机器人
+# lark-copilot，bot 通过飞书 IM DM 给 lark-copilot 发 envelope、等回复。
+# 设置 peer_open_id 后启用 ask_feishu_doc 工具；不设则该功能不启用，bot 行为不变。
+# peer_open_id 必须是飞书 open_id（形如 ou_xxxxxxxx，不是 union_id/user_id/邮箱）。
+# 启动时会做格式校验，格式不对直接 panic。
+[feishu_doc]
+peer_open_id = ""                       # env: FEISHU_DOC_PEER_OPEN_ID

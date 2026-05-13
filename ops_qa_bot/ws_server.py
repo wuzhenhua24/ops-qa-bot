@@ -33,6 +33,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTriggerResponse,
 )
 
+from . import feishu_doc_tool
 from .config import AppConfig
 from .feishu_core import (
     FeishuClient,
@@ -79,8 +80,31 @@ class WsRunner:
 
         self._config = config
         self._feishu = FeishuClient(config.feishu.app_id, config.feishu.app_secret)
+
+        # 飞书文档协作配置：peer 是 lark-copilot 的 user open_id。
+        # 设置后才启用 ask_feishu_doc 工具；未设置则保留 bot 原行为不变。
+        # 格式校验在 load_config 阶段做完；这里只读结果。
+        self._peer_open_id: str | None = config.feishu_doc.peer_open_id
+        bot_extra_kwargs: dict[str, Any] = {}
+        if self._peer_open_id:
+            mcp_server = feishu_doc_tool.build_mcp_server()
+            bot_extra_kwargs = {
+                "extra_mcp_servers": {"feishu_doc": mcp_server},
+                # SDK 把 MCP 工具暴露成 mcp__<server>__<tool> 这种带前缀的名字
+                "extra_tool_names": ["mcp__feishu_doc__ask_feishu_doc"],
+            }
+            logger.info(
+                "feishu_doc collab enabled: peer_open_id=%s", self._peer_open_id
+            )
+        else:
+            logger.info(
+                "feishu_doc collab disabled (FEISHU_DOC_PEER_OPEN_ID not set)"
+            )
+
         self._session_mgr = SessionManager(
-            docs_root=docs_root, idle_ttl=config.session_idle_ttl
+            docs_root=docs_root,
+            idle_ttl=config.session_idle_ttl,
+            bot_extra_kwargs=bot_extra_kwargs,
         )
         # WS 下 SDK 一般自己去重，但保险起见我们也按 event_id/click key 兜一层
         self._seen_events: TTLCache = TTLCache(maxsize=10000, ttl=600)
@@ -133,6 +157,33 @@ class WsRunner:
         message_type = msg.message_type
         if not chat_id or not sender_id or not message_type:
             return
+
+        # 飞书文档协作回程：peer（lark-copilot）发来的文本 *如果是* ack envelope
+        # 就交给 RPC 投递，命中即终止；否则**放行到正常 QA 流程**——这条手动通道
+        # 是有意保留的：peer 账号背后的真人（通常就是 lark-copilot 的运维者）需要
+        # 能直接 DM 这个 bot 做调试、提问或反馈，不能被协议层静默吞掉。
+        #
+        # try_deliver 在协议消息（含落空的 orphan ack）上都返回 True，在"不是 ack
+        # envelope"时返回 False —— 用它的返回值作为"是否协议消息"的单一判据。
+        if (
+            self._peer_open_id
+            and sender_id == self._peer_open_id
+            and message_type == "text"
+        ):
+            try:
+                content_dict = json.loads(msg.content or "{}")
+            except json.JSONDecodeError:
+                content_dict = {}
+            peer_text = (content_dict.get("text") or "").strip()
+            rpc = feishu_doc_tool.get_rpc()
+            if rpc is not None and rpc.try_deliver(peer_text):
+                return
+            # 非协议消息 → 当成 peer 账号的人在手动跟 bot 聊天，往下走标准 text
+            # 处理流程。info 级日志方便排查"以为是 ack 实际是手动消息"的情形。
+            logger.info(
+                "peer text not an ack, treat as manual QA input: preview=%r",
+                peer_text[:120],
+            )
 
         # image 消息走视觉路径：解 image_key → 异步下载 → handle_question(images=...)
         if message_type == "image":
@@ -653,6 +704,14 @@ class WsRunner:
         self._loop = asyncio.get_running_loop()
         self._started_at = time.time()
         await self._session_mgr.start()
+
+        # 飞书协作 RPC 只能在 loop 跑起来后 init（要拿 running loop 关联 Future）
+        if self._peer_open_id:
+            feishu_doc_tool.init_rpc(
+                feishu=self._feishu,
+                peer_open_id=self._peer_open_id,
+                loop=self._loop,
+            )
 
         # 先把 WS 线程拉起来再开 health server，避免 /readyz 在
         # "health up 但 _ws_thread 还是 None" 的毫秒级窗口里误报 503
