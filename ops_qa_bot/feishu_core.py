@@ -378,6 +378,47 @@ _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
 _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
 
+# Escalate drift 兜底：LLM 答出"文档中未找到 / 找不到相关内容"但忘了输出 ESCALATE
+# marker。这种 asker 看到答案是"找不到 + 空气"，没人接手——属于 LLM 概率漂移
+# （[[project-escalate-trigger-probabilistic]]）。命中时给答案追加一句 asker-facing
+# 提示让他有 next step（"在群里 @ 负责人"），并在日志里打 warning + qa 事件加
+# escalate_drift_fallback=True 字段，方便事后 grep 漂移频率。
+# 不强行猜 owner @：我们没有可靠依据从问题文本推断组件，乱 @ 错人比不 @ 更糟。
+_NOT_FOUND_RE = re.compile(
+    r"文档(中|里)?(未|没)(找到|有)|"
+    r"未找到相关|"
+    r"找不到相关"
+)
+
+
+def _is_escalate_drift(
+    raw_answer: str,
+    stripped_answer: str,
+    escalate_owner: str | None,
+    is_clarification: bool,
+) -> bool:
+    """Escalate marker drift 判定（纯函数，便于单测）。
+
+    True 表示 LLM 说"找不到"但忘了输出 ESCALATE/CLARIFY marker，需要兜底。
+    raw_answer 是 LLM 原文（剥 marker 之前），stripped_answer 是剥完 marker
+    的答案。escalate_owner 来自 ticket/普通 ESCALATE parser 合并后的结果。
+
+    四个条件全部满足才算 drift：
+    1. 非反问轮——反问轮 LLM 本来就不该输出 ESCALATE，不算漂移；
+    2. 没识别到任何 owner——已经 @ 上人就不需要兜底；
+    3. raw_answer 不含 <<ESCALATE 也不含 <<CLARIFY——LLM 自己 mark 过（哪怕
+       是 ESCALATE:none 表示"找不到但也不知道找谁"），按其意图办，不覆盖；
+    4. stripped_answer 文本命中"文档中未找到/找不到相关"句式——LLM 确实表达
+       了找不到，而不是答了别的东西。
+    """
+    if is_clarification:
+        return False
+    if escalate_owner is not None:
+        return False
+    if "<<ESCALATE" in raw_answer or "<<CLARIFY" in raw_answer:
+        return False
+    return bool(_NOT_FOUND_RE.search(stripped_answer))
+
 # 快捷追问机制：bot 答完后按 prompt 输出 <<FOLLOWUPS:k1|k2|k3>> 标记，
 # handle_question 解析 → 在反馈卡上面挂对应按钮。点击 → 用预设 prompt
 # 触发新一轮 handle_question，把用户自然带进下一轮。
@@ -2315,6 +2356,11 @@ async def handle_question(
         answer = _friendly_error(e, context="问答", suggest_reset=True)
     answer = answer or "（无回答内容）"
 
+    # raw_answer 留作 drift 检测：parsing 会把 marker 剥掉，事后只看 answer 没法
+    # 区分"LLM 输出了 <<ESCALATE:none>>（marker 在但 owner=none）"和"LLM 啥 marker
+    # 都没输出"。drift 兜底要的是后者，所以这里在剥之前先快照一份原文本。
+    raw_answer = answer
+
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
     # escalate_dir_hint 是 LLM 直接给的归档目录（基于答案命中的组件，准确性高于
     # 按 owner 反查；同一负责人挂多组件时只有 LLM 自己知道这次答的是哪个组件）。
@@ -2372,6 +2418,28 @@ async def handle_question(
         escalate_dir_hint = None
         archive_q_draft = None
     is_ticket = escalate_ticket_owner is not None
+
+    # Escalate marker drift 兜底（[[project-escalate-trigger-probabilistic]]）：
+    # LLM 答出"文档中未找到"但忘了输出 ESCALATE/CLARIFY marker。判定条件 +
+    # 决策都在 _is_escalate_drift 里，本处只负责"命中后追加 asker-facing 提示
+    # + 打 warning + qa_record 标记"。不强行猜 owner @——没可靠依据从问题文本
+    # 推断组件，乱 @ 错人比不 @ 更糟。
+    escalate_drift = _is_escalate_drift(
+        raw_answer, answer, escalate_owner, is_clarification
+    )
+    if escalate_drift:
+        logger.warning(
+            "escalate drift: not-found answer with no marker, append fallback hint. "
+            "chat=%s user=%s question=%r",
+            chat_id,
+            user_id,
+            _excerpt(question, 200),
+        )
+        answer = (
+            answer.rstrip()
+            + "\n\n💡 文档没覆盖到这块；可以在群里 @ 对应组件负责人协助处理。"
+        )
+
     # 上一轮上下文已过期时在答案最前面加一行提示，让用户立刻知道"那句『接着
     # 上面的』bot 没拿到上下文，本次按全新问题答的"。注入放在嵌图标记解析之后、
     # _mention_post 之前，提示成为飞书 post 的第一段，最显眼。
@@ -2469,6 +2537,10 @@ async def handle_question(
         qa_record["escalation_kind"] = "ticket" if is_ticket else "qa"
     if is_clarification:
         qa_record["clarification"] = True
+    if escalate_drift:
+        # grep 频率：jq 'select(.escalate_drift_fallback) | {qid, question}' feedback.log
+        # 频率高就该回头调 prompt 强化"找不到必须输出 marker"那条
+        qa_record["escalate_drift_fallback"] = True
     if attached_images:
         # 用相对路径而不是 image_key，事后能直接定位到具体哪些图被引用
         qa_record["images_attached"] = attached_images
