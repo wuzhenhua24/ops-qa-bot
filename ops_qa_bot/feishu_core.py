@@ -200,19 +200,41 @@ def _friendly_error(
 # 误判代价低（占位文案不准，最终答案不受影响），不做更复杂的语义判断。
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
+# 操作/工单请求关键词：用户让 bot/管理员代为执行变更（加权限/开账号/申请资源/
+# 开通访问）。prompt 侧要求 agent **先读文档**判断是自助流程还是手动分配，所以
+# 占位文案就用"🔍 翻文档中"——比"🔧 诊断中"准（agent 不会 ssh）、也比"📨
+# 转交负责人中"诚实（最后不一定 @）。这里识别只为压制 IP 启发，避免"帮我加
+# 172.x 权限"被误标成诊断中。
+# 要求带"帮我/帮/麻烦/给我/申请/开通"这种委托语义的前缀——单看"加/开"会和
+# "怎么加节点"这种知识句撞，宁可漏判（fallback 到默认占位）也不要把知识问题
+# 误标成工单。
+_OP_REQUEST_RE = re.compile(
+    r"帮(我|忙)?(加|开|改|配|搞|弄|执行|批准|开通)|"
+    r"麻烦(帮|加|开|改|配|执行|批准|开通)|"
+    r"给我(加|开|改|配)|"
+    # 申请 / 开通 之后允许夹 0-15 个非分句字符再到目标名词，覆盖
+    # "申请下 mysql 的只读账号"、"开通一下 redis 的访问权限" 这种带宾语前置的写法。
+    r"申请[^\n。！？!?]{0,15}(权限|账号|账户|资源|白名单|访问)|"
+    r"开通[^\n。！？!?]{0,15}(权限|账号|账户|访问|白名单)"
+)
+
 
 def _placeholder_text(question: str, queued: bool) -> str:
     """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
 
     queued=True 表示当前 session 锁被前一条问题占着，本条还没开始跑，前缀用
     🕒 排队中；获取到锁开始跑时上层会再 update 一次置成 🔍 翻文档中 / 🔧 诊断中。
+
+    含 IP 默认走"🔧 诊断中"；但如果同时命中操作/工单请求关键词（"帮我加权限"），
+    强制切回"🔍 翻文档中"——这种 agent 会先读文档判断自助/手动，不会 ssh，
+    贴"诊断中"会误导用户以为 bot 在 ssh 跑命令。
     """
     excerpt = question.strip().replace("\n", " ")
     if len(excerpt) > 40:
         excerpt = excerpt[:40] + "…"
     if queued:
         icon = "🕒 排队中"
-    elif _IP_RE.search(question):
+    elif _IP_RE.search(question) and not _OP_REQUEST_RE.search(question):
         icon = "🔧 诊断中"
     else:
         icon = "🔍 翻文档中"
@@ -345,6 +367,12 @@ SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 _ESCALATE_RE = re.compile(
     r"<<ESCALATE:(?P<who>ou_[A-Za-z0-9_-]+|none)"
     r"(?::(?P<dir>[A-Za-z0-9._/-]+))?>>"
+)
+# 工单类升级：用户让人代为执行变更（加权限/开账号），不是知识 Q&A。bot 只 @
+# 负责人、不发归档表单卡（没什么可归档的"答案"）。和 _ESCALATE_RE 互斥，两者同时
+# 出现时 ticket 优先。不带 dir：工单不归档，dir 没意义。
+_ESCALATE_TICKET_RE = re.compile(
+    r"<<ESCALATE_TICKET:(?P<who>ou_[A-Za-z0-9_-]+|none)>>"
 )
 _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
@@ -1647,6 +1675,20 @@ def _parse_escalate(answer: str) -> tuple[str, str | None, str | None]:
     return cleaned, (who if who != "none" else None), dir_hint
 
 
+def _parse_escalate_ticket(answer: str) -> tuple[str, str | None]:
+    """抽 <<ESCALATE_TICKET:owner>> 标记 → (清理后的答案, owner_id or None)。
+
+    工单类升级：@ 负责人但不发归档表单卡（"加权限"等操作请求不是知识 Q&A）。
+    调用方负责把它和 _parse_escalate 的结果合并；两者同时出现时 ticket 优先。
+    """
+    m = _ESCALATE_TICKET_RE.search(answer)
+    if not m:
+        return answer, None
+    cleaned = _ESCALATE_TICKET_RE.sub("", answer).strip()
+    who = m.group("who")
+    return cleaned, (who if who != "none" else None)
+
+
 def _parse_archive_q(answer: str) -> tuple[str, str | None]:
     """抽 <<ARCHIVE_Q:...>> 标记，返回 (清理后的答案文本, 净化后的问题标题草稿 or None)。
 
@@ -1692,33 +1734,42 @@ def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
     return cleaned
 
 
-def _append_escalate_at(post: dict, owner_id: str, archive_path: str) -> None:
-    """在 post 末尾追加 "📣 已通知负责人 @xxx" + "📁 归档去向" 两行。
+def _append_escalate_at(
+    post: dict, owner_id: str, archive_path: str, *, is_ticket: bool = False
+) -> None:
+    """在 post 末尾追加 "📣 已通知负责人 @xxx" 行（+ 普通升级时再加归档去向）。
 
+    is_ticket=False（默认，"文档没答案"升级）：追加两行——@ + 归档路径告知。
     archive_path 是相对 docs_root 的路径（如 "redis/qa-archive.md"），与紧随其后
     发出的归档表单卡 (_archive_form_card) 一致。告诉 asker 答案最终会落到哪、下次
     类似问题 bot 能从哪里直接答，避免"通知完就没下文"的预期空白。归档依赖 owner
     填表单，措辞用条件式（"填写后会归档"）不要说死。
+
+    is_ticket=True（工单类升级，"加权限/开账号"操作请求）：只 @ 不提归档；动词
+    用"协助处理"而不是"协助回答"——工单 ≠ 知识答疑。archive_path 在 ticket 模式
+    下被忽略，调用方可以传空串。
     """
     post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
+    verb = "协助处理" if is_ticket else "协助回答"
     post["zh_cn"]["content"].append(
         [
             {"tag": "text", "text": "📣 已通知负责人 "},
             {"tag": "at", "user_id": owner_id},
-            {"tag": "text", "text": " 协助回答 🙏"},
+            {"tag": "text", "text": f" {verb} 🙏"},
         ]
     )
-    post["zh_cn"]["content"].append(
-        [
-            {
-                "tag": "text",
-                "text": (
-                    f"📁 负责人填写后会归档到 {archive_path}，"
-                    "下次类似问题我能直接从这里答。"
-                ),
-            }
-        ]
-    )
+    if not is_ticket:
+        post["zh_cn"]["content"].append(
+            [
+                {
+                    "tag": "text",
+                    "text": (
+                        f"📁 负责人填写后会归档到 {archive_path}，"
+                        "下次类似问题我能直接从这里答。"
+                    ),
+                }
+            ]
+        )
 
 
 def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
@@ -2186,6 +2237,8 @@ async def handle_question(
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
     # escalate_dir_hint 是 LLM 直接给的归档目录（基于答案命中的组件，准确性高于
     # 按 owner 反查；同一负责人挂多组件时只有 LLM 自己知道这次答的是哪个组件）。
+    # ticket marker 先剥（独立于普通 ESCALATE），命中后走"@ 但不发归档卡"分支。
+    answer, escalate_ticket_owner = _parse_escalate_ticket(answer)
     answer, escalate_owner, escalate_dir_hint = _parse_escalate(answer)
     # 解析归档问题标题草稿（仅在升级时有意义；marker 缺失/为空则为 None，
     # 后面会回退到用户原话）
@@ -2198,6 +2251,7 @@ async def handle_question(
     # 但 LLM 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
     if is_clarification:
         escalate_owner = None
+        escalate_ticket_owner = None
         escalate_dir_hint = None
         archive_q_draft = None
         followup_keys = []
@@ -2229,6 +2283,14 @@ async def handle_question(
                 answer.rstrip()
                 + f"\n\n（另有 {len(truncated_images)} 张图未展示：{shown}）"
             )
+    # 工单 marker 优先：和普通 ESCALATE 同时出现（LLM 偶尔会瞎组合）时按工单处理，
+    # 归档相关字段强制清空。is_ticket 在这里一次性锁定本次升级类型，后面"要不要发
+    # 归档卡 / @ 行措辞用哪个动词"都查这个标志，避免散落多处条件。
+    if escalate_ticket_owner is not None:
+        escalate_owner = escalate_ticket_owner
+        escalate_dir_hint = None
+        archive_q_draft = None
+    is_ticket = escalate_ticket_owner is not None
     # 上一轮上下文已过期时在答案最前面加一行提示，让用户立刻知道"那句『接着
     # 上面的』bot 没拿到上下文，本次按全新问题答的"。注入放在嵌图标记解析之后、
     # _mention_post 之前，提示成为飞书 post 的第一段，最显眼。
@@ -2250,7 +2312,19 @@ async def handle_question(
         cooldown_key = (chat_id, escalate_owner)
         if cooldown_key in _escalate_cooldown:
             logger.info(
-                "escalate cooldown hit: chat=%s owner=%s, suppress @",
+                "escalate cooldown hit: chat=%s owner=%s kind=%s, suppress @",
+                chat_id,
+                escalate_owner,
+                "ticket" if is_ticket else "qa",
+            )
+        elif is_ticket:
+            # 工单类升级：只 @ 不算归档路径、不发归档卡。component_dir / archive_path_repr
+            # 留默认值，下面归档卡的分支会因为 is_ticket 整体跳过。
+            _escalate_cooldown[cooldown_key] = True
+            _append_escalate_at(final_post, escalate_owner, "", is_ticket=True)
+            escalated_now = True
+            logger.info(
+                "escalated to owner (ticket): chat=%s owner=%s",
                 chat_id,
                 escalate_owner,
             )
@@ -2311,6 +2385,7 @@ async def handle_question(
     }
     if escalate_owner is not None:
         qa_record["escalated_to"] = escalate_owner
+        qa_record["escalation_kind"] = "ticket" if is_ticket else "qa"
     if is_clarification:
         qa_record["clarification"] = True
     if attached_images:
@@ -2354,10 +2429,11 @@ async def handle_question(
             parent_id=parent_msg_id,
         )
 
-    # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）。
-    # component_dir / archive_path_repr 已在 _append_escalate_at 之前算好，这里直接复用，
-    # 与答案末尾告知 asker 的归档路径保持一致。
-    if escalated_now:
+    # 6. 归档表单卡：仅在本次实际 @ 了负责人**且不是工单类**时发——工单（加权限/
+    # 开账号）没什么"答案"可归档，发卡只会让负责人多一步无意义点击。cooldown 命中
+    # 或 none 也跳过。component_dir / archive_path_repr 已在 _append_escalate_at 之前
+    # 算好，这里直接复用，与答案末尾告知 asker 的归档路径保持一致。
+    if escalated_now and not is_ticket:
         # question_default：归档表单"问题"框的预填值——优先用 LLM 给的归一化标题，
         # 没给则回退到用户原话。提交时负责人改了就用改后的；question（原话）单纯
         # 留作最终 fallback + 日志对照。
