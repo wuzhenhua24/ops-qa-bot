@@ -30,7 +30,7 @@ logger = logging.getLogger("ops_qa_bot.feishu")
 feedback_logger = logging.getLogger("ops_qa_bot.feedback")
 
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
-POST_TITLE = "运维文档助手"
+POST_TITLE = "测试环境助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 
 # 图片输入：Anthropic vision 支持 png/jpeg/gif/webp；超过 5MB 大概率被 API 拒
@@ -364,15 +364,18 @@ SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 # 标记，handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
 # owner 接受 ou_xxx 或 none；后缀目录可选，由 LLM 基于"问题归属哪个组件"给出，
 # 用于归档卡选目录。owner / dir 都做白名单校验防注入和路径穿越。
+# 冒号 / who / dir 周围都容许 \s*——LLM 偶尔会写成 `<<ESCALATE: ou_xxx:redis>>`
+# 或 `<<ESCALATE:ou_xxx : redis >>`，严格正则漏匹配 → marker 字面糊到答案末尾 +
+# @ 不发。和 _FOLLOWUPS_RE 修复一同思路：宽松匹配，下游已有 strip 兜底。
 _ESCALATE_RE = re.compile(
-    r"<<ESCALATE:(?P<who>ou_[A-Za-z0-9_-]+|none)"
-    r"(?::(?P<dir>[A-Za-z0-9._/-]+))?>>"
+    r"<<ESCALATE:\s*(?P<who>ou_[A-Za-z0-9_-]+|none)\s*"
+    r"(?::\s*(?P<dir>[A-Za-z0-9._/-]+)\s*)?>>"
 )
 # 工单类升级：用户让人代为执行变更（加权限/开账号），不是知识 Q&A。bot 只 @
 # 负责人、不发归档表单卡（没什么可归档的"答案"）。和 _ESCALATE_RE 互斥，两者同时
 # 出现时 ticket 优先。不带 dir：工单不归档，dir 没意义。
 _ESCALATE_TICKET_RE = re.compile(
-    r"<<ESCALATE_TICKET:(?P<who>ou_[A-Za-z0-9_-]+|none)>>"
+    r"<<ESCALATE_TICKET:\s*(?P<who>ou_[A-Za-z0-9_-]+|none)\s*>>"
 )
 _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
@@ -423,13 +426,20 @@ def _is_escalate_drift(
 # handle_question 解析 → 在反馈卡上面挂对应按钮。点击 → 用预设 prompt
 # 触发新一轮 handle_question，把用户自然带进下一轮。
 # key 必须出自 _FOLLOWUP_LIBRARY；最多 3 个；不在白名单的 key 静默过滤。
-# 抓取宽松（含数字/大小写都先收下），合法性靠 _FOLLOWUP_LIBRARY 白名单过滤
-_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([\w|]+)>>")
+# 正则宽松（含空格 / 大小写 / 数字 / 横杠都先收下），合法性靠 _FOLLOWUP_LIBRARY
+# 白名单过滤 + _parse_followups 里逐 key strip。**必须容忍空格**：实测 LLM 偶尔
+# 写成 `<<FOLLOWUPS: troubleshoot|commands|related>>`（冒号后多个空格）或
+# `<<FOLLOWUPS:troubleshoot | commands | related>>`（竖线两侧空格），严格正则
+# 会漏匹配 → marker 字面糊到答案末尾 + 追问卡不发。和 _ARCHIVE_Q_RE / _IMG_RE
+# 一致用 `[^<>\n\r]+?`（允许除尖括号和换行外的任意字符）。
+_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([^<>\n\r]+?)>>")
 
 # 反问标记：LLM 检测到信息不足以准确答时输出 <<CLARIFY>>，把答案当成反问轮处理。
 # 反问轮：不发反馈卡 / 追问按钮 / 升级 @ / 归档卡，让用户专注回答反问；
 # 用户在同一 session 里答完，下一轮就按补充信息直接答。
-_CLARIFY_RE = re.compile(r"<<CLARIFY>>")
+# 内外都容 \s*：LLM 偶尔写成 `<<CLARIFY >>` / `<< CLARIFY>>`，严格正则漏匹配
+# → 反问轮被当成普通答完，会挂反馈卡 + 追问卡，用户体验错乱。
+_CLARIFY_RE = re.compile(r"<<\s*CLARIFY\s*>>")
 
 # 反问"我也说不清"出口：用户没法回填版本/环境等关键差异时点这个按钮，触发新一轮
 # handle_question 喂这段 preset prompt——告诉 LLM 用户无法提供更多信息，按最常见

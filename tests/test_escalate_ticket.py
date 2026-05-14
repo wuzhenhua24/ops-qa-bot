@@ -106,6 +106,56 @@ def test_append_escalate_at_ticket_uses_at_tag():
 
 
 # ---------------------------------------------------------------------------
+# Marker 空格容忍：实测 LLM 偶尔在 marker 里多打空格，原严格正则会漏匹配 →
+# marker 字面糊到答案末尾 + @ 不发 / 反问轮没生效。和 FOLLOWUPS 同思路一并修。
+# ---------------------------------------------------------------------------
+
+def test_escalate_ticket_tolerates_space_after_colon():
+    cleaned, owner = fc._parse_escalate_ticket("a <<ESCALATE_TICKET: ou_abc>>")
+    assert owner == "ou_abc"
+    assert "<<ESCALATE_TICKET" not in cleaned
+
+
+def test_escalate_ticket_tolerates_trailing_space():
+    cleaned, owner = fc._parse_escalate_ticket("a <<ESCALATE_TICKET:ou_abc >>")
+    assert owner == "ou_abc"
+    assert "<<ESCALATE_TICKET" not in cleaned
+
+
+def test_escalate_tolerates_space_around_owner():
+    cleaned, owner, dir_hint = fc._parse_escalate("a <<ESCALATE: ou_abc :redis>>")
+    assert owner == "ou_abc"
+    assert dir_hint == "redis"
+    assert "<<ESCALATE" not in cleaned
+
+
+def test_escalate_tolerates_space_around_dir():
+    cleaned, owner, dir_hint = fc._parse_escalate("a <<ESCALATE:ou_abc: redis >>")
+    assert owner == "ou_abc"
+    assert dir_hint == "redis"
+    assert "<<ESCALATE" not in cleaned
+
+
+def test_escalate_none_tolerates_space():
+    cleaned, owner, dir_hint = fc._parse_escalate("a <<ESCALATE: none >>")
+    assert owner is None
+    assert dir_hint is None
+    assert "<<ESCALATE" not in cleaned
+
+
+def test_clarify_tolerates_internal_whitespace():
+    cleaned, is_clarify = fc._parse_clarify("一些反问\n<<CLARIFY >>")
+    assert is_clarify is True
+    assert "<<CLARIFY" not in cleaned
+
+
+def test_clarify_tolerates_leading_space():
+    cleaned, is_clarify = fc._parse_clarify("一些反问\n<< CLARIFY>>")
+    assert is_clarify is True
+    assert "<<CLARIFY" not in cleaned
+
+
+# ---------------------------------------------------------------------------
 
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
