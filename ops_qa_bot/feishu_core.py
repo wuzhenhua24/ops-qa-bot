@@ -393,6 +393,13 @@ _NOT_FOUND_RE = re.compile(
     r"找不到相关"
 )
 
+# 正文 @ owner 渲染：LLM 在答案正文里写 `<@ou_xxx>` 字面想表达"候选负责人"（典型
+# 场景：drift 兜底时不确定主 owner 是谁，列两三个候选让用户挑）。markdown 解析
+# 不认这个语法，会原样渲染成丑陋的尖括号文本。bot 端识别该 pattern → 对照 INDEX.md
+# 注册白名单 → 在册的转 feishu <at> tag（用户能点 ping），不在册的（LLM 幻觉编出
+# 来的 open_id）静默剥除。容忍空格防 LLM 输出 `< @ou_xxx >` 等变种。
+_AT_OWNER_RE = re.compile(r"<\s*@\s*(ou_[A-Za-z0-9_-]+)\s*>")
+
 
 def _is_escalate_drift(
     raw_answer: str,
@@ -874,6 +881,61 @@ def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -
     ]
     post["zh_cn"]["content"].insert(0, mention_paragraph)
     return post
+
+
+def _rewrite_owner_at_mentions(
+    post: dict, registered_owners: set[str]
+) -> tuple[int, int]:
+    """把答案正文里 LLM 写的 `<@ou_xxx>` 字面文字转成飞书 <at> tag，对照白名单过滤。
+
+    遍历每段每段 `tag=text` 的文字找 _AT_OWNER_RE 命中点。对每个命中：
+    - open_id 在 `registered_owners` 里 → 拆 text 段，把 `<@ou_xxx>` 那截换成
+      `{tag: at, user_id: ou_xxx}` 段，飞书会渲染成 @ + 推送
+    - 不在白名单 → 直接删，**不保留字面**（不在册多半是 LLM 幻觉编的 open_id，
+      留着是丑陋字符，又怕 LLM 蒙对了真的 @ 错人）
+
+    返回 `(rendered, dropped)`：分别是渲染成 @ 段的数量、白名单外被丢的数量；
+    调用方用来打日志 + 写 qa_record 监控漂移频率。已 tag=at 的段（如答案首段的
+    asker @ / 末尾 `_append_escalate_at` 加的 owner @）天然跳过。保留原 text 段
+    上的 style（bold/italic 等），拆分后每个文本片段都继承。
+    """
+    rendered = 0
+    dropped = 0
+    content = post.get("zh_cn", {}).get("content", [])
+    for i, paragraph in enumerate(content):
+        new_para: list[dict] = []
+        for seg in paragraph:
+            if seg.get("tag") != "text":
+                new_para.append(seg)
+                continue
+            text = seg.get("text", "")
+            matches = list(_AT_OWNER_RE.finditer(text))
+            if not matches:
+                new_para.append(seg)
+                continue
+            style = seg.get("style")
+            last = 0
+            for m in matches:
+                if m.start() > last:
+                    chunk: dict = {"tag": "text", "text": text[last:m.start()]}
+                    if style:
+                        chunk["style"] = style
+                    new_para.append(chunk)
+                open_id = m.group(1)
+                if open_id in registered_owners:
+                    new_para.append({"tag": "at", "user_id": open_id})
+                    rendered += 1
+                else:
+                    dropped += 1
+                last = m.end()
+            if last < len(text):
+                chunk = {"tag": "text", "text": text[last:]}
+                if style:
+                    chunk["style"] = style
+                new_para.append(chunk)
+        # 段被替换成空（全是被丢的 @ + 没文字）时塞个空 text 段，避免后续渲染崩
+        content[i] = new_para if new_para else [{"tag": "text", "text": ""}]
+    return rendered, dropped
 
 
 async def handle_image_question(
@@ -2461,6 +2523,27 @@ async def handle_question(
             + answer
         )
     final_post = _mention_post(user_id, answer)
+
+    # 正文 @ owner 渲染：LLM 在答案正文里写 `<@ou_xxx>` 列候选负责人（drift 兜底
+    # 时多见），markdown 渲染会原样输出尖括号文本。对照 INDEX.md 注册白名单转成
+    # 飞书 <at> tag，幻觉编出来的 open_id 静默剥除。详见 _rewrite_owner_at_mentions。
+    registered_owners = set(
+        _index_owner_to_dirs(session_mgr.docs_root).keys()
+    )
+    at_rendered_in_body, at_dropped_in_body = _rewrite_owner_at_mentions(
+        final_post, registered_owners
+    )
+    if at_dropped_in_body:
+        # LLM 编 open_id 的频率高的话该回头看 prompt——可能"列候选负责人"那个
+        # hedging 习惯需要更强引导（要么按 INDEX.md 实际名单写，要么别列）。
+        logger.warning(
+            "stripped %d unregistered <@ou_xxx> mention(s) from answer body: "
+            "chat=%s user=%s",
+            at_dropped_in_body,
+            chat_id,
+            user_id,
+        )
+
     escalated_now = False
     # component_dir / archive_path_repr 在 cooldown 不命中时需要喂给 _append_escalate_at
     # （让 asker 知道答案会归档到哪），escalated_now=True 时还要复用给后面的归档表单卡，
@@ -2551,6 +2634,11 @@ async def handle_question(
         # grep 频率：jq 'select(.escalate_drift_fallback) | {qid, question}' feedback.log
         # 频率高就该回头调 prompt 强化"找不到必须输出 marker"那条
         qa_record["escalate_drift_fallback"] = True
+    if at_rendered_in_body or at_dropped_in_body:
+        # 正文 @ owner 渲染统计——rendered 是用户实际能 ping 到的人数，
+        # dropped 是 LLM 编 open_id 被剥的次数，监控 LLM 输出靠谱程度
+        qa_record["at_rendered_in_body"] = at_rendered_in_body
+        qa_record["at_dropped_in_body"] = at_dropped_in_body
     if attached_images:
         # 用相对路径而不是 image_key，事后能直接定位到具体哪些图被引用
         qa_record["images_attached"] = attached_images
