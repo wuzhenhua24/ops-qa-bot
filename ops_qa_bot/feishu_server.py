@@ -505,7 +505,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 }
             seen_clicks[click_key] = True
             ack_card = await handle_archive_submit(
-                qid, question, answer, clicker_id, docs_root
+                qid, question, answer, clicker_id, docs_root, feishu=feishu
             )
             # v2 卡片用 type:raw 包一层，确保飞书按 v2 渲染
             return {"card": {"type": "raw", "data": ack_card}}

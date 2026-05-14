@@ -128,6 +128,7 @@ def _seed_pending(qid: str, **overrides):
         "question_default": "Redis 7.x 集群跨机房迁移步骤",
         "owner_id": "ou_owner",
         "component_dir": None,
+        "parent_msg_id": None,
     }
     ctx.update(overrides)
     fc._pending_archives[qid] = ctx
@@ -200,6 +201,137 @@ def test_archive_submit_expired_qid():
         "nope-not-here", "标题", "答案", "ou_owner", Path("/tmp"),
     ))
     assert "过期" in card["body"]["elements"][0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Notify asker after successful archive
+# ---------------------------------------------------------------------------
+
+class _FakeFeishu:
+    """抓住 send_post 调用参数的极简替身，验证 asker 通知路径。"""
+
+    def __init__(self):
+        self.posts: list[dict] = []  # 每次 send_post 一个 entry
+
+    async def send_post(self, chat_id, post, *, parent_id=None):
+        self.posts.append(
+            {"chat_id": chat_id, "post": post, "parent_id": parent_id}
+        )
+        return "fake_mid"
+
+
+def _at_user_ids(post: dict) -> list[str]:
+    """从 post content 里提取所有 at tag 的 user_id 顺序，便于断言。"""
+    return [
+        seg["user_id"]
+        for line in post["zh_cn"]["content"]
+        for seg in line
+        if seg.get("tag") == "at"
+    ]
+
+
+def _post_text(post: dict) -> str:
+    chunks = []
+    for line in post["zh_cn"]["content"]:
+        for seg in line:
+            if seg.get("tag") == "text":
+                chunks.append(seg.get("text", ""))
+    return "".join(chunks)
+
+
+def test_archive_submit_notifies_asker_with_at_and_answer():
+    fake = _FakeFeishu()
+    with tempfile.TemporaryDirectory() as d:
+        _seed_pending("qid_notify", parent_msg_id="om_original_question")
+        card = asyncio.run(fc.handle_archive_submit(
+            "qid_notify", "Redis 跨机房迁移步骤",
+            "1. 起 sentinel\n2. 切流量\n3. ...",
+            "ou_owner", Path(d), feishu=fake,
+        ))
+        # 通知确实发了一次
+        assert len(fake.posts) == 1
+        sent = fake.posts[0]
+        assert sent["chat_id"] == "c1"  # _seed_pending 的默认 chat_id
+        assert sent["parent_id"] == "om_original_question"  # 引用回原问题
+        # 第一段必须 @ asker（推送）+ @ owner（"谁答的"）
+        at_ids = _at_user_ids(sent["post"])
+        assert at_ids[0] == "ou_asker"  # asker 必须排在前面，否则不会有推送提醒
+        assert "ou_owner" in at_ids
+        # 答案 body 落到 post 里（不是只有"已答复"提示）
+        text = _post_text(sent["post"])
+        assert "起 sentinel" in text
+        assert "Redis 跨机房迁移步骤" in text or "Redis 跨机房迁移步骤"[:60] in text
+        # ack 卡告诉负责人"已通知提问者"
+        ack = card["body"]["elements"][0]["content"]
+        assert "已通知提问者" in ack
+
+
+def test_archive_submit_without_feishu_skips_notify():
+    # 单元测试默认走法：不传 feishu → 只写文件不发通知
+    with tempfile.TemporaryDirectory() as d:
+        _seed_pending("qid_no_notify", parent_msg_id="om_x")
+        card = asyncio.run(fc.handle_archive_submit(
+            "qid_no_notify", "标题", "答案", "ou_owner", Path(d),
+        ))
+        # 没有 fake feishu 自然 0 调用；ack 文案也不该带"已通知提问者"
+        ack = card["body"]["elements"][0]["content"]
+        assert "已通知提问者" not in ack
+        # 但归档文件确实落盘了
+        assert (Path(d) / "qa-archive.md").exists()
+
+
+def test_archive_submit_notify_failure_does_not_block_archive():
+    # 通知 send_post 抛错（飞书 API 异常 / asker 已退群等）不能回阻已写盘的归档
+    class _FlakyFeishu:
+        def __init__(self):
+            self.called = False
+
+        async def send_post(self, chat_id, post, *, parent_id=None):
+            self.called = True
+            raise RuntimeError("simulated feishu API error")
+
+    flaky = _FlakyFeishu()
+    with tempfile.TemporaryDirectory() as d:
+        _seed_pending("qid_flaky")
+        card = asyncio.run(fc.handle_archive_submit(
+            "qid_flaky", "标题", "答案", "ou_owner", Path(d), feishu=flaky,
+        ))
+        assert flaky.called  # 通知尝试过了
+        ack = card["body"]["elements"][0]["content"]
+        assert "已归档" in ack
+        # 通知失败 → ack 不该撒谎说已通知
+        assert "已通知提问者" not in ack
+        assert (Path(d) / "qa-archive.md").exists()
+
+
+def test_archive_submit_duplicate_does_not_re_notify():
+    # 幂等命中（同 qid 已在归档文件里）不重发通知——避免给 asker 刷重复消息
+    fake = _FakeFeishu()
+    with tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / "qa-archive.md"
+        # 预先伪造一条已存在的归档（含 qid 哨兵），让 _write_qa_archive 返回 False
+        fp.write_text("旧内容\nqid: qid_dup\n", encoding="utf-8")
+        _seed_pending("qid_dup")
+        card = asyncio.run(fc.handle_archive_submit(
+            "qid_dup", "标题", "答案", "ou_owner", Path(d), feishu=fake,
+        ))
+        # 已存在 → 跳过 → 不通知
+        assert len(fake.posts) == 0
+        assert "已存在" in card["body"]["elements"][0]["content"]
+
+
+# pending ctx backward-compat：旧条目没有 parent_msg_id 时通知也能发，只是不引用
+def test_archive_submit_notify_without_parent_msg_id():
+    fake = _FakeFeishu()
+    with tempfile.TemporaryDirectory() as d:
+        ctx = _seed_pending("qid_no_parent")
+        # 模拟"老的 pending 项"——没有 parent_msg_id 字段
+        del fc._pending_archives["qid_no_parent"]["parent_msg_id"]
+        asyncio.run(fc.handle_archive_submit(
+            "qid_no_parent", "标题", "答案", "ou_owner", Path(d), feishu=fake,
+        ))
+        assert len(fake.posts) == 1
+        assert fake.posts[0]["parent_id"] is None  # 顶层发，不引用
 
 
 # ---------------------------------------------------------------------------

@@ -527,7 +527,12 @@ class WsRunner:
             ):
                 fut = asyncio.run_coroutine_threadsafe(
                     handle_archive_submit(
-                        qid, question, answer, clicker_id, self._config.docs_root
+                        qid,
+                        question,
+                        answer,
+                        clicker_id,
+                        self._config.docs_root,
+                        feishu=self._feishu,
                     ),
                     self._loop,
                 )
@@ -565,7 +570,12 @@ class WsRunner:
             # SDK 在线程池里同步调本回调，转发到 asyncio 主 loop 跑写盘逻辑
             fut = asyncio.run_coroutine_threadsafe(
                 handle_archive_submit(
-                    qid, question, answer, clicker_id, self._config.docs_root
+                    qid,
+                    question,
+                    answer,
+                    clicker_id,
+                    self._config.docs_root,
+                    feishu=self._feishu,
                 ),
                 self._loop,
             )

@@ -450,8 +450,9 @@ _FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
 }
 
 # 归档机制：bot 升级到负责人后，同时发一张表单卡（card v2 form）。
-# 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md。
-# qid → {chat_id, asker_id, question, owner_id, component_dir}。
+# 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md，
+# 同时在原 chat @ 提问者把答案推回去（闭环交付）。
+# qid → {chat_id, asker_id, question, question_default, owner_id, component_dir, parent_msg_id}。
 # 24h 没人填写就过期，重启后清空（测试环境不持久化）。
 _pending_archives: TTLCache = TTLCache(maxsize=1000, ttl=86400)
 # INDEX.md 解析缓存：路径 → (mtime, {open_id: 目录名})
@@ -1921,6 +1922,46 @@ def _archive_ack_card(icon: str, message: str) -> dict:
     }
 
 
+def _archive_answer_notify_post(
+    asker_id: str,
+    owner_id: str,
+    question: str,
+    answer_markdown: str,
+    archive_rel: str,
+) -> dict:
+    """构造"负责人答完 → 通知 asker"的 feishu post。
+
+    asker_id 放在第一段以 @ 推送（asker 才会收到飞书侧消息提醒，不然写到归档
+    文件里 asker 永远不知道有答案）；owner_id 内嵌作为"谁答的"标记。
+    answer_markdown 走 markdown_to_feishu_post，保留答案原本的列表/代码块/换行
+    结构。末尾补一行归档路径告诉 asker"答案已沉到这里，下次类似问题 bot 能
+    直接答"——闭环交付。
+    """
+    post = markdown_to_feishu_post(answer_markdown, POST_TITLE)
+    # 截短 question 防止特别长的标题撑爆头部一行；归档时已经做了 200 字上限但
+    # 这里再保险一道（头部行越短越好读，详情看下面的答案 body）。
+    q_short = question if len(question) <= 60 else question[:60].rstrip() + "…"
+    intro_paragraph = [
+        {"tag": "at", "user_id": asker_id},
+        {"tag": "text", "text": f" 你之前问的「{q_short}」，"},
+        {"tag": "at", "user_id": owner_id},
+        {"tag": "text", "text": " 已答复 👇"},
+    ]
+    post["zh_cn"]["content"].insert(0, intro_paragraph)
+    post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
+    post["zh_cn"]["content"].append(
+        [
+            {
+                "tag": "text",
+                "text": (
+                    f"📁 已归档到 {archive_rel}，下次类似问题我能直接从这里答。"
+                ),
+            }
+        ]
+    )
+    return post
+
+
 async def _write_qa_archive(
     file_path: Path,
     qid: str,
@@ -1981,6 +2022,7 @@ async def handle_archive_submit(
     answer: str,
     clicker_id: str | None,
     docs_root: Path,
+    feishu: "FeishuClient | None" = None,
 ) -> dict:
     """处理归档表单提交。返回应替换原表单卡的 ack 卡片（card v2）。
 
@@ -1991,6 +2033,10 @@ async def handle_archive_submit(
     多数失败路径（参数缺失、过期、空答案、写盘异常）都用 ack 卡告诉点击者，
     原卡片被替换避免重复提交困惑。**唯一例外是"非负责人点击"**：返回原表单卡保持
     可见，让真正的负责人还能填——否则其他人误点提交会把负责人的表单顶掉。
+
+    `feishu` 传入时（生产环境总传），写入成功后会在原 chat 发一条"📣 负责人已答复"
+    的 post @ 原 asker，把答案推送给提问者；不传或缺 asker_id 则只写文件不推送
+    （单元测试场景）。这条通知是闭环的关键——否则 asker 永远不知道负责人答了。
     """
     if not qid:
         return _archive_ack_card("⚠️", "归档参数缺失，请联系管理员。")
@@ -2073,6 +2119,35 @@ async def handle_archive_submit(
         rel = file_path.relative_to(docs_root)
     except ValueError:
         rel = file_path
+
+    # 通知 asker：写入成功 + 有 asker_id + 有 feishu client 时给原 chat 发一条
+    # @ asker 的 post 把答案推过去。**仅在 wrote=True 时通知**——幂等命中说明同
+    # qid 的答案已经存档过、asker 多半也通知过了，再发会成"垃圾消息"；写盘失败时
+    # 自然不发。通知本身失败（API 出错 / asker 已不在群里）不回阻归档结果，
+    # 文件已经写了、表单已经提交了，最坏情况 asker 重新问 bot 也能从归档命中。
+    notify_sent = False
+    if wrote and feishu is not None and ctx.get("asker_id"):
+        try:
+            notify_post = _archive_answer_notify_post(
+                asker_id=ctx["asker_id"],
+                owner_id=expected_owner,
+                question=question_text,
+                answer_markdown=answer_text,
+                archive_rel=str(rel),
+            )
+            await feishu.send_post(
+                ctx["chat_id"],
+                notify_post,
+                parent_id=ctx.get("parent_msg_id"),
+            )
+            notify_sent = True
+        except Exception:
+            logger.exception(
+                "notify asker failed (archive still ok): qid=%s asker=%s",
+                qid,
+                ctx.get("asker_id"),
+            )
+
     # had_draft：答题那轮 LLM 有没有给出（区别于原话的）归一化标题。
     # question_edited：负责人在表单里改没改预填值。两个一起看就知道 LLM 草稿
     # 命中率 + 负责人采纳率，用来判断 <<ARCHIVE_Q:>> 这套值不值 / 要不要再调 prompt。
@@ -2093,16 +2168,22 @@ async def handle_archive_submit(
                 "had_draft": had_draft,
                 "question_edited": question_edited,
                 "duplicate": not wrote,
+                "notify_sent": notify_sent,
             },
             ensure_ascii=False,
         )
     )
     logger.info(
-        "archive written: qid=%s path=%s duplicate=%s", qid, rel, not wrote
+        "archive written: qid=%s path=%s duplicate=%s notify=%s",
+        qid,
+        rel,
+        not wrote,
+        notify_sent,
     )
 
     if wrote:
-        return _archive_ack_card("✅", f"已归档至 `{rel}`，谢谢！")
+        suffix = "，已通知提问者" if notify_sent else ""
+        return _archive_ack_card("✅", f"已归档至 `{rel}`{suffix}，谢谢！")
     return _archive_ack_card(
         "ℹ️", f"该 qid 的归档已存在（`{rel}`），跳过。"
     )
@@ -2445,6 +2526,9 @@ async def handle_question(
             "question_default": question_default,
             "owner_id": escalate_owner,
             "component_dir": component_dir,
+            # 负责人提交归档时给 asker 发通知 post，引用回原始提问消息保持
+            # 话题归属（飞书 UI 会把消息显示在原问题底下，asker 看到不突兀）
+            "parent_msg_id": parent_msg_id,
         }
         await feishu.send_interactive(
             chat_id,
