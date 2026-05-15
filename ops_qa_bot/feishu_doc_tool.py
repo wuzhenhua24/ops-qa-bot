@@ -7,7 +7,7 @@ prompt 引导下决定何时调；调用时通过飞书 IM 给 B 发结构化 en
 ack 后把 answer 返给 agent。
 
 协议（与 lark-copilot/agent_collab.py 对端）:
-    请求文本: {"op":"doc_qa","req_id":"<uuid>","doc":"<url>","q":"<question>"}
+    请求文本: {"op":"doc_qa","req_id":"<uuid>","docs":["<url>", ...],"q":"<question>"}
     回复文本: {"op":"doc_qa_ack","req_id":"<same>","ok":true,"answer":"..."}
            或 {"op":"doc_qa_ack","req_id":"<same>","ok":false,"error":"..."}
 
@@ -113,12 +113,16 @@ class FeishuDocRPC:
 
     async def ask(
         self,
-        doc_url: str,
+        doc_urls: list[str],
         question: str,
         *,
         timeout: float = ASK_TIMEOUT_SEC,
     ) -> str:
-        """给 peer 发 doc_qa 请求并等回复。返回 answer 字符串。失败抛 RuntimeError。"""
+        """给 peer 发 doc_qa 请求并等回复。返回 answer 字符串。失败抛 RuntimeError。
+
+        doc_urls 是一个或多个飞书文档 URL；peer 会读取这些文档并基于全部内容
+        回答同一个 question（典型用法：跨文档汇总）。调用方应在外层保证非空。
+        """
         if self._is_open():
             # 熔断打开期间快速失败，不发 DM、不创建 future——这是熔断的全部价值：
             # peer 挂着的时候，每个带飞书链接的问题不用再陪 60s 超时。
@@ -131,16 +135,16 @@ class FeishuDocRPC:
         envelope = {
             "op": "doc_qa",
             "req_id": req_id,
-            "doc": doc_url,
+            "docs": doc_urls,
             "q": question,
         }
         text = json.dumps(envelope, ensure_ascii=False)
         fut: asyncio.Future[dict] = self._loop.create_future()
         self._pending[req_id] = fut
         logger.info(
-            "feishu_doc_rpc out: req_id=%s doc=%s q=%r",
+            "feishu_doc_rpc out: req_id=%s docs=%s q=%r",
             req_id,
-            doc_url,
+            doc_urls,
             question[:80],
         )
         try:
@@ -232,13 +236,32 @@ def get_rpc() -> FeishuDocRPC | None:
 @tool(
     "ask_feishu_doc",
     (
-        "通过协作机器人（lark-copilot）读取飞书文档并基于该文档回答一个问题。"
-        "适用场景：问题需要参考的资料保存在飞书云文档里，本机不能直接访问。"
-        "参数 doc 为飞书文档 URL（含 docx/wiki 链接），question 为针对该文档"
-        "的具体问题（短句更稳）。返回协作机器人基于该文档给出的答案文本——"
+        "通过协作机器人（lark-copilot）读取一篇或多篇飞书文档并基于这些文档回答"
+        "一个问题。适用场景：问题需要参考的资料保存在飞书云文档里，本机不能直接"
+        "访问；当一个问题需要跨多个文档汇总时，请把所有相关 URL 一次性传进 docs，"
+        "由协作机器人合并阅读，避免拆成多次调用。"
+        "参数 docs 是飞书文档 URL 列表（docx/wiki 链接，至少 1 条），question 是"
+        "针对这些文档的具体问题（短句更稳）。返回协作机器人给出的答案文本——"
         "把它当成另一个 agent 的回答，可以引用、二次加工，不要伪装成你自己读的。"
     ),
-    {"doc": str, "question": str},
+    # 显式 JSON Schema：array 用 dict shorthand 行为不一定一致，这里把 docs
+    # 声明为 minItems=1 的 string 数组，比 list[str] 更稳。
+    {
+        "type": "object",
+        "properties": {
+            "docs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "飞书文档 URL 列表（docx/wiki 链接），至少 1 条。",
+            },
+            "question": {
+                "type": "string",
+                "description": "针对这些文档的具体问题，短句更稳。",
+            },
+        },
+        "required": ["docs", "question"],
+    },
 )
 async def ask_feishu_doc(args: dict) -> dict:
     rpc = get_rpc()
@@ -252,25 +275,39 @@ async def ask_feishu_doc(args: dict) -> dict:
             ],
             "is_error": True,
         }
-    doc = (args.get("doc") or "").strip()
+    raw_docs = args.get("docs")
     question = (args.get("question") or "").strip()
-    if not doc or not question:
+    # 规范化 docs：必须是非空 list[str]，每条去空白，过滤掉空串。容忍 agent 传单
+    # 个字符串（写错 schema）并自动包成 list，避免一个低概率的格式偏差就报错。
+    if isinstance(raw_docs, str):
+        raw_docs = [raw_docs]
+    if not isinstance(raw_docs, list):
         return {
             "content": [
-                {"type": "text", "text": "参数缺失：doc 和 question 都不能为空。"}
+                {"type": "text", "text": "参数错误：docs 必须是 URL 字符串数组。"}
+            ],
+            "is_error": True,
+        }
+    docs = [d.strip() for d in raw_docs if isinstance(d, str) and d.strip()]
+    if not docs or not question:
+        return {
+            "content": [
+                {"type": "text", "text": "参数缺失：docs（非空 URL 数组）和 question 都不能为空。"}
             ],
             "is_error": True,
         }
     try:
-        answer = await rpc.ask(doc, question)
+        answer = await rpc.ask(docs, question)
     except Exception as ex:  # noqa: BLE001
+        # 失败提示里列出全部 URL，方便用户自查 / 转人工
+        urls_hint = "\n".join(f"- {u}" for u in docs)
         return {
             "content": [
                 {
                     "type": "text",
                     "text": (
                         f"协作机器人未返回答案（{type(ex).__name__}: {ex}）。"
-                        f"请把这个飞书链接转给用户人工查阅：{doc}"
+                        f"请把以下飞书链接转给用户人工查阅：\n{urls_hint}"
                     ),
                 }
             ],
