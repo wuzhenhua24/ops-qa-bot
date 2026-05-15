@@ -42,7 +42,7 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
-    has_at_all_mention,
+    is_at_all_broadcast,
 )
 from .feishu_crypto import FeishuCrypto
 from .logging_config import request_id_var
@@ -204,8 +204,10 @@ def create_app(config: AppConfig) -> FastAPI:
             return {"code": 0}
 
         # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
-        # 但全员通知不应触发答题。命中就 drop。
-        if has_at_all_mention((event.get("message") or {}).get("mentions")):
+        # 但全员通知不应触发答题。同时传 message.content（JSON 字符串，含 text
+        # 字面）兜底飞书 WS SDK 不在 mentions 里放 @_all 的 case。
+        raw_msg = event.get("message") or {}
+        if is_at_all_broadcast(raw_msg.get("mentions"), text=raw_msg.get("content")):
             logger.info(
                 "skip: @所有人 broadcast chat=%s user=%s type=%s",
                 chat_id,

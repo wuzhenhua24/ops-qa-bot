@@ -112,13 +112,19 @@ def _parse_post_content(content_dict: dict) -> tuple[str, list[str]]:
     return "\n".join(text_lines).strip(), image_keys
 
 
-def has_at_all_mention(mentions: list | None) -> bool:
-    """判 mentions 里是否带 @所有人。
+_AT_ALL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])@_all(?![A-Za-z0-9_])")
 
-    群里有人 @所有人 会把 bot 也唤醒（@_all 在飞书里 mention 所有人，含群里 bot），
-    bot 不该把全员通知当成提问触发答题。@所有人的 mention 形如：
-    `{"key": "@_all", "id": {"open_id": "all"}, "name": "所有人"}`。
-    用 key 和 id.open_id 双判，兼容 SDK 对象（WS）和 dict（HTTP webhook）两种输入。
+
+def is_at_all_broadcast(
+    mentions: list | None, text: str | None = None
+) -> bool:
+    """识别 @所有人 全员通知。
+
+    群里有人 @所有人 会把 bot 也唤醒（飞书 @_all mention 所有人，含 bot），
+    全员通知不应该触发答题。先看 mentions 结构有没有 @_all 项；实测 WS SDK
+    有时不把 @_all 放进 mentions、只在 message content 文本里留 `@_all` 字面，
+    需要 text 兜底（带词边界防止误伤 `@_allowed` 之类正常 token）。
+    mentions 兼容 SDK 对象（WS，带 .key / .id.open_id）和 dict（HTTP webhook）。
     """
     for m in mentions or []:
         if m is None:
@@ -137,6 +143,8 @@ def has_at_all_mention(mentions: list | None) -> bool:
                 open_id = mid.get("open_id")
             if open_id == "all":
                 return True
+    if text and _AT_ALL_TOKEN_RE.search(text):
+        return True
     return False
 
 

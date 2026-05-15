@@ -57,7 +57,7 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
-    has_at_all_mention,
+    is_at_all_broadcast,
 )
 from .health_server import HealthServer
 from .logging_config import request_id_var
@@ -136,8 +136,9 @@ class WsRunner:
             return
 
         # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
-        # 但全员通知不应触发答题。命中就 drop。
-        if has_at_all_mention(msg.mentions):
+        # 但全员通知不应触发答题。同时传 msg.content（JSON 字符串，含 text 字面）
+        # 兜底飞书 WS SDK 不在 mentions 里放 @_all 的 case。
+        if is_at_all_broadcast(msg.mentions, text=msg.content):
             logger.info(
                 "skip: @所有人 broadcast chat=%s user=%s type=%s",
                 chat_id,
