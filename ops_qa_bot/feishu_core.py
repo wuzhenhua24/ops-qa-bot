@@ -112,6 +112,34 @@ def _parse_post_content(content_dict: dict) -> tuple[str, list[str]]:
     return "\n".join(text_lines).strip(), image_keys
 
 
+def has_at_all_mention(mentions: list | None) -> bool:
+    """判 mentions 里是否带 @所有人。
+
+    群里有人 @所有人 会把 bot 也唤醒（@_all 在飞书里 mention 所有人，含群里 bot），
+    bot 不该把全员通知当成提问触发答题。@所有人的 mention 形如：
+    `{"key": "@_all", "id": {"open_id": "all"}, "name": "所有人"}`。
+    用 key 和 id.open_id 双判，兼容 SDK 对象（WS）和 dict（HTTP webhook）两种输入。
+    """
+    for m in mentions or []:
+        if m is None:
+            continue
+        key = getattr(m, "key", None)
+        if key is None and isinstance(m, dict):
+            key = m.get("key")
+        if key == "@_all":
+            return True
+        mid = getattr(m, "id", None)
+        if mid is None and isinstance(m, dict):
+            mid = m.get("id")
+        if mid is not None:
+            open_id = getattr(mid, "open_id", None)
+            if open_id is None and isinstance(mid, dict):
+                open_id = mid.get("open_id")
+            if open_id == "all":
+                return True
+    return False
+
+
 def _normalize_image_media_type(content_type: str, data: bytes) -> str:
     """归一化 image media_type 到 Anthropic vision 接受的集合内。
 

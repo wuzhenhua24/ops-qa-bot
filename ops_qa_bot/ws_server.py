@@ -57,6 +57,7 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
+    has_at_all_mention,
 )
 from .health_server import HealthServer
 from .logging_config import request_id_var
@@ -132,6 +133,17 @@ class WsRunner:
         msg_id = getattr(msg, "message_id", None)
         message_type = msg.message_type
         if not chat_id or not sender_id or not message_type:
+            return
+
+        # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
+        # 但全员通知不应触发答题。命中就 drop。
+        if has_at_all_mention(msg.mentions):
+            logger.info(
+                "skip: @所有人 broadcast chat=%s user=%s type=%s",
+                chat_id,
+                sender_id,
+                message_type,
+            )
             return
 
         # image 消息走视觉路径：解 image_key → 异步下载 → handle_question(images=...)
