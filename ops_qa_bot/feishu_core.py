@@ -30,7 +30,7 @@ logger = logging.getLogger("ops_qa_bot.feishu")
 feedback_logger = logging.getLogger("ops_qa_bot.feedback")
 
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
-POST_TITLE = "运维文档助手"
+POST_TITLE = "测试环境助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 
 # 图片输入：Anthropic vision 支持 png/jpeg/gif/webp；超过 5MB 大概率被 API 拒
@@ -110,6 +110,42 @@ def _parse_post_content(content_dict: dict) -> tuple[str, list[str]]:
         if line:
             text_lines.append(line)
     return "\n".join(text_lines).strip(), image_keys
+
+
+_AT_ALL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])@_all(?![A-Za-z0-9_])")
+
+
+def is_at_all_broadcast(
+    mentions: list | None, text: str | None = None
+) -> bool:
+    """识别 @所有人 全员通知。
+
+    群里有人 @所有人 会把 bot 也唤醒（飞书 @_all mention 所有人，含 bot），
+    全员通知不应该触发答题。先看 mentions 结构有没有 @_all 项；实测 WS SDK
+    有时不把 @_all 放进 mentions、只在 message content 文本里留 `@_all` 字面，
+    需要 text 兜底（带词边界防止误伤 `@_allowed` 之类正常 token）。
+    mentions 兼容 SDK 对象（WS，带 .key / .id.open_id）和 dict（HTTP webhook）。
+    """
+    for m in mentions or []:
+        if m is None:
+            continue
+        key = getattr(m, "key", None)
+        if key is None and isinstance(m, dict):
+            key = m.get("key")
+        if key == "@_all":
+            return True
+        mid = getattr(m, "id", None)
+        if mid is None and isinstance(m, dict):
+            mid = m.get("id")
+        if mid is not None:
+            open_id = getattr(mid, "open_id", None)
+            if open_id is None and isinstance(mid, dict):
+                open_id = mid.get("open_id")
+            if open_id == "all":
+                return True
+    if text and _AT_ALL_TOKEN_RE.search(text):
+        return True
+    return False
 
 
 def _normalize_image_media_type(content_type: str, data: bytes) -> str:
@@ -200,19 +236,41 @@ def _friendly_error(
 # 误判代价低（占位文案不准，最终答案不受影响），不做更复杂的语义判断。
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
+# 操作/工单请求关键词：用户让 bot/管理员代为执行变更（加权限/开账号/申请资源/
+# 开通访问）。prompt 侧要求 agent **先读文档**判断是自助流程还是手动分配，所以
+# 占位文案就用"🔍 翻文档中"——比"🔧 诊断中"准（agent 不会 ssh）、也比"📨
+# 转交负责人中"诚实（最后不一定 @）。这里识别只为压制 IP 启发，避免"帮我加
+# 172.x 权限"被误标成诊断中。
+# 要求带"帮我/帮/麻烦/给我/申请/开通"这种委托语义的前缀——单看"加/开"会和
+# "怎么加节点"这种知识句撞，宁可漏判（fallback 到默认占位）也不要把知识问题
+# 误标成工单。
+_OP_REQUEST_RE = re.compile(
+    r"帮(我|忙)?(加|开|改|配|搞|弄|执行|批准|开通)|"
+    r"麻烦(帮|加|开|改|配|执行|批准|开通)|"
+    r"给我(加|开|改|配)|"
+    # 申请 / 开通 之后允许夹 0-15 个非分句字符再到目标名词，覆盖
+    # "申请下 mysql 的只读账号"、"开通一下 redis 的访问权限" 这种带宾语前置的写法。
+    r"申请[^\n。！？!?]{0,15}(权限|账号|账户|资源|白名单|访问)|"
+    r"开通[^\n。！？!?]{0,15}(权限|账号|账户|访问|白名单)"
+)
+
 
 def _placeholder_text(question: str, queued: bool) -> str:
     """生成带问题摘要的占位文本，让用户能区分多条并发问的占位。
 
     queued=True 表示当前 session 锁被前一条问题占着，本条还没开始跑，前缀用
     🕒 排队中；获取到锁开始跑时上层会再 update 一次置成 🔍 翻文档中 / 🔧 诊断中。
+
+    含 IP 默认走"🔧 诊断中"；但如果同时命中操作/工单请求关键词（"帮我加权限"），
+    强制切回"🔍 翻文档中"——这种 agent 会先读文档判断自助/手动，不会 ssh，
+    贴"诊断中"会误导用户以为 bot 在 ssh 跑命令。
     """
     excerpt = question.strip().replace("\n", " ")
     if len(excerpt) > 40:
         excerpt = excerpt[:40] + "…"
     if queued:
         icon = "🕒 排队中"
-    elif _IP_RE.search(question):
+    elif _IP_RE.search(question) and not _OP_REQUEST_RE.search(question):
         icon = "🔧 诊断中"
     else:
         icon = "🔍 翻文档中"
@@ -353,25 +411,89 @@ SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 # 标记，handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
 # owner 接受 ou_xxx 或 none；后缀目录可选，由 LLM 基于"问题归属哪个组件"给出，
 # 用于归档卡选目录。owner / dir 都做白名单校验防注入和路径穿越。
+# 冒号 / who / dir 周围都容许 \s*——LLM 偶尔会写成 `<<ESCALATE: ou_xxx:redis>>`
+# 或 `<<ESCALATE:ou_xxx : redis >>`，严格正则漏匹配 → marker 字面糊到答案末尾 +
+# @ 不发。和 _FOLLOWUPS_RE 修复一同思路：宽松匹配，下游已有 strip 兜底。
 _ESCALATE_RE = re.compile(
-    r"<<ESCALATE:(?P<who>ou_[A-Za-z0-9_-]+|none)"
-    r"(?::(?P<dir>[A-Za-z0-9._/-]+))?>>"
+    r"<<ESCALATE:\s*(?P<who>ou_[A-Za-z0-9_-]+|none)\s*"
+    r"(?::\s*(?P<dir>[A-Za-z0-9._/-]+)\s*)?>>"
+)
+# 工单类升级：用户让人代为执行变更（加权限/开账号），不是知识 Q&A。bot 只 @
+# 负责人、不发归档表单卡（没什么可归档的"答案"）。和 _ESCALATE_RE 互斥，两者同时
+# 出现时 ticket 优先。不带 dir：工单不归档，dir 没意义。
+_ESCALATE_TICKET_RE = re.compile(
+    r"<<ESCALATE_TICKET:\s*(?P<who>ou_[A-Za-z0-9_-]+|none)\s*>>"
 )
 _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
 _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
 
+# Escalate drift 兜底：LLM 答出"文档中未找到 / 找不到相关内容"但忘了输出 ESCALATE
+# marker。这种 asker 看到答案是"找不到 + 空气"，没人接手——属于 LLM 概率漂移
+# （[[project-escalate-trigger-probabilistic]]）。命中时给答案追加一句 asker-facing
+# 提示让他有 next step（"在群里 @ 负责人"），并在日志里打 warning + qa 事件加
+# escalate_drift_fallback=True 字段，方便事后 grep 漂移频率。
+# 不强行猜 owner @：我们没有可靠依据从问题文本推断组件，乱 @ 错人比不 @ 更糟。
+_NOT_FOUND_RE = re.compile(
+    r"文档(中|里)?(未|没)(找到|有)|"
+    r"未找到相关|"
+    r"找不到相关"
+)
+
+# 正文 @ owner 渲染：LLM 在答案正文里写 `<@ou_xxx>` 字面想表达"候选负责人"（典型
+# 场景：drift 兜底时不确定主 owner 是谁，列两三个候选让用户挑）。markdown 解析
+# 不认这个语法，会原样渲染成丑陋的尖括号文本。bot 端识别该 pattern → 对照 INDEX.md
+# 注册白名单 → 在册的转 feishu <at> tag（用户能点 ping），不在册的（LLM 幻觉编出
+# 来的 open_id）静默剥除。容忍空格防 LLM 输出 `< @ou_xxx >` 等变种。
+_AT_OWNER_RE = re.compile(r"<\s*@\s*(ou_[A-Za-z0-9_-]+)\s*>")
+
+
+def _is_escalate_drift(
+    raw_answer: str,
+    stripped_answer: str,
+    escalate_owner: str | None,
+    is_clarification: bool,
+) -> bool:
+    """Escalate marker drift 判定（纯函数，便于单测）。
+
+    True 表示 LLM 说"找不到"但忘了输出 ESCALATE/CLARIFY marker，需要兜底。
+    raw_answer 是 LLM 原文（剥 marker 之前），stripped_answer 是剥完 marker
+    的答案。escalate_owner 来自 ticket/普通 ESCALATE parser 合并后的结果。
+
+    四个条件全部满足才算 drift：
+    1. 非反问轮——反问轮 LLM 本来就不该输出 ESCALATE，不算漂移；
+    2. 没识别到任何 owner——已经 @ 上人就不需要兜底；
+    3. raw_answer 不含 <<ESCALATE 也不含 <<CLARIFY——LLM 自己 mark 过（哪怕
+       是 ESCALATE:none 表示"找不到但也不知道找谁"），按其意图办，不覆盖；
+    4. stripped_answer 文本命中"文档中未找到/找不到相关"句式——LLM 确实表达
+       了找不到，而不是答了别的东西。
+    """
+    if is_clarification:
+        return False
+    if escalate_owner is not None:
+        return False
+    if "<<ESCALATE" in raw_answer or "<<CLARIFY" in raw_answer:
+        return False
+    return bool(_NOT_FOUND_RE.search(stripped_answer))
+
 # 快捷追问机制：bot 答完后按 prompt 输出 <<FOLLOWUPS:k1|k2|k3>> 标记，
 # handle_question 解析 → 在反馈卡上面挂对应按钮。点击 → 用预设 prompt
 # 触发新一轮 handle_question，把用户自然带进下一轮。
 # key 必须出自 _FOLLOWUP_LIBRARY；最多 3 个；不在白名单的 key 静默过滤。
-# 抓取宽松（含数字/大小写都先收下），合法性靠 _FOLLOWUP_LIBRARY 白名单过滤
-_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([\w|]+)>>")
+# 正则宽松（含空格 / 大小写 / 数字 / 横杠都先收下），合法性靠 _FOLLOWUP_LIBRARY
+# 白名单过滤 + _parse_followups 里逐 key strip。**必须容忍空格**：实测 LLM 偶尔
+# 写成 `<<FOLLOWUPS: troubleshoot|commands|related>>`（冒号后多个空格）或
+# `<<FOLLOWUPS:troubleshoot | commands | related>>`（竖线两侧空格），严格正则
+# 会漏匹配 → marker 字面糊到答案末尾 + 追问卡不发。和 _ARCHIVE_Q_RE / _IMG_RE
+# 一致用 `[^<>\n\r]+?`（允许除尖括号和换行外的任意字符）。
+_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([^<>\n\r]+?)>>")
 
 # 反问标记：LLM 检测到信息不足以准确答时输出 <<CLARIFY>>，把答案当成反问轮处理。
 # 反问轮：不发反馈卡 / 追问按钮 / 升级 @ / 归档卡，让用户专注回答反问；
 # 用户在同一 session 里答完，下一轮就按补充信息直接答。
-_CLARIFY_RE = re.compile(r"<<CLARIFY>>")
+# 内外都容 \s*：LLM 偶尔写成 `<<CLARIFY >>` / `<< CLARIFY>>`，严格正则漏匹配
+# → 反问轮被当成普通答完，会挂反馈卡 + 追问卡，用户体验错乱。
+_CLARIFY_RE = re.compile(r"<<\s*CLARIFY\s*>>")
 
 # 反问"我也说不清"出口：用户没法回填版本/环境等关键差异时点这个按钮，触发新一轮
 # handle_question 喂这段 preset prompt——告诉 LLM 用户无法提供更多信息，按最常见
@@ -433,8 +555,9 @@ _FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
 }
 
 # 归档机制：bot 升级到负责人后，同时发一张表单卡（card v2 form）。
-# 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md。
-# qid → {chat_id, asker_id, question, owner_id, component_dir}。
+# 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md，
+# 同时在原 chat @ 提问者把答案推回去（闭环交付）。
+# qid → {chat_id, asker_id, question, question_default, owner_id, component_dir, parent_msg_id}。
 # 24h 没人填写就过期，重启后清空（测试环境不持久化）。
 _pending_archives: TTLCache = TTLCache(maxsize=1000, ttl=86400)
 # INDEX.md 解析缓存：路径 → (mtime, {open_id: 目录名})
@@ -835,6 +958,61 @@ def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -
     ]
     post["zh_cn"]["content"].insert(0, mention_paragraph)
     return post
+
+
+def _rewrite_owner_at_mentions(
+    post: dict, registered_owners: set[str]
+) -> tuple[int, int]:
+    """把答案正文里 LLM 写的 `<@ou_xxx>` 字面文字转成飞书 <at> tag，对照白名单过滤。
+
+    遍历每段每段 `tag=text` 的文字找 _AT_OWNER_RE 命中点。对每个命中：
+    - open_id 在 `registered_owners` 里 → 拆 text 段，把 `<@ou_xxx>` 那截换成
+      `{tag: at, user_id: ou_xxx}` 段，飞书会渲染成 @ + 推送
+    - 不在白名单 → 直接删，**不保留字面**（不在册多半是 LLM 幻觉编的 open_id，
+      留着是丑陋字符，又怕 LLM 蒙对了真的 @ 错人）
+
+    返回 `(rendered, dropped)`：分别是渲染成 @ 段的数量、白名单外被丢的数量；
+    调用方用来打日志 + 写 qa_record 监控漂移频率。已 tag=at 的段（如答案首段的
+    asker @ / 末尾 `_append_escalate_at` 加的 owner @）天然跳过。保留原 text 段
+    上的 style（bold/italic 等），拆分后每个文本片段都继承。
+    """
+    rendered = 0
+    dropped = 0
+    content = post.get("zh_cn", {}).get("content", [])
+    for i, paragraph in enumerate(content):
+        new_para: list[dict] = []
+        for seg in paragraph:
+            if seg.get("tag") != "text":
+                new_para.append(seg)
+                continue
+            text = seg.get("text", "")
+            matches = list(_AT_OWNER_RE.finditer(text))
+            if not matches:
+                new_para.append(seg)
+                continue
+            style = seg.get("style")
+            last = 0
+            for m in matches:
+                if m.start() > last:
+                    chunk: dict = {"tag": "text", "text": text[last:m.start()]}
+                    if style:
+                        chunk["style"] = style
+                    new_para.append(chunk)
+                open_id = m.group(1)
+                if open_id in registered_owners:
+                    new_para.append({"tag": "at", "user_id": open_id})
+                    rendered += 1
+                else:
+                    dropped += 1
+                last = m.end()
+            if last < len(text):
+                chunk = {"tag": "text", "text": text[last:]}
+                if style:
+                    chunk["style"] = style
+                new_para.append(chunk)
+        # 段被替换成空（全是被丢的 @ + 没文字）时塞个空 text 段，避免后续渲染崩
+        content[i] = new_para if new_para else [{"tag": "text", "text": ""}]
+    return rendered, dropped
 
 
 async def handle_image_question(
@@ -1688,6 +1866,20 @@ def _parse_escalate(answer: str) -> tuple[str, str | None, str | None]:
     return cleaned, (who if who != "none" else None), dir_hint
 
 
+def _parse_escalate_ticket(answer: str) -> tuple[str, str | None]:
+    """抽 <<ESCALATE_TICKET:owner>> 标记 → (清理后的答案, owner_id or None)。
+
+    工单类升级：@ 负责人但不发归档表单卡（"加权限"等操作请求不是知识 Q&A）。
+    调用方负责把它和 _parse_escalate 的结果合并；两者同时出现时 ticket 优先。
+    """
+    m = _ESCALATE_TICKET_RE.search(answer)
+    if not m:
+        return answer, None
+    cleaned = _ESCALATE_TICKET_RE.sub("", answer).strip()
+    who = m.group("who")
+    return cleaned, (who if who != "none" else None)
+
+
 def _parse_archive_q(answer: str) -> tuple[str, str | None]:
     """抽 <<ARCHIVE_Q:...>> 标记，返回 (清理后的答案文本, 净化后的问题标题草稿 or None)。
 
@@ -1733,33 +1925,42 @@ def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
     return cleaned
 
 
-def _append_escalate_at(post: dict, owner_id: str, archive_path: str) -> None:
-    """在 post 末尾追加 "📣 已通知负责人 @xxx" + "📁 归档去向" 两行。
+def _append_escalate_at(
+    post: dict, owner_id: str, archive_path: str, *, is_ticket: bool = False
+) -> None:
+    """在 post 末尾追加 "📣 已通知负责人 @xxx" 行（+ 普通升级时再加归档去向）。
 
+    is_ticket=False（默认，"文档没答案"升级）：追加两行——@ + 归档路径告知。
     archive_path 是相对 docs_root 的路径（如 "redis/qa-archive.md"），与紧随其后
     发出的归档表单卡 (_archive_form_card) 一致。告诉 asker 答案最终会落到哪、下次
     类似问题 bot 能从哪里直接答，避免"通知完就没下文"的预期空白。归档依赖 owner
     填表单，措辞用条件式（"填写后会归档"）不要说死。
+
+    is_ticket=True（工单类升级，"加权限/开账号"操作请求）：只 @ 不提归档；动词
+    用"协助处理"而不是"协助回答"——工单 ≠ 知识答疑。archive_path 在 ticket 模式
+    下被忽略，调用方可以传空串。
     """
     post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
+    verb = "协助处理" if is_ticket else "协助回答"
     post["zh_cn"]["content"].append(
         [
             {"tag": "text", "text": "📣 已通知负责人 "},
             {"tag": "at", "user_id": owner_id},
-            {"tag": "text", "text": " 协助回答 🙏"},
+            {"tag": "text", "text": f" {verb} 🙏"},
         ]
     )
-    post["zh_cn"]["content"].append(
-        [
-            {
-                "tag": "text",
-                "text": (
-                    f"📁 负责人填写后会归档到 {archive_path}，"
-                    "下次类似问题我能直接从这里答。"
-                ),
-            }
-        ]
-    )
+    if not is_ticket:
+        post["zh_cn"]["content"].append(
+            [
+                {
+                    "tag": "text",
+                    "text": (
+                        f"📁 负责人填写后会归档到 {archive_path}，"
+                        "下次类似问题我能直接从这里答。"
+                    ),
+                }
+            ]
+        )
 
 
 def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
@@ -1911,6 +2112,46 @@ def _archive_ack_card(icon: str, message: str) -> dict:
     }
 
 
+def _archive_answer_notify_post(
+    asker_id: str,
+    owner_id: str,
+    question: str,
+    answer_markdown: str,
+    archive_rel: str,
+) -> dict:
+    """构造"负责人答完 → 通知 asker"的 feishu post。
+
+    asker_id 放在第一段以 @ 推送（asker 才会收到飞书侧消息提醒，不然写到归档
+    文件里 asker 永远不知道有答案）；owner_id 内嵌作为"谁答的"标记。
+    answer_markdown 走 markdown_to_feishu_post，保留答案原本的列表/代码块/换行
+    结构。末尾补一行归档路径告诉 asker"答案已沉到这里，下次类似问题 bot 能
+    直接答"——闭环交付。
+    """
+    post = markdown_to_feishu_post(answer_markdown, POST_TITLE)
+    # 截短 question 防止特别长的标题撑爆头部一行；归档时已经做了 200 字上限但
+    # 这里再保险一道（头部行越短越好读，详情看下面的答案 body）。
+    q_short = question if len(question) <= 60 else question[:60].rstrip() + "…"
+    intro_paragraph = [
+        {"tag": "at", "user_id": asker_id},
+        {"tag": "text", "text": f" 你之前问的「{q_short}」，"},
+        {"tag": "at", "user_id": owner_id},
+        {"tag": "text", "text": " 已答复 👇"},
+    ]
+    post["zh_cn"]["content"].insert(0, intro_paragraph)
+    post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
+    post["zh_cn"]["content"].append(
+        [
+            {
+                "tag": "text",
+                "text": (
+                    f"📁 已归档到 {archive_rel}，下次类似问题我能直接从这里答。"
+                ),
+            }
+        ]
+    )
+    return post
+
+
 async def _write_qa_archive(
     file_path: Path,
     qid: str,
@@ -1971,6 +2212,7 @@ async def handle_archive_submit(
     answer: str,
     clicker_id: str | None,
     docs_root: Path,
+    feishu: "FeishuClient | None" = None,
 ) -> dict:
     """处理归档表单提交。返回应替换原表单卡的 ack 卡片（card v2）。
 
@@ -1981,6 +2223,10 @@ async def handle_archive_submit(
     多数失败路径（参数缺失、过期、空答案、写盘异常）都用 ack 卡告诉点击者，
     原卡片被替换避免重复提交困惑。**唯一例外是"非负责人点击"**：返回原表单卡保持
     可见，让真正的负责人还能填——否则其他人误点提交会把负责人的表单顶掉。
+
+    `feishu` 传入时（生产环境总传），写入成功后会在原 chat 发一条"📣 负责人已答复"
+    的 post @ 原 asker，把答案推送给提问者；不传或缺 asker_id 则只写文件不推送
+    （单元测试场景）。这条通知是闭环的关键——否则 asker 永远不知道负责人答了。
     """
     if not qid:
         return _archive_ack_card("⚠️", "归档参数缺失，请联系管理员。")
@@ -2063,6 +2309,35 @@ async def handle_archive_submit(
         rel = file_path.relative_to(docs_root)
     except ValueError:
         rel = file_path
+
+    # 通知 asker：写入成功 + 有 asker_id + 有 feishu client 时给原 chat 发一条
+    # @ asker 的 post 把答案推过去。**仅在 wrote=True 时通知**——幂等命中说明同
+    # qid 的答案已经存档过、asker 多半也通知过了，再发会成"垃圾消息"；写盘失败时
+    # 自然不发。通知本身失败（API 出错 / asker 已不在群里）不回阻归档结果，
+    # 文件已经写了、表单已经提交了，最坏情况 asker 重新问 bot 也能从归档命中。
+    notify_sent = False
+    if wrote and feishu is not None and ctx.get("asker_id"):
+        try:
+            notify_post = _archive_answer_notify_post(
+                asker_id=ctx["asker_id"],
+                owner_id=expected_owner,
+                question=question_text,
+                answer_markdown=answer_text,
+                archive_rel=str(rel),
+            )
+            await feishu.send_post(
+                ctx["chat_id"],
+                notify_post,
+                parent_id=ctx.get("parent_msg_id"),
+            )
+            notify_sent = True
+        except Exception:
+            logger.exception(
+                "notify asker failed (archive still ok): qid=%s asker=%s",
+                qid,
+                ctx.get("asker_id"),
+            )
+
     # had_draft：答题那轮 LLM 有没有给出（区别于原话的）归一化标题。
     # question_edited：负责人在表单里改没改预填值。两个一起看就知道 LLM 草稿
     # 命中率 + 负责人采纳率，用来判断 <<ARCHIVE_Q:>> 这套值不值 / 要不要再调 prompt。
@@ -2083,16 +2358,22 @@ async def handle_archive_submit(
                 "had_draft": had_draft,
                 "question_edited": question_edited,
                 "duplicate": not wrote,
+                "notify_sent": notify_sent,
             },
             ensure_ascii=False,
         )
     )
     logger.info(
-        "archive written: qid=%s path=%s duplicate=%s", qid, rel, not wrote
+        "archive written: qid=%s path=%s duplicate=%s notify=%s",
+        qid,
+        rel,
+        not wrote,
+        notify_sent,
     )
 
     if wrote:
-        return _archive_ack_card("✅", f"已归档至 `{rel}`，谢谢！")
+        suffix = "，已通知提问者" if notify_sent else ""
+        return _archive_ack_card("✅", f"已归档至 `{rel}`{suffix}，谢谢！")
     return _archive_ack_card(
         "ℹ️", f"该 qid 的归档已存在（`{rel}`），跳过。"
     )
@@ -2224,9 +2505,16 @@ async def handle_question(
         answer = _friendly_error(e, context="问答", suggest_reset=True)
     answer = answer or "（无回答内容）"
 
+    # raw_answer 留作 drift 检测：parsing 会把 marker 剥掉，事后只看 answer 没法
+    # 区分"LLM 输出了 <<ESCALATE:none>>（marker 在但 owner=none）"和"LLM 啥 marker
+    # 都没输出"。drift 兜底要的是后者，所以这里在剥之前先快照一份原文本。
+    raw_answer = answer
+
     # 解析"找不到 → @ 负责人"标记。owner 为 None 表示不 @
     # escalate_dir_hint 是 LLM 直接给的归档目录（基于答案命中的组件，准确性高于
     # 按 owner 反查；同一负责人挂多组件时只有 LLM 自己知道这次答的是哪个组件）。
+    # ticket marker 先剥（独立于普通 ESCALATE），命中后走"@ 但不发归档卡"分支。
+    answer, escalate_ticket_owner = _parse_escalate_ticket(answer)
     answer, escalate_owner, escalate_dir_hint = _parse_escalate(answer)
     # 解析归档问题标题草稿（仅在升级时有意义；marker 缺失/为空则为 None，
     # 后面会回退到用户原话）
@@ -2239,6 +2527,7 @@ async def handle_question(
     # 但 LLM 偶尔会不严格遵守。强制清掉，避免反问轮还 @ 负责人 / 挂追问按钮把用户搞糊涂。
     if is_clarification:
         escalate_owner = None
+        escalate_ticket_owner = None
         escalate_dir_hint = None
         archive_q_draft = None
         followup_keys = []
@@ -2270,6 +2559,36 @@ async def handle_question(
                 answer.rstrip()
                 + f"\n\n（另有 {len(truncated_images)} 张图未展示：{shown}）"
             )
+    # 工单 marker 优先：和普通 ESCALATE 同时出现（LLM 偶尔会瞎组合）时按工单处理，
+    # 归档相关字段强制清空。is_ticket 在这里一次性锁定本次升级类型，后面"要不要发
+    # 归档卡 / @ 行措辞用哪个动词"都查这个标志，避免散落多处条件。
+    if escalate_ticket_owner is not None:
+        escalate_owner = escalate_ticket_owner
+        escalate_dir_hint = None
+        archive_q_draft = None
+    is_ticket = escalate_ticket_owner is not None
+
+    # Escalate marker drift 兜底（[[project-escalate-trigger-probabilistic]]）：
+    # LLM 答出"文档中未找到"但忘了输出 ESCALATE/CLARIFY marker。判定条件 +
+    # 决策都在 _is_escalate_drift 里，本处只负责"命中后追加 asker-facing 提示
+    # + 打 warning + qa_record 标记"。不强行猜 owner @——没可靠依据从问题文本
+    # 推断组件，乱 @ 错人比不 @ 更糟。
+    escalate_drift = _is_escalate_drift(
+        raw_answer, answer, escalate_owner, is_clarification
+    )
+    if escalate_drift:
+        logger.warning(
+            "escalate drift: not-found answer with no marker, append fallback hint. "
+            "chat=%s user=%s question=%r",
+            chat_id,
+            user_id,
+            _excerpt(question, 200),
+        )
+        answer = (
+            answer.rstrip()
+            + "\n\n💡 文档没覆盖到这块；可以在群里 @ 对应组件负责人协助处理。"
+        )
+
     # 上一轮上下文已过期时在答案最前面加一行提示，让用户立刻知道"那句『接着
     # 上面的』bot 没拿到上下文，本次按全新问题答的"。注入放在嵌图标记解析之后、
     # _mention_post 之前，提示成为飞书 post 的第一段，最显眼。
@@ -2281,6 +2600,27 @@ async def handle_question(
             + answer
         )
     final_post = _mention_post(user_id, answer)
+
+    # 正文 @ owner 渲染：LLM 在答案正文里写 `<@ou_xxx>` 列候选负责人（drift 兜底
+    # 时多见），markdown 渲染会原样输出尖括号文本。对照 INDEX.md 注册白名单转成
+    # 飞书 <at> tag，幻觉编出来的 open_id 静默剥除。详见 _rewrite_owner_at_mentions。
+    registered_owners = set(
+        _index_owner_to_dirs(session_mgr.docs_root).keys()
+    )
+    at_rendered_in_body, at_dropped_in_body = _rewrite_owner_at_mentions(
+        final_post, registered_owners
+    )
+    if at_dropped_in_body:
+        # LLM 编 open_id 的频率高的话该回头看 prompt——可能"列候选负责人"那个
+        # hedging 习惯需要更强引导（要么按 INDEX.md 实际名单写，要么别列）。
+        logger.warning(
+            "stripped %d unregistered <@ou_xxx> mention(s) from answer body: "
+            "chat=%s user=%s",
+            at_dropped_in_body,
+            chat_id,
+            user_id,
+        )
+
     escalated_now = False
     # component_dir / archive_path_repr 在 cooldown 不命中时需要喂给 _append_escalate_at
     # （让 asker 知道答案会归档到哪），escalated_now=True 时还要复用给后面的归档表单卡，
@@ -2291,7 +2631,19 @@ async def handle_question(
         cooldown_key = (chat_id, escalate_owner)
         if cooldown_key in _escalate_cooldown:
             logger.info(
-                "escalate cooldown hit: chat=%s owner=%s, suppress @",
+                "escalate cooldown hit: chat=%s owner=%s kind=%s, suppress @",
+                chat_id,
+                escalate_owner,
+                "ticket" if is_ticket else "qa",
+            )
+        elif is_ticket:
+            # 工单类升级：只 @ 不算归档路径、不发归档卡。component_dir / archive_path_repr
+            # 留默认值，下面归档卡的分支会因为 is_ticket 整体跳过。
+            _escalate_cooldown[cooldown_key] = True
+            _append_escalate_at(final_post, escalate_owner, "", is_ticket=True)
+            escalated_now = True
+            logger.info(
+                "escalated to owner (ticket): chat=%s owner=%s",
                 chat_id,
                 escalate_owner,
             )
@@ -2352,8 +2704,18 @@ async def handle_question(
     }
     if escalate_owner is not None:
         qa_record["escalated_to"] = escalate_owner
+        qa_record["escalation_kind"] = "ticket" if is_ticket else "qa"
     if is_clarification:
         qa_record["clarification"] = True
+    if escalate_drift:
+        # grep 频率：jq 'select(.escalate_drift_fallback) | {qid, question}' feedback.log
+        # 频率高就该回头调 prompt 强化"找不到必须输出 marker"那条
+        qa_record["escalate_drift_fallback"] = True
+    if at_rendered_in_body or at_dropped_in_body:
+        # 正文 @ owner 渲染统计——rendered 是用户实际能 ping 到的人数，
+        # dropped 是 LLM 编 open_id 被剥的次数，监控 LLM 输出靠谱程度
+        qa_record["at_rendered_in_body"] = at_rendered_in_body
+        qa_record["at_dropped_in_body"] = at_dropped_in_body
     if attached_images:
         # 用相对路径而不是 image_key，事后能直接定位到具体哪些图被引用
         qa_record["images_attached"] = attached_images
@@ -2395,10 +2757,11 @@ async def handle_question(
             parent_id=parent_msg_id,
         )
 
-    # 6. 归档表单卡：仅在本次实际 @ 了负责人时发（cooldown 命中或 none 跳过）。
-    # component_dir / archive_path_repr 已在 _append_escalate_at 之前算好，这里直接复用，
-    # 与答案末尾告知 asker 的归档路径保持一致。
-    if escalated_now:
+    # 6. 归档表单卡：仅在本次实际 @ 了负责人**且不是工单类**时发——工单（加权限/
+    # 开账号）没什么"答案"可归档，发卡只会让负责人多一步无意义点击。cooldown 命中
+    # 或 none 也跳过。component_dir / archive_path_repr 已在 _append_escalate_at 之前
+    # 算好，这里直接复用，与答案末尾告知 asker 的归档路径保持一致。
+    if escalated_now and not is_ticket:
         # question_default：归档表单"问题"框的预填值——优先用 LLM 给的归一化标题，
         # 没给则回退到用户原话。提交时负责人改了就用改后的；question（原话）单纯
         # 留作最终 fallback + 日志对照。
@@ -2410,6 +2773,9 @@ async def handle_question(
             "question_default": question_default,
             "owner_id": escalate_owner,
             "component_dir": component_dir,
+            # 负责人提交归档时给 asker 发通知 post，引用回原始提问消息保持
+            # 话题归属（飞书 UI 会把消息显示在原问题底下，asker 看到不突兀）
+            "parent_msg_id": parent_msg_id,
         }
         await feishu.send_interactive(
             chat_id,

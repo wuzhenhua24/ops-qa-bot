@@ -42,6 +42,7 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
+    is_at_all_broadcast,
 )
 from .feishu_crypto import FeishuCrypto
 from .logging_config import request_id_var
@@ -200,6 +201,19 @@ def create_app(config: AppConfig) -> FastAPI:
         event = payload.get("event") or {}
         chat_id, sender_id, question, msg_id, message_type = _extract_event(event)
         if not chat_id or not sender_id or not message_type:
+            return {"code": 0}
+
+        # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
+        # 但全员通知不应触发答题。同时传 message.content（JSON 字符串，含 text
+        # 字面）兜底飞书 WS SDK 不在 mentions 里放 @_all 的 case。
+        raw_msg = event.get("message") or {}
+        if is_at_all_broadcast(raw_msg.get("mentions"), text=raw_msg.get("content")):
+            logger.info(
+                "skip: @所有人 broadcast chat=%s user=%s type=%s",
+                chat_id,
+                sender_id,
+                message_type,
+            )
             return {"code": 0}
 
         # image 消息走视觉路径：解 image_key → 后台下载 → handle_question(images=...)
@@ -505,7 +519,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 }
             seen_clicks[click_key] = True
             ack_card = await handle_archive_submit(
-                qid, question, answer, clicker_id, docs_root
+                qid, question, answer, clicker_id, docs_root, feishu=feishu
             )
             # v2 卡片用 type:raw 包一层，确保飞书按 v2 渲染
             return {"card": {"type": "raw", "data": ack_card}}

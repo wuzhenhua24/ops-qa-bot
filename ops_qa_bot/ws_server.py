@@ -58,6 +58,7 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
+    is_at_all_broadcast,
 )
 from .health_server import HealthServer
 from .logging_config import request_id_var
@@ -156,6 +157,18 @@ class WsRunner:
         msg_id = getattr(msg, "message_id", None)
         message_type = msg.message_type
         if not chat_id or not sender_id or not message_type:
+            return
+
+        # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
+        # 但全员通知不应触发答题。同时传 msg.content（JSON 字符串，含 text 字面）
+        # 兜底飞书 WS SDK 不在 mentions 里放 @_all 的 case。
+        if is_at_all_broadcast(msg.mentions, text=msg.content):
+            logger.info(
+                "skip: @所有人 broadcast chat=%s user=%s type=%s",
+                chat_id,
+                sender_id,
+                message_type,
+            )
             return
 
         # 飞书文档协作回程：peer（lark-copilot）发来的文本 *如果是* ack envelope
@@ -578,7 +591,12 @@ class WsRunner:
             ):
                 fut = asyncio.run_coroutine_threadsafe(
                     handle_archive_submit(
-                        qid, question, answer, clicker_id, self._config.docs_root
+                        qid,
+                        question,
+                        answer,
+                        clicker_id,
+                        self._config.docs_root,
+                        feishu=self._feishu,
                     ),
                     self._loop,
                 )
@@ -616,7 +634,12 @@ class WsRunner:
             # SDK 在线程池里同步调本回调，转发到 asyncio 主 loop 跑写盘逻辑
             fut = asyncio.run_coroutine_threadsafe(
                 handle_archive_submit(
-                    qid, question, answer, clicker_id, self._config.docs_root
+                    qid,
+                    question,
+                    answer,
+                    clicker_id,
+                    self._config.docs_root,
+                    feishu=self._feishu,
                 ),
                 self._loop,
             )
