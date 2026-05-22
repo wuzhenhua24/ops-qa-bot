@@ -45,6 +45,29 @@ class HealthConfig:
 
 
 @dataclass
+class DocQAConfig:
+    """外部「飞书文档问答」服务（POST /doc_qa）的接入配置。
+
+    部分组件负责人用飞书文档而非本地 markdown 维护运维知识；这个服务把
+    feishu doc token + 问题翻成 markdown 答案。bot 把它包成主 agent 的一个
+    工具 `query_feishu_doc`，按 INDEX.md 里登记为 `feishu` 来源的组件调用。
+
+    `base_url` 为空时整个特性关闭（不挂工具、prompt 不加来源节），让没有飞书
+    文档需求的部署零感知。`token` 为空表示对端没开鉴权（仅可信内网测试）。
+    `timeout` 必须 ≥ 对端最坏耗时——/doc_qa 内部还要跑 agent + 拉文档图，
+    比纯文本接口慢，留足余量避免外层 agent 等不到结果误判失败。
+    """
+
+    base_url: str | None = None
+    token: str | None = None
+    timeout: float = 60.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url)
+
+
+@dataclass
 class AppConfig:
     docs_root: Path
     feishu: FeishuConfig
@@ -53,6 +76,7 @@ class AppConfig:
     admin_token: str | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    doc_qa: DocQAConfig = field(default_factory=DocQAConfig)
 
 
 def _pick(env_key: str, cfg_value: Any, default: Any = None) -> Any:
@@ -121,6 +145,18 @@ def load_config(path: Path) -> AppConfig:
     health_host = _pick("HEALTH_HOST", health_raw.get("host"), "127.0.0.1")
     health_port = int(_pick("HEALTH_PORT", health_raw.get("port"), 8001))
 
+    doc_qa_raw = data.get("doc_qa") or {}
+    doc_qa_base_url = (
+        _pick("DOC_QA_BASE_URL", doc_qa_raw.get("base_url")) or None
+    )
+    # 末尾斜杠归一化：拼 /doc_qa 时不想撞出 //doc_qa
+    if doc_qa_base_url:
+        doc_qa_base_url = doc_qa_base_url.rstrip("/")
+    doc_qa_token = _pick("DOC_QA_TOKEN", doc_qa_raw.get("token")) or None
+    doc_qa_timeout = float(
+        _pick("DOC_QA_TIMEOUT", doc_qa_raw.get("timeout"), 60)
+    )
+
     return AppConfig(
         docs_root=docs_root,
         feishu=FeishuConfig(
@@ -138,5 +174,10 @@ def load_config(path: Path) -> AppConfig:
             enabled=health_enabled,
             host=health_host,
             port=health_port,
+        ),
+        doc_qa=DocQAConfig(
+            base_url=doc_qa_base_url,
+            token=doc_qa_token,
+            timeout=doc_qa_timeout,
         ),
     )

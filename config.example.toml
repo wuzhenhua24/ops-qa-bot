@@ -42,3 +42,12 @@ feedback_log = "./logs/feedback.log"    # env: FEEDBACK_LOG
 enabled = true                          # env: HEALTH_ENABLED；不需要监控时设 false
 host    = "127.0.0.1"                   # env: HEALTH_HOST；接外部监控时改 0.0.0.0
 port    = 8001                          # env: HEALTH_PORT
+
+# 可选：外部「飞书文档问答」服务（POST /doc_qa）接入。
+# 部分组件负责人用飞书文档而非本地 markdown 维护知识——在 docs/INDEX.md 里把这些
+# 组件的「来源」列标成 feishu、「飞书文档」列填 doc token，bot 就会用 query_feishu_doc
+# 工具去查。base_url 留空则整个特性关闭（不挂工具，无飞书文档需求的部署零感知）。
+[doc_qa]
+base_url = ""                           # env: DOC_QA_BASE_URL，如 http://127.0.0.1:8800（不带末尾 /doc_qa）
+token    = ""                           # env: DOC_QA_TOKEN，对端 HTTP_API_TOKEN；对端没开鉴权则留空
+timeout  = 60                           # env: DOC_QA_TIMEOUT（秒）。要 ≥ 对端最坏耗时（内部还要跑 agent + 拉图）

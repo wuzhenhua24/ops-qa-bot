@@ -23,6 +23,9 @@ import httpx
 from cachetools import LRUCache, TTLCache
 
 from .bot import AnswerResult, OpsQABot
+from .config import DocQAConfig
+from .doc_qa import FULL_TOOL_NAME, parse_feishu_registry
+from .doc_qa import _norm_key as _feishu_norm_key
 from .feishu_format import markdown_to_feishu_post
 
 logger = logging.getLogger("ops_qa_bot.feishu")
@@ -388,6 +391,19 @@ class ProgressTracker:
             # force=True 让用户立刻看到每条诊断在哪台机器跑什么。
             phase_change = self._last_phase != "bash"
             self._last_phase = "bash"
+            self._last_dir = None
+            self._read_count_in_dir = 0
+            return text, phase_change
+
+        if tool_name == FULL_TOOL_NAME:
+            # 飞书文档问答工具：单步就出结果，跨阶段第一次 force 刷一次"查飞书
+            # 文档中"，重复调用（多组件）不抖动。component 入参带上让用户看到查的是谁。
+            comp = str(tool_input.get("component", "")).strip()
+            text = (
+                f"📄 查飞书文档中（{comp}）…" if comp else "📄 查飞书文档中…"
+            )
+            phase_change = self._last_phase != "docqa"
+            self._last_phase = "docqa"
             self._last_dir = None
             self._read_count_in_dir = 0
             return text, phase_change
@@ -763,9 +779,15 @@ class SessionManager:
     主动清掉 last_seen 不算过期，避免给主动重置的用户再补一条提示。
     """
 
-    def __init__(self, docs_root: Path, idle_ttl: float = 1800.0):
+    def __init__(
+        self,
+        docs_root: Path,
+        idle_ttl: float = 1800.0,
+        doc_qa_config: "DocQAConfig | None" = None,
+    ):
         self._docs_root = docs_root
         self._idle_ttl = idle_ttl
+        self._doc_qa_config = doc_qa_config
         self._sessions: dict[SessionKey, _SessionEntry] = {}
         self._manager_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
@@ -792,7 +814,10 @@ class SessionManager:
         async with self._manager_lock:
             entry = self._sessions.get(key)
             if entry is None:
-                bot = OpsQABot(docs_root=self._docs_root)
+                bot = OpsQABot(
+                    docs_root=self._docs_root,
+                    doc_qa_config=self._doc_qa_config,
+                )
                 await bot.__aenter__()
                 entry = _SessionEntry(bot)
                 self._sessions[key] = entry
@@ -1885,15 +1910,26 @@ def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
 
 
 def _append_escalate_at(
-    post: dict, owner_id: str, archive_path: str, *, is_ticket: bool = False
+    post: dict,
+    owner_id: str,
+    archive_path: str,
+    *,
+    is_ticket: bool = False,
+    is_feishu: bool = False,
 ) -> None:
     """在 post 末尾追加 "📣 已通知负责人 @xxx" 行（+ 普通升级时再加归档去向）。
 
-    is_ticket=False（默认，"文档没答案"升级）：追加两行——@ + 归档路径告知。
-    archive_path 是相对 docs_root 的路径（如 "redis/qa-archive.md"），与紧随其后
-    发出的归档表单卡 (_archive_form_card) 一致。告诉 asker 答案最终会落到哪、下次
-    类似问题 bot 能从哪里直接答，避免"通知完就没下文"的预期空白。归档依赖 owner
-    填表单，措辞用条件式（"填写后会归档"）不要说死。
+    is_ticket=False（默认，"文档没答案"升级）：追加两行——@ + 归档去向告知。
+
+    本地组件（is_feishu=False）：archive_path 是相对 docs_root 的路径（如
+    "redis/qa-archive.md"），与紧随其后发出的归档表单卡一致。告诉 asker 答案最终
+    会落到哪、下次类似问题 bot 能从哪里直接答，避免"通知完就没下文"的预期空白。
+
+    飞书来源组件（is_feishu=True）：这类组件的知识维护在飞书文档里，bot 不会回读
+    本地 qa-archive.md（见 [[project_feishu_doc_qa_integration]] 的归档回读缺口），
+    所以**不能**承诺"下次我能直接从这里答"——那是假的。改成告诉 asker 答案会同步
+    给他，并点明知识维护在飞书文档（第一信号源是负责人维护的飞书文档）。本地仍会
+    静默写一份 archive 作留档 + 为将来万一要切"兼读本地"预热数据，但不对外宣称。
 
     is_ticket=True（工单类升级，"加权限/开账号"操作请求）：只 @ 不提归档；动词
     用"协助处理"而不是"协助回答"——工单 ≠ 知识答疑。archive_path 在 ticket 模式
@@ -1909,17 +1945,17 @@ def _append_escalate_at(
         ]
     )
     if not is_ticket:
-        post["zh_cn"]["content"].append(
-            [
-                {
-                    "tag": "text",
-                    "text": (
-                        f"📁 负责人填写后会归档到 {archive_path}，"
-                        "下次类似问题我能直接从这里答。"
-                    ),
-                }
-            ]
-        )
+        if is_feishu:
+            line = (
+                "📁 答案整理后会同步给你；这个组件的运维知识维护在飞书文档里，"
+                "已请负责人补充进去。"
+            )
+        else:
+            line = (
+                f"📁 负责人填写后会归档到 {archive_path}，"
+                "下次类似问题我能直接从这里答。"
+            )
+        post["zh_cn"]["content"].append([{"tag": "text", "text": line}])
 
 
 def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
@@ -1982,7 +2018,12 @@ def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
 
 
 def _archive_form_card(
-    qid: str, question_default: str, owner_id: str, archive_path_repr: str
+    qid: str,
+    question_default: str,
+    owner_id: str,
+    archive_path_repr: str,
+    *,
+    is_feishu: bool = False,
 ) -> dict:
     """归档表单卡（card v2 form）：可编辑问题标题 + 多行答案输入框 + 提交按钮。
 
@@ -1990,7 +2031,25 @@ def _archive_form_card(
     标题，否则是用户原话。负责人可在框里改成更通用的说法再提交；最终写盘用框里的值。
     archive_path_repr：展示给 owner 的相对路径（如 "redis/qa-archive.md"），
     让他知道答案会落到哪个文件再决定写多详细。
+
+    is_feishu=True（飞书来源组件）：bot 不回读本地 archive，所以引导文案不提"追加进
+    xxx.md / 检索关键词"那套（会误导负责人以为填表单 bot 就学会了），改成"答案会
+    同步给提问者 + 请维护飞书文档"。表单照常提交、本地照常静默留档（见
+    [[project_feishu_doc_qa_integration]]）。
     """
+    if is_feishu:
+        intro = (
+            f"<at id={owner_id}></at> 下面的「问题」是系统整理的，可改成更通用的"
+            "说法；把整理过的答案填进答案框，提交后会同步给提问者。"
+            "这个组件的运维知识维护在飞书文档，请把答案一并补充进去。"
+        )
+    else:
+        intro = (
+            f"<at id={owner_id}></at> 下面的「问题」是系统自动整理的，"
+            "可改成更通用的说法（它会作为归档标题和以后的检索关键词）；"
+            "把整理过的答案填进答案框，"
+            f"提交后会追加进 `{archive_path_repr}`。"
+        )
     return {
         "schema": "2.0",
         "config": {"update_multi": True},
@@ -2002,12 +2061,7 @@ def _archive_form_card(
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": (
-                        f"<at id={owner_id}></at> 下面的「问题」是系统自动整理的，"
-                        "可改成更通用的说法（它会作为归档标题和以后的检索关键词）；"
-                        "把整理过的答案填进答案框，"
-                        f"提交后会追加进 `{archive_path_repr}`。"
-                    ),
+                    "content": intro,
                 },
                 {
                     "tag": "form",
@@ -2222,7 +2276,11 @@ async def handle_archive_submit(
             f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
         )
         return _archive_form_card(
-            qid, question_default, expected_owner, archive_path_repr
+            qid,
+            question_default,
+            expected_owner,
+            archive_path_repr,
+            is_feishu=bool(ctx.get("is_feishu")),
         )
 
     answer_text = (answer or "").strip()
@@ -2586,6 +2644,9 @@ async def handle_question(
     # 保证两边路径完全一致。cooldown 命中走不到，留默认值即可。
     component_dir: str | None = None
     archive_path_repr = "qa-archive.md"
+    # 升级到的组件是否飞书来源：决定 @ 行 / 归档卡的措辞（飞书组件不承诺本地回读，
+    # 改为引导负责人维护飞书文档）。在 component_dir 定下来后按注册表判定。
+    is_feishu_component = False
     if escalate_owner is not None:
         cooldown_key = (chat_id, escalate_owner)
         if cooldown_key in _escalate_cooldown:
@@ -2630,9 +2691,19 @@ async def handle_question(
             archive_path_repr = (
                 f"{component_dir}/qa-archive.md" if component_dir else "qa-archive.md"
             )
+            if component_dir:
+                is_feishu_component = (
+                    _feishu_norm_key(component_dir)
+                    in parse_feishu_registry(session_mgr.docs_root)
+                )
 
             _escalate_cooldown[cooldown_key] = True
-            _append_escalate_at(final_post, escalate_owner, archive_path_repr)
+            _append_escalate_at(
+                final_post,
+                escalate_owner,
+                archive_path_repr,
+                is_feishu=is_feishu_component,
+            )
             escalated_now = True
             logger.info(
                 "escalated to owner: chat=%s owner=%s", chat_id, escalate_owner
@@ -2664,6 +2735,11 @@ async def handle_question(
     if escalate_owner is not None:
         qa_record["escalated_to"] = escalate_owner
         qa_record["escalation_kind"] = "ticket" if is_ticket else "qa"
+        if is_feishu_component:
+            # 观察期抓手：grep `feishu_component` 统计飞书来源组件多频繁升级。
+            # 升级率高 = 飞书文档没覆盖到 / 负责人没在维护，是决定要不要切"兼读
+            # 本地 archive"的判据（[[project_feishu_doc_qa_integration]]）。
+            qa_record["feishu_component"] = True
     if is_clarification:
         qa_record["clarification"] = True
     if escalate_drift:
@@ -2732,6 +2808,7 @@ async def handle_question(
             "question_default": question_default,
             "owner_id": escalate_owner,
             "component_dir": component_dir,
+            "is_feishu": is_feishu_component,
             # 负责人提交归档时给 asker 发通知 post，引用回原始提问消息保持
             # 话题归属（飞书 UI 会把消息显示在原问题底下，asker 看到不突兀）
             "parent_msg_id": parent_msg_id,
@@ -2739,7 +2816,11 @@ async def handle_question(
         await feishu.send_interactive(
             chat_id,
             _archive_form_card(
-                qid, question_default, escalate_owner, archive_path_repr
+                qid,
+                question_default,
+                escalate_owner,
+                archive_path_repr,
+                is_feishu=is_feishu_component,
             ),
             parent_id=parent_msg_id,
         )

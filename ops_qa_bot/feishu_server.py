@@ -100,7 +100,9 @@ def create_app(config: AppConfig) -> FastAPI:
     idle_ttl = config.session_idle_ttl
 
     feishu = FeishuClient(config.feishu.app_id, config.feishu.app_secret)
-    session_mgr = SessionManager(docs_root=docs_root, idle_ttl=idle_ttl)
+    session_mgr = SessionManager(
+        docs_root=docs_root, idle_ttl=idle_ttl, doc_qa_config=config.doc_qa
+    )
 
     # 配置了 encrypt_key 就启用签名校验 + AES 解密，否则维持原行为（依赖 verify_token + IP 白名单）
     crypto: FeishuCrypto | None = (

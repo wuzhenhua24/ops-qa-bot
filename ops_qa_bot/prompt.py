@@ -429,5 +429,34 @@ Mem:           15Gi        14Gi       512Mi
 """
 
 
-def build_system_prompt(docs_root: Path) -> str:
-    return SYSTEM_PROMPT_TEMPLATE.format(docs_root=str(docs_root))
+# 飞书文档来源节：仅当部署配了 doc_qa 服务时追加。讲清楚 source=feishu 的组件
+# 没有本地文件、要改用 query_feishu_doc 工具，以及来源标注 / 追问折上下文 / 找不到
+# 走升级这几条与现有规范衔接的点。具体哪些组件是 feishu 由 agent 读 INDEX.md 得知，
+# 不在 prompt 里写死。
+_DOC_QA_SECTION = """
+
+# 组件文档来源（本地 markdown vs 飞书文档）
+
+`{docs_root}/INDEX.md` 的组件表有一列「来源」：
+
+- **来源 = `local`**（默认）：文档是 `{docs_root}` 下的本地 md 文件，按上面「工作流程」用 Glob/Read/Grep 查。
+- **来源 = `feishu`**：该组件的运维知识维护在**飞书文档**里，`{docs_root}` 下**没有**它的本地 md 文件。**不要对这类组件用 Glob/Read/Grep**（查不到，白费 round），改用 `query_feishu_doc` 工具。
+
+## 用 query_feishu_doc 工具
+
+- 路由命中一个 `feishu` 来源的组件时，调 `query_feishu_doc`：
+  - `component`：传 INDEX.md 里该组件的「组件」列名（如 `Nginx`），**不要传 doc token**（token 由系统按组件名解析，你不用也拿不到）。
+  - `question`：传一个**自包含的完整问题**。这个服务**没有对话记忆**——用户追问 / 反问轮回填后，要把前面几轮的关键上下文（组件、版本、报错、已确认的环境）**折进这一条 question**，不能只发"那它怎么回滚"这种依赖上文的半句。
+- 工具返回的是该组件飞书文档里的**答案 markdown**，把它当作文档依据来组织你的回答，规范同本地文档：
+  - **引用来源**写成 `（来源：飞书文档·<组件>）`，例如 `（来源：飞书文档·Nginx）`；不要编造飞书文档的具体路径或链接。
+  - 危险操作照样标 ⚠️ 风险；危险/操作类问题照样可挂 `<<FOLLOWUPS:...>>`。
+- **取不到内容时**（工具返回"未能取得…"「未登记」等提示，或内容明显答非所问）：按「升级规则」回复未找到 + 输出 `<<ESCALATE:ou_xxx:目录>>` 通知负责人（目录取 INDEX.md 里该组件的「目录」列），**不要凭常识编答案**。
+- 跨来源问题（一个组件本地、一个组件飞书）：分别用对应方式查，再合并作答，各自标清来源。
+"""
+
+
+def build_system_prompt(docs_root: Path, *, doc_qa_enabled: bool = False) -> str:
+    template = SYSTEM_PROMPT_TEMPLATE
+    if doc_qa_enabled:
+        template = template + _DOC_QA_SECTION
+    return template.format(docs_root=str(docs_root))

@@ -7,11 +7,17 @@
 
 `open_id` 列用于在 bot 回答不上来时 @ 对应负责人，必须填飞书的 `ou_xxxxxxxx` 格式。
 
-| 组件 | 目录 | 覆盖内容 | 负责人 | open_id |
-|------|------|----------|--------|---------|
-| Redis | `redis/` | Redis 集群运维、常见故障排查、性能调优 | 张三 | ou_REPLACE_WITH_REAL_ID_1 |
-| MySQL | `mysql/` | MySQL 主从、备份恢复、慢查询、常见故障 | 李四 | ou_REPLACE_WITH_REAL_ID_2 |
-| Kafka | `kafka/` | Kafka 集群操作、topic 管理、消费延迟处理 | 王五 | ou_REPLACE_WITH_REAL_ID_3 |
+「来源」列指定该组件运维知识维护在哪：
+
+- `local`（默认）：文档是本地 markdown，放在「目录」列指向的目录下。
+- `feishu`：文档维护在飞书，由「飞书文档」列登记 doc token / url（多个用逗号分隔）。这类组件没有本地 md 文件，bot 会改用 `query_feishu_doc` 工具查（需部署侧配 `[doc_qa]`）。
+
+| 组件 | 来源 | 目录 | 飞书文档 | 覆盖内容 | 负责人 | open_id |
+|------|------|------|----------|----------|--------|---------|
+| Redis | local | `redis/` | - | Redis 集群运维、常见故障排查、性能调优 | 张三 | ou_REPLACE_WITH_REAL_ID_1 |
+| MySQL | local | `mysql/` | - | MySQL 主从、备份恢复、慢查询、常见故障 | 李四 | ou_REPLACE_WITH_REAL_ID_2 |
+| Kafka | local | `kafka/` | - | Kafka 集群操作、topic 管理、消费延迟处理 | 王五 | ou_REPLACE_WITH_REAL_ID_3 |
+| Nginx | feishu | `nginx/` | docx_REPLACE_WITH_REAL_TOKEN | Nginx 网关配置、上游/白名单、限流（维护在飞书文档） | 赵六 | ou_REPLACE_WITH_REAL_ID_4 |
 
 ## 使用说明
 

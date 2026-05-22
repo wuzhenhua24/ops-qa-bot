@@ -16,6 +16,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from .config import DocQAConfig
+from .doc_qa import FULL_TOOL_NAME, SERVER_KEY, build_doc_qa_server
 from .prompt import build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,13 @@ def format_tool_call(name: str, tool_input: dict) -> str:
         return f"Grep '{pattern}'" + (f" in {path}" if path else "")
     if name == "Bash":
         return f"Bash {tool_input.get('command', '?')}"
+    if name == FULL_TOOL_NAME:
+        # 完整 question 可能很长，日志只记组件名 + 问题长度，别刷屏
+        q = str(tool_input.get("question", ""))
+        return (
+            f"query_feishu_doc(component={tool_input.get('component', '?')}, "
+            f"q_len={len(q)})"
+        )
     return f"{name}({tool_input})"
 
 
@@ -178,7 +187,11 @@ class OpsQABot:
             text = await bot.answer("Redis 内存告警怎么处理？")
     """
 
-    def __init__(self, docs_root: str | Path):
+    def __init__(
+        self,
+        docs_root: str | Path,
+        doc_qa_config: DocQAConfig | None = None,
+    ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
             raise ValueError(f"docs_root 不存在或不是目录: {self.docs_root}")
@@ -186,6 +199,12 @@ class OpsQABot:
             raise ValueError(
                 f"docs_root 下缺少 INDEX.md 路由表: {self.docs_root / 'INDEX.md'}"
             )
+
+        # 飞书文档问答：base_url 配了才启用。启用时挂一个进程内 MCP 工具
+        # query_feishu_doc，让 agent 能查"用飞书文档维护的组件"（INDEX.md 里
+        # 来源=feishu 的行）。没配则整个特性关闭，prompt 也不加来源节，无飞书
+        # 文档需求的部署零感知。
+        doc_qa_enabled = bool(doc_qa_config and doc_qa_config.enabled)
 
         # 工具集设计：
         # - Read/Glob/Grep：文档检索的完备集
@@ -200,9 +219,25 @@ class OpsQABot:
         # 走 "ask" 流程；SDK 模式下没人能 prompt，agent 就会把它理解成"我没权限"
         # 而拒绝调 Bash。bypassPermissions 跳过所有权限检查，安全控制完全交给
         # tools 白名单（agent 只能见到这 4 个工具）+ PreToolUse hook（写命令兜底）。
+        # MCP 工具叠加在内置 tools 之上（tools 列表只约束内置工具，不含 MCP）。
+        # bypassPermissions 已跳过所有权限询问，allowed_tools 不是必须；仍显式列出
+        # 工具全名做白名单收敛，意图清晰、也防 SDK/CLI 默认策略未来收紧。
+        mcp_servers: dict = {}
+        allowed_tools: list[str] = []
+        if doc_qa_enabled:
+            assert doc_qa_config is not None
+            mcp_servers[SERVER_KEY] = build_doc_qa_server(
+                self.docs_root, doc_qa_config
+            )
+            allowed_tools.append(FULL_TOOL_NAME)
+
         self._options = ClaudeAgentOptions(
-            system_prompt=build_system_prompt(self.docs_root),
+            system_prompt=build_system_prompt(
+                self.docs_root, doc_qa_enabled=doc_qa_enabled
+            ),
             tools=["Read", "Glob", "Grep", "Bash"],
+            mcp_servers=mcp_servers,
+            allowed_tools=allowed_tools,
             cwd=str(self.docs_root),
             permission_mode="bypassPermissions",
             hooks={

@@ -81,7 +81,9 @@ class WsRunner:
         self._config = config
         self._feishu = FeishuClient(config.feishu.app_id, config.feishu.app_secret)
         self._session_mgr = SessionManager(
-            docs_root=docs_root, idle_ttl=config.session_idle_ttl
+            docs_root=docs_root,
+            idle_ttl=config.session_idle_ttl,
+            doc_qa_config=config.doc_qa,
         )
         # WS 下 SDK 一般自己去重，但保险起见我们也按 event_id/click key 兜一层
         self._seen_events: TTLCache = TTLCache(maxsize=10000, ttl=600)
