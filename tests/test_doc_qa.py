@@ -277,7 +277,12 @@ def test_handler_lookup_by_dir_name():
 # 飞书来源组件升级措辞：不承诺本地回读，引导维护飞书文档
 # ---------------------------------------------------------------------------
 
-from ops_qa_bot.feishu_core import _append_escalate_at, _archive_form_card  # noqa: E402
+from ops_qa_bot.feishu_core import (  # noqa: E402
+    _append_escalate_at,
+    _archive_form_card,
+    _feishu_reference_links,
+)
+from ops_qa_bot.feishu_format import markdown_to_feishu_post  # noqa: E402
 
 
 def _fresh_post() -> dict:
@@ -334,6 +339,61 @@ def test_archive_card_feishu_redirects_to_feishu_doc():
     assert "飞书文档" in s
     # 表单本体（问题/答案输入框 + 提交）照常在，机制不变
     assert "archive_form" in s and "archive_submit" in s
+
+
+# ---------------------------------------------------------------------------
+# 参考文档链接：本轮查过的飞书组件 → 末尾可点链接
+# ---------------------------------------------------------------------------
+
+_INDEX_REF = """# i
+| 组件 | 来源 | 目录 | 飞书文档 | 覆盖内容 | 负责人 | open_id |
+|---|---|---|---|---|---|---|
+| Nginx | feishu | `nginx/` | https://abc.feishu.cn/docx/AAA | 网关 | 赵六 | ou_b |
+| Gw | feishu | `gw/` | https://abc.feishu.cn/docx/B1, https://abc.feishu.cn/docx/B2 | x | 钱七 | ou_c |
+| Tok | feishu | `t/` | docx_TOKEN_ONLY | x | 孙八 | ou_d |
+"""
+
+
+def test_ref_links_single_url():
+    root = _make_docs_root(_INDEX_REF)
+    out = _feishu_reference_links(["Nginx"], root)
+    assert out == "📄 参考文档：\n- [Nginx 飞书文档](https://abc.feishu.cn/docx/AAA)"
+
+
+def test_ref_links_multi_url_numbered():
+    root = _make_docs_root(_INDEX_REF)
+    out = _feishu_reference_links(["Gw"], root)
+    assert "[Gw 飞书文档 1](https://abc.feishu.cn/docx/B1)" in out
+    assert "[Gw 飞书文档 2](https://abc.feishu.cn/docx/B2)" in out
+
+
+def test_ref_links_dedup_by_component():
+    root = _make_docs_root(_INDEX_REF)
+    out = _feishu_reference_links(["Nginx", "nginx", "Nginx"], root)
+    assert out.count("Nginx 飞书文档") == 1
+
+
+def test_ref_links_token_only_skipped():
+    root = _make_docs_root(_INDEX_REF)
+    # 纯 token 拼不出链接 → 该组件无可链 → 整体 None
+    assert _feishu_reference_links(["Tok"], root) is None
+
+
+def test_ref_links_unknown_component_none():
+    root = _make_docs_root(_INDEX_REF)
+    assert _feishu_reference_links(["Redis"], root) is None
+    assert _feishu_reference_links([], root) is None
+
+
+def test_ref_links_render_to_clickable_a_tag():
+    root = _make_docs_root(_INDEX_REF)
+    block = _feishu_reference_links(["Nginx"], root)
+    post = markdown_to_feishu_post("答案正文\n\n" + block)
+    assert any(
+        seg.get("tag") == "a" and seg.get("href") == "https://abc.feishu.cn/docx/AAA"
+        for para in post["zh_cn"]["content"]
+        for seg in para
+    )
 
 
 # ---------------------------------------------------------------------------

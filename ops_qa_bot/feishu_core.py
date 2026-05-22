@@ -1958,6 +1958,38 @@ def _append_escalate_at(
         post["zh_cn"]["content"].append([{"tag": "text", "text": line}])
 
 
+def _feishu_reference_links(components: list[str], docs_root: Path) -> str | None:
+    """本轮查过的飞书组件 → 末尾「📄 参考文档」可点链接 markdown 块（无则 None）。
+
+    provenance 来自 query_feishu_doc 工具调用事件（ground truth），不依赖 LLM 在
+    正文里写的"来源"。只链登记成 http(s) URL 的文档——纯 token 拼不出链接，静默跳过；
+    一个组件多文档列多行；按组件名去重保序。
+
+    措辞用"参考文档"而非"出处"：/doc_qa 返回的是跨文档综合答案，只能给到**组件级**
+    入口，给不到逐行精确出处。块用 markdown 无序列表 + 链接语法，交给
+    markdown_to_feishu_post 渲染成飞书可点 a 标签。
+    """
+    reg = parse_feishu_registry(docs_root)
+    seen: set[str] = set()
+    lines: list[str] = []
+    for c in components:
+        entry = reg.get(_feishu_norm_key(c))
+        if entry is None or entry.name in seen:
+            continue
+        seen.add(entry.name)
+        urls = [d for d in entry.docs if d.startswith(("http://", "https://"))]
+        if not urls:
+            continue
+        if len(urls) == 1:
+            lines.append(f"- [{entry.name} 飞书文档]({urls[0]})")
+        else:
+            for i, u in enumerate(urls, 1):
+                lines.append(f"- [{entry.name} 飞书文档 {i}]({u})")
+    if not lines:
+        return None
+    return "📄 参考文档：\n" + "\n".join(lines)
+
+
 def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
     """解析 docs_root/INDEX.md 的"组件目录"表 → {open_id: [目录1, 目录2, ...]}。
 
@@ -2458,6 +2490,9 @@ async def handle_question(
     # 让用户从"翻文档中"看到具体进度（已定位 redis/、正在查 troubleshooting.md…）
     result: AnswerResult | None = None
     answer = ""
+    # 本轮调过 query_feishu_doc 的飞书组件（按出现顺序，去重在 _feishu_reference_links
+    # 里做）。在 try 外声明，异常路径也能安全引用（虽然那时一般是空）。
+    queried_feishu_components: list[str] = []
     try:
         entry = await session_mgr.get(key)
         async with entry.lock:
@@ -2483,6 +2518,12 @@ async def handle_question(
             async for event in entry.bot.ask(question, images=images):
                 etype = event.get("type")
                 if etype == "tool":
+                    if event.get("name") == FULL_TOOL_NAME:
+                        comp = str(
+                            (event.get("input") or {}).get("component", "")
+                        ).strip()
+                        if comp:
+                            queried_feishu_components.append(comp)
                     if (
                         tracker is not None
                         and placeholder_mid is not None
@@ -2605,6 +2646,17 @@ async def handle_question(
             answer.rstrip()
             + "\n\n💡 文档没覆盖到这块；可以在群里 @ 对应组件负责人协助处理。"
         )
+
+    # 飞书组件参考文档链接：本轮调过 query_feishu_doc 的组件，在答案末尾追加可点
+    # 链接（provenance 来自工具事件，不依赖 LLM 写的来源）。反问轮跳过——那轮没有
+    # 真正基于文档的答案，挂链接是噪音。放在答案文本里，随 _mention_post 一起渲染，
+    # 位置在正文之后、post 级追加的"📣 已通知负责人"之前。
+    if not is_clarification and queried_feishu_components:
+        ref_block = _feishu_reference_links(
+            queried_feishu_components, session_mgr.docs_root
+        )
+        if ref_block:
+            answer = answer.rstrip() + "\n\n" + ref_block
 
     # 上一轮上下文已过期时在答案最前面加一行提示，让用户立刻知道"那句『接着
     # 上面的』bot 没拿到上下文，本次按全新问题答的"。注入放在嵌图标记解析之后、
