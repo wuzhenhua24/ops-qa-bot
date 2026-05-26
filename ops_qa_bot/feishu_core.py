@@ -2163,14 +2163,23 @@ def _archive_answer_notify_post(
     question: str,
     answer_markdown: str,
     archive_rel: str,
+    *,
+    is_feishu: bool = False,
 ) -> dict:
     """构造"负责人答完 → 通知 asker"的 feishu post。
 
     asker_id 放在第一段以 @ 推送（asker 才会收到飞书侧消息提醒，不然写到归档
     文件里 asker 永远不知道有答案）；owner_id 内嵌作为"谁答的"标记。
     answer_markdown 走 markdown_to_feishu_post，保留答案原本的列表/代码块/换行
-    结构。末尾补一行归档路径告诉 asker"答案已沉到这里，下次类似问题 bot 能
-    直接答"——闭环交付。
+    结构。末尾补一行收尾——闭环交付。
+
+    is_feishu=False：本地组件，告知归档路径 + 承诺"下次直接答"（agent 后续轮
+    Read 本地 archive 能命中）。
+
+    is_feishu=True：飞书来源组件，bot 不回读本地 archive（见
+    [[project_feishu_doc_qa_integration]]），**不能**承诺"下次直接答"——那是
+    假的。改成告诉 asker 答案已同步 + 请负责人补充进飞书文档。与
+    `_append_escalate_at` / `_archive_form_card` 的 is_feishu 分支保持一致姿态。
     """
     post = markdown_to_feishu_post(answer_markdown, POST_TITLE)
     # 截短 question 防止特别长的标题撑爆头部一行；归档时已经做了 200 字上限但
@@ -2184,16 +2193,14 @@ def _archive_answer_notify_post(
     ]
     post["zh_cn"]["content"].insert(0, intro_paragraph)
     post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
-    post["zh_cn"]["content"].append(
-        [
-            {
-                "tag": "text",
-                "text": (
-                    f"📁 已归档到 {archive_rel}，下次类似问题我能直接从这里答。"
-                ),
-            }
-        ]
-    )
+    if is_feishu:
+        tail = (
+            "📁 答案已同步给你；这个组件的运维知识维护在飞书文档，"
+            "已请负责人补充进去。"
+        )
+    else:
+        tail = f"📁 已归档到 {archive_rel}，下次类似问题我能直接从这里答。"
+    post["zh_cn"]["content"].append([{"tag": "text", "text": tail}])
     return post
 
 
@@ -2373,6 +2380,7 @@ async def handle_archive_submit(
                 question=question_text,
                 answer_markdown=answer_text,
                 archive_rel=str(rel),
+                is_feishu=bool(ctx.get("is_feishu")),
             )
             await feishu.send_post(
                 ctx["chat_id"],

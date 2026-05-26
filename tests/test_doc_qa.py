@@ -279,6 +279,7 @@ def test_handler_lookup_by_dir_name():
 
 from ops_qa_bot.feishu_core import (  # noqa: E402
     _append_escalate_at,
+    _archive_answer_notify_post,
     _archive_form_card,
     _feishu_reference_links,
 )
@@ -339,6 +340,42 @@ def test_archive_card_feishu_redirects_to_feishu_doc():
     assert "飞书文档" in s
     # 表单本体（问题/答案输入框 + 提交）照常在，机制不变
     assert "archive_form" in s and "archive_submit" in s
+
+
+def test_archive_notify_local_promises_readback():
+    # 本地组件：通知里告知归档路径 + 承诺下次直接答
+    post = _archive_answer_notify_post(
+        asker_id="ou_a",
+        owner_id="ou_b",
+        question="为什么 redis 内存涨这么快",
+        answer_markdown="先看 maxmemory 配置...",
+        archive_rel="redis/qa-archive.md",
+    )
+    txt = str(post["zh_cn"]["content"])
+    assert "下次类似问题我能直接从这里答" in txt
+    assert "redis/qa-archive.md" in txt
+
+
+def test_archive_notify_feishu_no_readback_promise():
+    # 飞书组件：通知里不暴露本地路径、不承诺"自学"，引导维护飞书文档
+    post = _archive_answer_notify_post(
+        asker_id="ou_a",
+        owner_id="ou_b",
+        question="archer 上为啥没禁用按钮",
+        answer_markdown="功能已关闭，仅管理员操作",
+        archive_rel="archer/qa-archive.md",
+        is_feishu=True,
+    )
+    txt = str(post["zh_cn"]["content"])
+    assert "下次类似问题我能直接从这里答" not in txt
+    assert "qa-archive.md" not in txt
+    assert "维护在飞书文档" in txt
+    # asker @ 仍在头部，闭环交付不变
+    assert any(
+        seg.get("tag") == "at" and seg.get("user_id") == "ou_a"
+        for para in post["zh_cn"]["content"]
+        for seg in para
+    )
 
 
 # ---------------------------------------------------------------------------
