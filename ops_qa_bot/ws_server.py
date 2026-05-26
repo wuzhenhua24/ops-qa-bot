@@ -1,4 +1,4 @@
-"""长连接模式：通过 lark-oapi SDK 的 WebSocket 客户端接收飞书事件。
+"""长连接模式：通过 lark-oapi 的 FeishuChannel(transport="ws") 接收飞书事件。
 
 相比 HTTP 模式（`feishu_server.py`）的差异：
 - 不需要开公网 HTTPS 入站端口、TLS 证书、反向代理、IP 白名单
@@ -7,12 +7,23 @@
 - 单进程只能服务一个 app_id
 
 业务逻辑（OpsQABot、SessionManager、反馈日志、占位消息等）完全复用
-`feishu_server.py` 里抽出来的 `handle_question` / `handle_feedback_click`。
+`feishu_core.py` 里抽出来的 `handle_question` / `handle_feedback_click` 等。
 
 飞书开放平台配置：
 - 事件订阅方式选 "长连接"（不配 Request URL）
 - 订阅事件：`im.message.receive_v1`、`card.action.trigger`
 - 消息卡片的"接收方式"选 "事件订阅"（对应 card.action.trigger）
+
+架构：
+- FeishuChannel 内部托管 WS 连接、自动重连、签名/token 校验、event-id
+  与 cardAction tag+value+operator 维度的 dedup、@所有人 检测
+- 消息事件走 channel.on("message", _on_inbound)，handler 拿规范化的
+  InboundMessage，直接在 channel 后台 loop 上 await 业务函数
+- 卡片回调走 channel.on("cardAction", _on_card_action)，handler 内部主动调
+  channel.update_card() 完成卡片顶替——channel 的 cardAction processor
+  是异步 schedule + 空响应模式，不支持飞书 v2 卡片回调的"同步 return 顶替"
+- SessionManager + HealthServer 都启动在 channel 后台 loop，所有业务
+  同一个 loop 跑，避免跨 loop asyncio.Lock 协调问题
 """
 
 from __future__ import annotations
@@ -20,33 +31,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 import time
-from pathlib import Path
+import uuid
 from typing import Any
 
-import lark_oapi as lark
-from cachetools import TTLCache
-from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
-from lark_oapi.event.callback.model.p2_card_action_trigger import (
-    P2CardActionTrigger,
-    P2CardActionTriggerResponse,
+from lark_oapi.channel import FeishuChannel
+from lark_oapi.channel.config import (
+    ChatQueueConfig,
+    PolicyConfig,
+    SafetyConfig,
+    TextBatchConfig,
 )
+from lark_oapi.channel.types import CardActionEvent, InboundMessage
 
 from .config import AppConfig
 from .feishu_core import (
     FeishuClient,
     SessionManager,
     _archive_ack_card,
-    _feedback_ack_card,
-    _clarify_giveup_ack_card,
     _extract_image_caption,
-    _feedback_reason_form_card,
-    _FOLLOWUP_LIBRARY,
-    _followup_ack_card,
     _followup_error_card,
     _parse_post_content,
-    get_archive_expected_owner,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
@@ -57,7 +62,6 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
-    is_at_all_broadcast,
 )
 from .health_server import HealthServer
 from .logging_config import request_id_var
@@ -65,12 +69,36 @@ from .logging_config import request_id_var
 logger = logging.getLogger("ops_qa_bot.ws")
 
 
+def _form_value(event: CardActionEvent) -> dict:
+    """从 CardActionEvent.raw 抽 form_value。
+
+    channel 的 CardActionPayload 只暴露 button payload (``action.value``)，
+    form 类元素（multi_select / input）的填写结果在 envelope 内部，要从
+    ``raw["event"]["action"]["form_value"]`` 挖。
+    """
+    try:
+        return event.raw["event"]["action"].get("form_value") or {}
+    except (KeyError, TypeError, AttributeError):
+        return {}
+
+
+def _normalize_reasons(form_value: dict) -> list[str] | None:
+    """multi_select_static 返回 list[str]；防御兼容历史 str 值（飞书 SDK
+    调整或回放旧事件时可能塞单字符串），统一归并成 list 喂给下游。"""
+    raw = form_value.get("reasons")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, str)]
+    return None
+
+
 class WsRunner:
     """长连接模式的运行主体。
 
-    - SDK 的事件回调是同步的（线程池里跑）→ 用 `run_coroutine_threadsafe` 桥接到 asyncio
-    - asyncio 主循环负责 SessionManager、业务流程、对外 httpx 调用
-    - WS 客户端在后台线程里阻塞 `start()`，asyncio 主循环永远 sleep
+    构造时建一个 FeishuChannel(transport="ws") 并注册 message / cardAction
+    handler。run() 启动 channel + SessionManager + HealthServer，全在 channel
+    的后台 loop 上跑。主 loop（run() 所在协程）只做"等关闭信号"的 sleep。
     """
 
     def __init__(self, config: AppConfig):
@@ -79,531 +107,260 @@ class WsRunner:
             raise RuntimeError(f"docs_root 缺少 INDEX.md: {docs_root}")
 
         self._config = config
-        self._feishu = FeishuClient(config.feishu.app_id, config.feishu.app_secret)
+
+        # channel policy / safety 配置跟 HTTP 路径对齐：
+        # - require_mention=False：飞书订阅 im.message.receive_v1 本身只在
+        #   群里 @bot 时推送，channel 这层重复检查关掉；
+        #   respond_to_mention_all=True 把 mentioned_all 决策让给 handler
+        # - text_batch.delay_ms=0：不批合并连发消息，保持"逐条处理"
+        # - chat_queue.enabled=False：不做 per-chat 串行；并发安全由
+        #   SessionManager 的 per-(chat,user) lock 兜底
+        self._channel = FeishuChannel(
+            app_id=config.feishu.app_id,
+            app_secret=config.feishu.app_secret,
+            transport="ws",
+            policy=PolicyConfig(
+                require_mention=False,
+                respond_to_mention_all=True,
+            ),
+            safety=SafetyConfig(
+                text_batch=TextBatchConfig(delay_ms=0),
+                chat_queue=ChatQueueConfig(enabled=False),
+            ),
+        )
+        # outbound 复用同一个 channel，避免双 token cache + 双 bot identity 查询
+        self._feishu = FeishuClient(channel=self._channel)
         self._session_mgr = SessionManager(
             docs_root=docs_root,
             idle_ttl=config.session_idle_ttl,
             doc_qa_config=config.doc_qa,
         )
-        # WS 下 SDK 一般自己去重，但保险起见我们也按 event_id/click key 兜一层
-        self._seen_events: TTLCache = TTLCache(maxsize=10000, ttl=600)
-        self._seen_clicks: TTLCache = TTLCache(maxsize=10000, ttl=600)
 
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._ws_thread: threading.Thread | None = None
         self._health: HealthServer | None = None
 
-        # 健康检查用的状态
+        # 健康检查 / 观测用的状态
         self._started_at: float = 0.0
         self._last_event_at: float = 0.0  # 最近一次成功收到事件
         self._event_count: int = 0
         self._click_count: int = 0
 
+        self._register_handlers()
+
     # ------------------------------------------------------------------
-    # 事件回调（SDK 从线程池调用，同步接口）
+    # channel 事件 handler
     # ------------------------------------------------------------------
 
-    def _on_message(self, event: P2ImMessageReceiveV1) -> None:
-        header = getattr(event, "header", None)
-        event_id = getattr(header, "event_id", None) if header else None
+    def _register_handlers(self) -> None:
+        self._channel.on("message", self._on_inbound)
+        self._channel.on("cardAction", self._on_card_action)
+        self._channel.on(
+            "reconnecting", lambda: logger.warning("ws reconnecting ...")
+        )
+        self._channel.on("reconnected", lambda: logger.info("ws reconnected"))
 
-        import uuid as _uuid
-        rid = event_id[:8] if event_id else "ws" + _uuid.uuid4().hex[:6]
-        request_id_var.set(rid)
+    async def _on_inbound(self, inbound: InboundMessage) -> None:
+        """消息事件 handler — 在 channel 后台 loop 上直接 await 业务函数。
 
-        # 收到事件就更新健康状态（任何路径都算"链路通"）
+        重复事件、签名校验、@所有人 检测、bot 自己发的消息全部由 channel 上游
+        处理，这里只负责"事件 → 业务函数"的路由。
+        """
+        event_id = inbound.id or uuid.uuid4().hex
+        request_id_var.set("ws" + event_id[:6])
+
         self._last_event_at = time.time()
         self._event_count += 1
 
-        # 去重
-        if event_id:
-            if event_id in self._seen_events:
-                logger.info("duplicate event, skip: event_id=%s", event_id)
-                return
-            self._seen_events[event_id] = True
+        chat_id = inbound.chat_id
+        sender_id = inbound.sender_id
+        msg_id = inbound.message_id
+        message_type = inbound.raw_content_type
 
-        data = event.event
-        msg = data.message if data else None
-        sender = data.sender if data else None
-        if not msg or not sender:
-            return
-        if sender.sender_type != "user":
-            return
-
-        chat_id = msg.chat_id
-        sender_id = sender.sender_id.open_id if sender.sender_id else None
-        msg_id = getattr(msg, "message_id", None)
-        message_type = msg.message_type
         if not chat_id or not sender_id or not message_type:
             return
-
-        # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
-        # 但全员通知不应触发答题。同时传 msg.content（JSON 字符串，含 text 字面）
-        # 兜底飞书 WS SDK 不在 mentions 里放 @_all 的 case。
-        if is_at_all_broadcast(msg.mentions, text=msg.content):
+        if inbound.sender.is_bot:
+            # 其他 bot 转发 / 应用广播 / 多 bot 群里互相 @ 形成的消息环路：不答题
+            return
+        if inbound.mentioned_all:
             logger.info(
                 "skip: @所有人 broadcast chat=%s user=%s type=%s",
-                chat_id,
-                sender_id,
-                message_type,
+                chat_id, sender_id, message_type,
             )
             return
 
-        # image 消息走视觉路径：解 image_key → 异步下载 → handle_question(images=...)
+        # image_key / post AST / caption 这些飞书原始 wire 字段还得从 raw 里挖；
+        # InboundMessage.raw 就是飞书 message dict（已经从 v2 envelope 剥出来）。
+        raw_content_str = (inbound.raw or {}).get("content") or "{}"
+        try:
+            content_dict = json.loads(raw_content_str)
+        except json.JSONDecodeError:
+            content_dict = {}
+
         if message_type == "image":
-            try:
-                content_dict = json.loads(msg.content or "{}")
-            except json.JSONDecodeError:
-                content_dict = {}
             image_key = content_dict.get("image_key")
             if not image_key or not msg_id:
                 logger.info(
                     "image message missing key/msg_id: chat=%s user=%s",
-                    chat_id,
-                    sender_id,
+                    chat_id, sender_id,
                 )
                 return
             caption = _extract_image_caption(content_dict)
-            if self._loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    handle_image_question(
-                        chat_id,
-                        sender_id,
-                        image_key,
-                        msg_id,
-                        self._feishu,
-                        self._session_mgr,
-                        caption=caption,
-                    ),
-                    self._loop,
-                )
+            await handle_image_question(
+                chat_id, sender_id, image_key, msg_id,
+                self._feishu, self._session_mgr,
+                caption=caption,
+            )
             return
 
-        # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
-        # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
-        # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
         if message_type == "post":
-            try:
-                content_dict = json.loads(msg.content or "{}")
-            except json.JSONDecodeError:
-                content_dict = {}
+            # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
+            # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
+            # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
             text, image_keys = _parse_post_content(content_dict)
-            if self._loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    handle_post_question(
-                        chat_id,
-                        sender_id,
-                        text,
-                        image_keys,
-                        msg_id,
-                        self._feishu,
-                        self._session_mgr,
-                    ),
-                    self._loop,
-                )
+            await handle_post_question(
+                chat_id, sender_id, text, image_keys, msg_id,
+                self._feishu, self._session_mgr,
+            )
             return
 
-        # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
         if message_type != "text":
+            # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
             logger.info(
                 "non-text message: type=%s chat=%s user=%s",
-                message_type,
-                chat_id,
-                sender_id,
+                message_type, chat_id, sender_id,
             )
-            if self._loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    handle_unsupported_message(
-                        chat_id, sender_id, msg_id, message_type, self._feishu
-                    ),
-                    self._loop,
-                )
+            await handle_unsupported_message(
+                chat_id, sender_id, msg_id, message_type, self._feishu
+            )
             return
 
-        try:
-            content = json.loads(msg.content or "{}")
-        except json.JSONDecodeError:
-            return
-        question = (content.get("text") or "").strip()
-        for mention in msg.mentions or []:
-            key = getattr(mention, "key", None)
-            if key:
-                question = question.replace(key, "").strip()
+        # text 消息：从原 content.text 抽问题，按 mentions[].key 去掉 @bot 占位符
+        question = (content_dict.get("text") or "").strip()
+        for m in inbound.mentions:
+            if m.key:
+                question = question.replace(m.key, "").strip()
         if not question:
             return
 
         logger.info(
             "ws message: chat=%s user=%s q=%r", chat_id, sender_id, question[:80]
         )
-
-        # 交给 asyncio 主循环跑业务
-        if self._loop is None:
-            logger.error("asyncio loop not initialized, drop event")
-            return
-        asyncio.run_coroutine_threadsafe(
-            handle_question(
-                chat_id,
-                sender_id,
-                question,
-                self._feishu,
-                self._session_mgr,
-                parent_msg_id=msg_id,
-            ),
-            self._loop,
+        await handle_question(
+            chat_id, sender_id, question,
+            self._feishu, self._session_mgr,
+            parent_msg_id=msg_id,
         )
 
-    def _on_card_action(
-        self, event: P2CardActionTrigger
-    ) -> P2CardActionTriggerResponse:
-        import uuid as _uuid
-        event_id = (
-            event.header.event_id
-            if getattr(event, "header", None) and event.header.event_id
-            else None
-        )
-        rid = "c" + (event_id[:7] if event_id else _uuid.uuid4().hex[:7])
-        request_id_var.set(rid)
+    async def _on_card_action(self, event: CardActionEvent) -> None:
+        """卡片回调 handler — 业务结果通过 channel.update_card 顶替原卡。
 
-        # 卡片点击同样算"链路通"
+        channel 内置 dedup key 是 ``card:{msg_id}:{operator.open_id}:{tag}:{value}``，
+        按 operator 分桶 —— 不同点击人有不同 dedup key，"非 asker 错点击闭锁 asker"
+        在这里不存在。dedup hit 时 channel 直接 drop 不顶替原卡，行为反而比旧的
+        "重试返回 replay 卡可能顶掉新状态"更稳。
+
+        权限校验失败（非 asker / 非 owner）由各 handler 内部走 reject 路径处理，
+        返回视觉等同原卡的 ack；外层统一 update_card 顶替一次，UX 上无差异。
+        """
+        request_id_var.set("c" + uuid.uuid4().hex[:7])
+
         self._last_event_at = time.time()
         self._click_count += 1
 
-        data = event.event
-        if not data or not data.action or not data.action.value:
-            return P2CardActionTriggerResponse({})
-        value = data.action.value
+        action = event.action
+        value = action.value if isinstance(action.value, dict) else {}
         action_name = value.get("action")
-        clicker_id = data.operator.open_id if data.operator else None
-        msg_id = data.context.open_message_id if data.context else ""
+        msg_id = event.message_id
+        clicker_id = event.operator.open_id or None
+        form_value = _form_value(event)
 
-        if action_name == "feedback":
-            qid = value.get("qid")
-            rating = value.get("rating")
-            asker_id = value.get("asker_id")
-            if not qid or rating not in ("up", "down"):
-                return P2CardActionTriggerResponse({})
-            # 非 asker 点击不进 dedup 缓存：缓存了之后第二次点击会被认作"重试"走 replay
-            # 路径返回 form/ack（错的），把 asker 的原卡顶掉。直接走 handler 走拒绝
-            # 路径，它会记 feedback_rejected 日志 + 返回原反馈卡（视觉无变化）。
-            if clicker_id and asker_id and clicker_id != asker_id:
+        ack_card: dict | None = None
+        try:
+            if action_name == "feedback":
+                qid = value.get("qid")
+                rating = value.get("rating")
+                asker_id = value.get("asker_id")
+                if not qid or rating not in ("up", "down"):
+                    return
                 ack_card = handle_feedback_click(
-                    qid=qid,
-                    rating=rating,
-                    clicker_id=clicker_id,
-                    asker_id=asker_id,
+                    qid=qid, rating=rating,
+                    clicker_id=clicker_id, asker_id=asker_id,
                 )
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": ack_card}}
-                )
-            # 去重：点击重试场景
-            click_key = f"{msg_id}|{qid}|{clicker_id}|{rating}"
-            if click_key in self._seen_clicks:
-                logger.info("duplicate card click, skip: key=%s", click_key)
-                # 重试要返回和首次一致的卡片，否则 👎 的原因表单会被 ack 顶掉
-                replay = (
-                    _feedback_reason_form_card(qid, asker_id)
-                    if rating == "down"
-                    else _feedback_ack_card(rating)
-                )
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": replay}}
-                )
-            self._seen_clicks[click_key] = True
-            ack_card = handle_feedback_click(
-                qid=qid,
-                rating=rating,
-                clicker_id=clicker_id,
-                asker_id=asker_id,
-            )
-            # v2 卡片回调响应格式：{"type": "raw", "data": <card json>}
-            return P2CardActionTriggerResponse(
-                {"card": {"type": "raw", "data": ack_card}}
-            )
 
-        if action_name in ("feedback_reason_submit", "feedback_reason_skip"):
-            qid = value.get("qid")
-            asker_id = value.get("asker_id")
-            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。reason 表单这边
-            # 风险更高——缓存了之后 replay 直接返回 ack，会把 asker 还在填的表单顶成 ack。
-            if clicker_id and asker_id and clicker_id != asker_id:
-                if action_name == "feedback_reason_skip":
-                    ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
-                else:
-                    form_value = data.action.form_value or {}
-                    raw_reasons = form_value.get("reasons")
-                    if isinstance(raw_reasons, str):
-                        reasons = [raw_reasons]
-                    elif isinstance(raw_reasons, list):
-                        reasons = [r for r in raw_reasons if isinstance(r, str)]
-                    else:
-                        reasons = None
-                    comment = form_value.get("comment") or None
-                    ack_card = handle_feedback_reason_submit(
-                        qid, reasons, comment, clicker_id, asker_id
-                    )
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": ack_card}}
-                )
-            click_key = f"{msg_id}|reason|{qid}|{clicker_id}|{action_name}"
-            if click_key in self._seen_clicks:
-                logger.info("duplicate reason click, skip: key=%s", click_key)
-                return P2CardActionTriggerResponse(
-                    {
-                        "card": {
-                            "type": "raw",
-                            "data": _feedback_ack_card("down"),
-                        }
-                    }
-                )
-            self._seen_clicks[click_key] = True
-            if action_name == "feedback_reason_skip":
-                ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
-            else:
-                form_value = data.action.form_value or {}
-                # multi_select_static 返回 list[str]；防御兼容历史 str 值（飞书 SDK
-                # 调整或回放旧事件时可能塞单字符串），统一归并成 list 喂给下游
-                raw_reasons = form_value.get("reasons")
-                if isinstance(raw_reasons, str):
-                    reasons = [raw_reasons]
-                elif isinstance(raw_reasons, list):
-                    reasons = [r for r in raw_reasons if isinstance(r, str)]
-                else:
-                    reasons = None
+            elif action_name == "feedback_reason_submit":
+                qid = value.get("qid")
+                asker_id = value.get("asker_id")
+                reasons = _normalize_reasons(form_value)
                 comment = form_value.get("comment") or None
                 ack_card = handle_feedback_reason_submit(
                     qid, reasons, comment, clicker_id, asker_id
                 )
-            return P2CardActionTriggerResponse(
-                {"card": {"type": "raw", "data": ack_card}}
-            )
 
-        if action_name == "followup":
-            qid = value.get("qid")
-            key = value.get("key")
-            chat_id_v = value.get("chat_id")
-            asker_id = value.get("asker_id")
-            parent_msg_id_v = value.get("parent_msg_id")
-            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。
-            if (
-                clicker_id
-                and asker_id
-                and clicker_id != asker_id
-                and self._loop is not None
-            ):
-                fut = asyncio.run_coroutine_threadsafe(
-                    handle_followup_click(
-                        qid,
-                        key,
-                        chat_id_v,
-                        asker_id,
-                        clicker_id,
-                        self._feishu,
-                        self._session_mgr,
-                        parent_msg_id=parent_msg_id_v,
-                    ),
-                    self._loop,
-                )
+            elif action_name == "feedback_reason_skip":
+                qid = value.get("qid")
+                asker_id = value.get("asker_id")
+                ack_card = handle_feedback_reason_skip(qid, clicker_id, asker_id)
+
+            elif action_name == "followup":
+                qid = value.get("qid")
+                key = value.get("key")
+                chat_id_v = value.get("chat_id")
+                asker_id = value.get("asker_id")
+                parent_msg_id_v = value.get("parent_msg_id")
                 try:
-                    ack_card = fut.result(timeout=5)
+                    ack_card = await handle_followup_click(
+                        qid, key, chat_id_v, asker_id, clicker_id,
+                        self._feishu, self._session_mgr,
+                        parent_msg_id=parent_msg_id_v,
+                    )
                 except Exception:
                     logger.exception(
                         "followup click failed: qid=%s key=%s", qid, key
                     )
                     ack_card = _followup_error_card("追问触发失败，请重试。")
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": ack_card}}
-                )
-            click_key = f"{msg_id}|followup|{qid}|{key}|{clicker_id}"
-            if click_key in self._seen_clicks:
-                logger.info("duplicate followup click, skip: key=%s", click_key)
-                if key in _FOLLOWUP_LIBRARY:
-                    replay = _followup_ack_card(_FOLLOWUP_LIBRARY[key][0])
-                else:
-                    replay = _followup_error_card("追问类型无效。")
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": replay}}
-                )
-            self._seen_clicks[click_key] = True
-            if self._loop is None:
-                return P2CardActionTriggerResponse(
-                    {
-                        "card": {
-                            "type": "raw",
-                            "data": _followup_error_card("服务未就绪，请稍后再试。"),
-                        }
-                    }
-                )
-            fut = asyncio.run_coroutine_threadsafe(
-                handle_followup_click(
-                    qid,
-                    key,
-                    chat_id_v,
-                    asker_id,
-                    clicker_id,
-                    self._feishu,
-                    self._session_mgr,
-                    parent_msg_id=parent_msg_id_v,
-                ),
-                self._loop,
-            )
-            try:
-                ack_card = fut.result(timeout=5)
-            except Exception:
-                logger.exception("followup click failed: qid=%s key=%s", qid, key)
-                ack_card = _followup_error_card("追问触发失败，请重试。")
-            return P2CardActionTriggerResponse(
-                {"card": {"type": "raw", "data": ack_card}}
-            )
 
-        if action_name == "clarify_giveup":
-            qid = value.get("qid")
-            chat_id_v = value.get("chat_id")
-            asker_id = value.get("asker_id")
-            parent_msg_id_v = value.get("parent_msg_id")
-            # 非 asker 不进 dedup 缓存：见 feedback 分支同样的注释。
-            if (
-                clicker_id
-                and asker_id
-                and clicker_id != asker_id
-                and self._loop is not None
-            ):
-                fut = asyncio.run_coroutine_threadsafe(
-                    handle_clarify_giveup_click(
-                        qid,
-                        chat_id_v,
-                        asker_id,
-                        clicker_id,
-                        self._feishu,
-                        self._session_mgr,
-                        parent_msg_id=parent_msg_id_v,
-                    ),
-                    self._loop,
-                )
+            elif action_name == "clarify_giveup":
+                qid = value.get("qid")
+                chat_id_v = value.get("chat_id")
+                asker_id = value.get("asker_id")
+                parent_msg_id_v = value.get("parent_msg_id")
                 try:
-                    ack_card = fut.result(timeout=5)
+                    ack_card = await handle_clarify_giveup_click(
+                        qid, chat_id_v, asker_id, clicker_id,
+                        self._feishu, self._session_mgr,
+                        parent_msg_id=parent_msg_id_v,
+                    )
                 except Exception:
                     logger.exception("clarify_giveup click failed: qid=%s", qid)
                     ack_card = _followup_error_card("触发失败，请重试。")
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": ack_card}}
-                )
-            click_key = f"{msg_id}|clarify_giveup|{qid}|{clicker_id}"
-            if click_key in self._seen_clicks:
-                logger.info(
-                    "duplicate clarify_giveup click, skip: key=%s", click_key
-                )
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": _clarify_giveup_ack_card()}}
-                )
-            self._seen_clicks[click_key] = True
-            if self._loop is None:
-                return P2CardActionTriggerResponse(
-                    {
-                        "card": {
-                            "type": "raw",
-                            "data": _followup_error_card("服务未就绪，请稍后再试。"),
-                        }
-                    }
-                )
-            fut = asyncio.run_coroutine_threadsafe(
-                handle_clarify_giveup_click(
-                    qid,
-                    chat_id_v,
-                    asker_id,
-                    clicker_id,
-                    self._feishu,
-                    self._session_mgr,
-                    parent_msg_id=parent_msg_id_v,
-                ),
-                self._loop,
-            )
-            try:
-                ack_card = fut.result(timeout=5)
-            except Exception:
-                logger.exception("clarify_giveup click failed: qid=%s", qid)
-                ack_card = _followup_error_card("触发失败，请重试。")
-            return P2CardActionTriggerResponse(
-                {"card": {"type": "raw", "data": ack_card}}
-            )
 
-        if action_name == "archive_submit":
-            qid = value.get("qid")
-            form_value = data.action.form_value or {}
-            answer = form_value.get("answer") or ""
-            question = form_value.get("question") or ""
-            # 非 owner 提交不进 dedup 缓存：见 feedback 分支同样的注释。这里风险更高
-            # ——dedup 命中后 replay 直接返回 ack，会把 owner 还在填的表单顶成 ack。
-            expected_owner = get_archive_expected_owner(qid)
-            if (
-                clicker_id
-                and expected_owner
-                and clicker_id != expected_owner
-                and self._loop is not None
-            ):
-                fut = asyncio.run_coroutine_threadsafe(
-                    handle_archive_submit(
-                        qid,
-                        question,
-                        answer,
-                        clicker_id,
-                        self._config.docs_root,
-                        feishu=self._feishu,
-                    ),
-                    self._loop,
-                )
+            elif action_name == "archive_submit":
+                qid = value.get("qid")
+                answer = form_value.get("answer") or ""
+                question = form_value.get("question") or ""
                 try:
-                    ack_card = fut.result(timeout=15)
+                    ack_card = await handle_archive_submit(
+                        qid, question, answer, clicker_id,
+                        self._config.docs_root, feishu=self._feishu,
+                    )
                 except Exception:
                     logger.exception("archive submit failed: qid=%s", qid)
                     ack_card = _archive_ack_card("❌", "归档失败，请联系管理员。")
-                return P2CardActionTriggerResponse(
-                    {"card": {"type": "raw", "data": ack_card}}
-                )
-            click_key = f"{msg_id}|archive|{qid}|{clicker_id}"
-            if click_key in self._seen_clicks:
-                logger.info("duplicate archive submit, skip: key=%s", click_key)
-                return P2CardActionTriggerResponse(
-                    {
-                        "card": {
-                            "type": "raw",
-                            "data": _archive_ack_card("ℹ️", "已处理。"),
-                        }
-                    }
-                )
-            self._seen_clicks[click_key] = True
-            if self._loop is None:
-                return P2CardActionTriggerResponse(
-                    {
-                        "card": {
-                            "type": "raw",
-                            "data": _archive_ack_card(
-                                "❌", "服务未就绪，请稍后再试。"
-                            ),
-                        }
-                    }
-                )
-            # SDK 在线程池里同步调本回调，转发到 asyncio 主 loop 跑写盘逻辑
-            fut = asyncio.run_coroutine_threadsafe(
-                handle_archive_submit(
-                    qid,
-                    question,
-                    answer,
-                    clicker_id,
-                    self._config.docs_root,
-                    feishu=self._feishu,
-                ),
-                self._loop,
-            )
-            try:
-                ack_card = fut.result(timeout=15)
-            except Exception:
-                logger.exception("archive submit failed: qid=%s", qid)
-                ack_card = _archive_ack_card("❌", "归档失败，请联系管理员。")
-            return P2CardActionTriggerResponse(
-                {"card": {"type": "raw", "data": ack_card}}
-            )
+            else:
+                return  # 其他类型的按钮暂不处理
+        except Exception:
+            logger.exception("cardAction handler failed: action=%s", action_name)
+            return
 
-        return P2CardActionTriggerResponse({})
+        if ack_card is None or not msg_id:
+            return
+        # 异步 patch 顶替原卡。channel safety pipeline 已经在 handler 跑之前
+        # mark dedup（finally 路径），update_card 失败不会自动重试。日志报警足够。
+        result = await self._channel.update_card(msg_id, ack_card)
+        if not result.success:
+            logger.error(
+                "update_card failed: msg_id=%s action=%s err=%s",
+                msg_id, action_name, result.error,
+            )
 
     # ------------------------------------------------------------------
     # 健康检查端点
@@ -618,30 +375,25 @@ class WsRunner:
         }
 
     async def _h_readyz(self) -> tuple[int, dict[str, Any]]:
-        """readiness：asyncio loop 跑得到这里 + WS 客户端线程还活着就算 ready。
+        """readiness：channel.is_ready 为 True 即算 ready。
 
-        不拿"业务事件新鲜度"做判定 —— 低流量时会误报，真断连时又迟报。
-        事件计数 / 上次事件距今多久仅作为观测字段返回，不参与 ready 判定。
-        真断连的兜底靠 SDK 自身重连 + 进程退出后 systemd 拉起。
+        channel.is_ready 在 WS 自动重连期间保持 True（SDK 内部处理重连，
+        业务无感）。真断连退不出 → systemd 拉起兜底。
+        事件计数 / 距上次事件时间仅作为观测，不参与 ready 判定 —— 低流量时
+        会误报，真断连时又迟报。
         """
         now = time.time()
         uptime = now - self._started_at
         last = self._last_event_at
         idle = (now - last) if last > 0 else None
 
-        ws_thread = self._ws_thread
-        ws_alive = ws_thread is not None and ws_thread.is_alive()
-        if ws_thread is None:
-            ready, reason = False, "ws client thread not started yet"
-        elif not ws_alive:
-            ready, reason = False, "ws client thread has exited"
-        else:
-            ready, reason = True, "ok"
+        ready = self._channel.is_ready
+        reason = "ok" if ready else "channel not ready"
 
         return (200 if ready else 503), {
             "ready": ready,
             "reason": reason,
-            "ws_thread_alive": ws_alive,
+            "channel_ready": ready,
             "last_event_age_seconds": round(idle, 1) if idle is not None else None,
             "uptime_seconds": round(uptime, 1),
             "event_count": self._event_count,
@@ -660,33 +412,13 @@ class WsRunner:
     # 生命周期
     # ------------------------------------------------------------------
 
-    def _build_ws_client(self) -> lark.ws.Client:
-        handler = (
-            lark.EventDispatcherHandler.builder("", "")
-            .register_p2_im_message_receive_v1(self._on_message)
-            .register_p2_card_action_trigger(self._on_card_action)
-            .build()
-        )
-        return lark.ws.Client(
-            self._config.feishu.app_id,
-            self._config.feishu.app_secret,
-            event_handler=handler,
-        )
+    async def _bootstrap(self) -> None:
+        """在 channel 后台 loop 上启动 SessionManager + HealthServer。
 
-    async def run(self) -> None:
-        """主入口：启动 asyncio 主循环 + 后台 WS 线程 + 健康检查 server。"""
-        self._loop = asyncio.get_running_loop()
-        self._started_at = time.time()
+        都跑在同一个 loop 上 —— session_mgr.snapshot() 跨 loop 调会因为
+        asyncio.Lock 的 Future loop 绑定踩坑。
+        """
         await self._session_mgr.start()
-
-        # 先把 WS 线程拉起来再开 health server，避免 /readyz 在
-        # "health up 但 _ws_thread 还是 None" 的毫秒级窗口里误报 503
-        ws_client = self._build_ws_client()
-        self._ws_thread = threading.Thread(
-            target=ws_client.start, daemon=True, name="lark-ws-client"
-        )
-        self._ws_thread.start()
-
         if self._config.health.enabled:
             self._health = HealthServer(
                 host=self._config.health.host,
@@ -698,6 +430,27 @@ class WsRunner:
                 },
             )
             await self._health.start()
+
+    async def _teardown(self) -> None:
+        if self._health is not None:
+            await self._health.stop()
+            self._health = None
+        await self._session_mgr.stop()
+
+    async def run(self) -> None:
+        """主入口：启动 channel + SessionManager + HealthServer。"""
+        self._started_at = time.time()
+
+        # channel.connect() 在 ws 模式下：建后台 loop+thread、同步 fetch bot
+        # identity（10s 超时；失败进 retry loop 不阻塞）、建 dispatcher、
+        # 启 WSClient（连上飞书 + 后台跑 ws 收发循环）。
+        await self._channel.connect()
+
+        # 把 SessionManager + HealthServer 启动到 channel 后台 loop。
+        # 业务 handler 也在那个 loop 跑，全局单 loop 简化锁语义。
+        fut = self._channel.schedule(self._bootstrap())
+        await asyncio.wrap_future(fut)
+
         logger.info(
             "ws server started: app_id=%s docs_root=%s idle_ttl=%ss",
             self._config.feishu.app_id,
@@ -706,15 +459,17 @@ class WsRunner:
         )
 
         try:
-            # 主协程永远等着，让 SDK 线程和业务协程跑起来
+            # 主协程永远等着，让 channel 后台 loop + handler 协程跑业务
             while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("ws server stopping, closing sessions ...")
-            if self._health is not None:
-                await self._health.stop()
-                self._health = None
-            await self._session_mgr.stop()
+            logger.info("ws server stopping ...")
+            try:
+                fut = self._channel.schedule(self._teardown())
+                await asyncio.wrap_future(fut)
+            except Exception:
+                logger.exception("teardown failed")
+            await self._channel.disconnect()
             logger.info("ws server stopped")
