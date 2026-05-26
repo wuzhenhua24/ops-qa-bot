@@ -1,142 +1,57 @@
 """把 markdown 文本转成飞书 post 消息结构。
 
-飞书 post 是结构化富文本，不支持完整 markdown。本模块覆盖常见语法：
-
-- 标题 `#` / `##` / `###`   → 加粗整行
-- 粗体 `**text**`            → bold
-- 斜体 `*text*`              → italic
-- 行内代码 `` `code` ``      → 保留反引号原样（post 无代码样式）
-- 围栏代码块 ``` ```lang...``` ``` → post `code_block` 元素（带 language，等宽 + 高亮）
-- 链接 `[text](url)`         → a 标签
-- 无序列表 `- item` / `* item` → 前缀 `• `
-- 有序列表 `1. item`         → 保留原格式
-- 空行                       → 空段落
-
-不支持：嵌套粗斜体、表格、图片。
+markdown 解析（粗体/斜体/链接/列表/标题/代码块/strikethrough/水平线/at 标签/...）
+委托给 lark-oapi 的 ``markdown_to_post_ast``——比我们之前手写的解析器覆盖更全，
+后续 markdown 解析改进/修复跟着 SDK 走。本模块只额外处理业务专属的
+``<<IMG_KEY:xxx>>`` 独立行占位符：bot 在答题流程里把 LLM 的 ``<<IMG:path>>``
+校验/上传后替换成 ``<<IMG_KEY:img_xxx>>``，渲染层把这种独立行转成飞书 post
+的 img 段。行内嵌入（行中混文字）不识别。
 """
+
+from __future__ import annotations
 
 import re
 from typing import Any
 
-_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
-_INLINE_RE = re.compile(
-    r"\*\*(?P<bold>[^*]+)\*\*"
-    r"|\*(?P<italic>[^*]+)\*"
-    r"|`(?P<code>[^`]+)`"
-)
+from lark_oapi.channel.outbound.markdown import markdown_to_post_ast
 
-
-def _parse_bold_italic_code(text: str) -> list[dict[str, Any]]:
-    """解析 bold/italic/inline-code，返回 post span 列表。"""
-    spans: list[dict[str, Any]] = []
-    last = 0
-    for m in _INLINE_RE.finditer(text):
-        if m.start() > last:
-            spans.append({"tag": "text", "text": text[last:m.start()]})
-        if m.group("bold") is not None:
-            spans.append({"tag": "text", "text": m.group("bold"), "style": ["bold"]})
-        elif m.group("italic") is not None:
-            spans.append({"tag": "text", "text": m.group("italic"), "style": ["italic"]})
-        elif m.group("code") is not None:
-            spans.append({"tag": "text", "text": f"`{m.group('code')}`"})
-        last = m.end()
-    if last < len(text):
-        spans.append({"tag": "text", "text": text[last:]})
-    return spans
-
-
-def _inline_spans(text: str) -> list[dict[str, Any]]:
-    """先抽出链接，再对 plain text 部分解析 bold/italic/code。"""
-    spans: list[dict[str, Any]] = []
-    pos = 0
-    for m in _LINK_RE.finditer(text):
-        if m.start() > pos:
-            spans.extend(_parse_bold_italic_code(text[pos:m.start()]))
-        spans.append({"tag": "a", "text": m.group(1), "href": m.group(2)})
-        pos = m.end()
-    if pos < len(text):
-        spans.extend(_parse_bold_italic_code(text[pos:]))
-    if not spans:
-        spans.append({"tag": "text", "text": ""})
-    return spans
-
-
-# 已上传到飞书的图片占位行：bot 在答题流程里把 LLM 的 <<IMG:path>> 校验/上传后
-# 替换成 <<IMG_KEY:img_xxx>>，渲染层把这种独立行转成飞书 post 的 img 段。
 _IMG_KEY_LINE_RE = re.compile(r"^<<IMG_KEY:([A-Za-z0-9_-]+)>>$")
 
 
 def markdown_to_feishu_post(markdown: str, title: str = "") -> dict[str, Any]:
     """转为飞书 post 消息的 content 字典。
 
-    返回值可直接序列化后放入飞书 API 的 `content` 字段：
+    返回值可直接序列化后放入飞书 API 的 ``content`` 字段::
+
         msg_type = "post"
         content  = json.dumps(markdown_to_feishu_post(text, "标题"))
+
+    实现：按 ``<<IMG_KEY:xxx>>`` 独立行 split，文本段交给 SDK 的
+    ``markdown_to_post_ast``，img 段拼成飞书 post 的 ``tag:img`` 元素。
     """
     paragraphs: list[list[dict[str, Any]]] = []
-    in_code = False
-    code_lang = ""
-    code_lines: list[str] = []
+    text_buf: list[str] = []
 
-    def _flush_code_block() -> None:
-        # 关栏时调用：把累积的行整段塞进一个 code_block 元素，一段一个块。
-        # language 留空也合法，飞书会按纯代码块渲染（仍是等宽 + 边框）。
-        block: dict[str, Any] = {"tag": "code_block", "text": "\n".join(code_lines)}
-        if code_lang:
-            block["language"] = code_lang
-        paragraphs.append([block])
+    def _flush_text() -> None:
+        if not text_buf:
+            return
+        md = "\n".join(text_buf)
+        # SDK 的 markdown_to_post_ast 内部对纯空白段做了去重——这是有意的，
+        # 飞书 post 段落本身有间距，不需要显式空段落
+        ast = markdown_to_post_ast(md)
+        paragraphs.extend(ast["zh_cn"]["content"])
+        text_buf.clear()
 
     for raw in markdown.splitlines():
-        stripped = raw.lstrip()
-
-        # 围栏代码块：开栏抓 language，关栏整段输出一个 code_block 元素
-        if stripped.startswith("```"):
-            if in_code:
-                _flush_code_block()
-                in_code = False
-                code_lang = ""
-                code_lines = []
-            else:
-                in_code = True
-                # ```python / ```bash 等 → 取 ``` 之后的语言标记
-                code_lang = stripped[3:].strip()
-                code_lines = []
-            continue
-        if in_code:
-            code_lines.append(raw)
-            continue
-
-        # 已上传图占位：放在围栏判定后、空行/标题前，让 IMG_KEY 行不会被当作普通文本。
-        # 行内嵌入（行中混文字）不识别，要求 LLM 独立行写。
-        img_m = _IMG_KEY_LINE_RE.match(stripped)
-        if img_m:
-            paragraphs.append([{"tag": "img", "image_key": img_m.group(1)}])
-            continue
-
-        # 空行
-        if stripped == "":
-            paragraphs.append([{"tag": "text", "text": ""}])
-            continue
-
-        # 标题
-        for prefix in ("### ", "## ", "# "):
-            if stripped.startswith(prefix):
-                paragraphs.append(
-                    [{"tag": "text", "text": stripped[len(prefix):], "style": ["bold"]}]
-                )
-                break
+        m = _IMG_KEY_LINE_RE.match(raw.strip())
+        if m:
+            _flush_text()
+            paragraphs.append([{"tag": "img", "image_key": m.group(1)}])
         else:
-            # 无序列表
-            if stripped.startswith("- ") or stripped.startswith("* "):
-                spans: list[dict[str, Any]] = [{"tag": "text", "text": "• "}]
-                spans.extend(_inline_spans(stripped[2:]))
-                paragraphs.append(spans)
-            else:
-                paragraphs.append(_inline_spans(raw))
+            text_buf.append(raw)
+    _flush_text()
 
-    # LLM 偶尔会忘了闭合围栏（被 max_tokens 截断 / 输出格式抖动），EOF 时
-    # 兜底把累积的代码也作为 code_block 输出，免得用户看不到这段代码
-    if in_code:
-        _flush_code_block()
+    if not paragraphs:
+        paragraphs = [[{"tag": "text", "text": ""}]]
 
     return {"zh_cn": {"title": title, "content": paragraphs}}
