@@ -10,13 +10,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
 from cachetools import TTLCache
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
+from lark_oapi.channel import FeishuChannel
+from lark_oapi.channel.config import (
+    ChatQueueConfig,
+    PolicyConfig,
+    SafetyConfig,
+    TextBatchConfig,
+)
+from lark_oapi.channel.types import InboundMessage
 
 from .config import AppConfig
 from .feishu_core import (
@@ -42,7 +51,6 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
-    is_at_all_broadcast,
 )
 from .feishu_crypto import FeishuCrypto
 from .logging_config import request_id_var
@@ -50,71 +58,187 @@ from .logging_config import request_id_var
 logger = logging.getLogger("ops_qa_bot.feishu.http")
 
 
-def _extract_event(
-    event: dict,
-) -> tuple[str | None, str | None, str | None, str | None, str | None]:
-    """从飞书事件抽出 (chat_id, sender_open_id, question, message_id, message_type)。
-
-    message_id 用于让 bot 后续所有消息都"引用回复"这条原消息，连发多问时归属清晰。
-    sender 不是真人或缺关键字段时全 None；非 text 消息时 question 为 None 但
-    chat_id/sender_id/msg_id/message_type 仍返回，让 caller 决定是答题还是回不支持提示。
-    """
-    msg = event.get("message") or {}
-    chat_id = msg.get("chat_id")
-    msg_id = msg.get("message_id")
-    message_type = msg.get("message_type")
-
-    sender = event.get("sender") or {}
-    # 只处理真人发送的消息：过滤 sender_type != "user"，避免其他 bot 转发、
-    # 应用广播、甚至多 bot 群里互相 @ 形成的消息环路触发答题。
-    if sender.get("sender_type") != "user":
-        return None, None, None, None, None
-    sender_id = (sender.get("sender_id") or {}).get("open_id")
-    if not chat_id or not sender_id or not message_type:
-        return None, None, None, None, None
-
-    if message_type != "text":
-        return chat_id, sender_id, None, msg_id, message_type
-
-    try:
-        content = json.loads(msg.get("content") or "{}")
-    except json.JSONDecodeError:
-        return chat_id, sender_id, None, msg_id, message_type
-    question = (content.get("text") or "").strip()
-    # 群聊里去掉 @bot 的提及占位符
-    for mention in msg.get("mentions") or []:
-        key = mention.get("key")
-        if key:
-            question = question.replace(key, "").strip()
-    return chat_id, sender_id, (question or None), msg_id, message_type
-
-
 def create_app(config: AppConfig) -> FastAPI:
     docs_root = config.docs_root
     if not (docs_root / "INDEX.md").is_file():
         raise RuntimeError(f"docs_root 缺少 INDEX.md: {docs_root}")
 
-    verify_token = config.feishu.verify_token
     card_verify_token = config.feishu.card_verify_token
     admin_token = config.admin_token
     idle_ttl = config.session_idle_ttl
 
-    feishu = FeishuClient(config.feishu.app_id, config.feishu.app_secret)
+    # 消息事件 webhook 走 FeishuChannel——它内置：AES 解密、签名校验、verify_token、
+    # url_verification challenge、event-id dedup、@所有人 检测（mentioned_all 字段）。
+    # outbound 用同一个 channel 实例，避免重复的 token cache + bot identity 查询。
+    #
+    # safety/policy 配置说明：
+    # - 飞书事件订阅 im.message.receive_v1 已经在订阅层过滤了"群里 @bot 才推送"，
+    #   所以 require_mention=False 关掉 channel 这层重复检查；
+    #   respond_to_mention_all=True 把 mentioned_all 决策让给我们 handler。
+    # - 不批合并消息（delay_ms=0）、不做 per-chat 串行（chat_queue.enabled=False），
+    #   保持现有"逐条处理"语义；并发安全由 SessionManager 的 per-(chat,user) lock 兜底。
+    webhook_channel = FeishuChannel(
+        app_id=config.feishu.app_id,
+        app_secret=config.feishu.app_secret,
+        encrypt_key=config.feishu.encrypt_key or None,
+        verification_token=config.feishu.verify_token or None,
+        transport="webhook",
+        policy=PolicyConfig(
+            require_mention=False,
+            respond_to_mention_all=True,
+        ),
+        safety=SafetyConfig(
+            text_batch=TextBatchConfig(delay_ms=0),
+            chat_queue=ChatQueueConfig(enabled=False),
+        ),
+    )
+
+    feishu = FeishuClient(channel=webhook_channel)
     session_mgr = SessionManager(
         docs_root=docs_root, idle_ttl=idle_ttl, doc_qa_config=config.doc_qa
     )
 
-    # 配置了 encrypt_key 就启用签名校验 + AES 解密，否则维持原行为（依赖 verify_token + IP 白名单）
+    # 卡片回调路径还保留旧的同步响应模式（飞书要求 3s 内同步返回新卡顶替原卡），
+    # channel.on("cardAction") 是异步 schedule 模式对不上，所以 /feishu/card 路由
+    # 沿用 FeishuCrypto + 手写校验 + 同步分发的老逻辑。
     crypto: FeishuCrypto | None = (
         FeishuCrypto(config.feishu.encrypt_key) if config.feishu.encrypt_key else None
     )
 
-    # 飞书事件/卡片回调在超时或网络抖动时会重试，用 TTLCache 按 event_id
-    # 和 (message_id, qid, rating) 做幂等，10 分钟窗口覆盖飞书重试周期。
-    # asyncio 单线程下，TTLCache 的 __contains__ / __setitem__ 都不 await，
-    # 查-写之间不会被抢占，无须额外加锁。
-    seen_events: TTLCache = TTLCache(maxsize=10000, ttl=600)
+    # 卡片回调的幂等键：(message_id, qid, rating) 组合，10 分钟窗口覆盖飞书重试。
+    # 消息事件的 event-id dedup 已经被 channel.SafetyPipeline 接管。
     seen_clicks: TTLCache = TTLCache(maxsize=10000, ttl=600)
+
+    # 业务函数（handle_question 等）跑在 fastapi 主 loop 上（session_mgr 也在主 loop
+    # 启动）；channel 的 on("message") handler 跑在 channel 的后台 loop 上，
+    # 通过 run_coroutine_threadsafe 把业务 schedule 到主 loop，避免跨 loop
+    # asyncio.Lock 协调问题。
+    fastapi_loop_ref: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
+
+    async def _on_inbound(inbound: InboundMessage) -> None:
+        """channel.on("message") handler — 在 channel bg loop 上跑。
+
+        从 InboundMessage 解出业务参数，fire-and-forget 调度到 fastapi 主 loop。
+        重复事件、url_verification、签名校验、@所有人 过滤、bot 自己发的消息全部
+        由 channel 上游处理，这里只负责"事件 → 业务函数"的路由。
+        """
+        rid = (inbound.id or uuid.uuid4().hex)[:8]
+        request_id_var.set(rid)
+
+        chat_id = inbound.chat_id
+        sender_id = inbound.sender_id
+        msg_id = inbound.message_id
+        message_type = inbound.raw_content_type
+
+        if not chat_id or not sender_id or not message_type:
+            return
+        if inbound.sender.is_bot:
+            # 其他 bot 转发 / 应用广播 / 多 bot 群里互相 @ 形成的消息环路：不答题
+            return
+        if inbound.mentioned_all:
+            logger.info(
+                "skip: @所有人 broadcast chat=%s user=%s type=%s",
+                chat_id,
+                sender_id,
+                message_type,
+            )
+            return
+
+        fastapi_loop = fastapi_loop_ref["loop"]
+        if fastapi_loop is None:
+            logger.error("fastapi loop not ready, drop event")
+            return
+
+        # image_key / post AST / caption 这些飞书原始 wire 字段还得从 raw 里挖；
+        # InboundMessage.raw 就是飞书 message dict（已经从 v2 envelope 剥出来）。
+        raw_content_str = (inbound.raw or {}).get("content") or "{}"
+        try:
+            content_dict = json.loads(raw_content_str)
+        except json.JSONDecodeError:
+            content_dict = {}
+
+        if message_type == "image":
+            image_key = content_dict.get("image_key")
+            if not image_key or not msg_id:
+                logger.info(
+                    "image message missing key/msg_id: chat=%s user=%s",
+                    chat_id,
+                    sender_id,
+                )
+                return
+            caption = _extract_image_caption(content_dict)
+            asyncio.run_coroutine_threadsafe(
+                handle_image_question(
+                    chat_id,
+                    sender_id,
+                    image_key,
+                    msg_id,
+                    feishu,
+                    session_mgr,
+                    caption=caption,
+                ),
+                fastapi_loop,
+            )
+            return
+
+        if message_type == "post":
+            text, image_keys = _parse_post_content(content_dict)
+            asyncio.run_coroutine_threadsafe(
+                handle_post_question(
+                    chat_id,
+                    sender_id,
+                    text,
+                    image_keys,
+                    msg_id,
+                    feishu,
+                    session_mgr,
+                ),
+                fastapi_loop,
+            )
+            return
+
+        if message_type != "text":
+            logger.info(
+                "non-text message: type=%s chat=%s user=%s",
+                message_type,
+                chat_id,
+                sender_id,
+            )
+            asyncio.run_coroutine_threadsafe(
+                handle_unsupported_message(
+                    chat_id, sender_id, msg_id, message_type, feishu
+                ),
+                fastapi_loop,
+            )
+            return
+
+        # text 消息：从原 content.text 抽问题，按 mentions[].key 去掉 @bot 占位符
+        question = (content_dict.get("text") or "").strip()
+        for m in inbound.mentions:
+            if m.key:
+                question = question.replace(m.key, "").strip()
+        if not question:
+            return
+
+        logger.info(
+            "webhook received: chat=%s user=%s q=%r",
+            chat_id,
+            sender_id,
+            question[:80],
+        )
+        asyncio.run_coroutine_threadsafe(
+            handle_question(
+                chat_id,
+                sender_id,
+                question,
+                feishu,
+                session_mgr,
+                parent_msg_id=msg_id,
+            ),
+            fastapi_loop,
+        )
+
+    webhook_channel.on("message", _on_inbound)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -123,42 +247,28 @@ def create_app(config: AppConfig) -> FastAPI:
             docs_root,
             idle_ttl,
         )
+        fastapi_loop_ref["loop"] = asyncio.get_running_loop()
         await session_mgr.start()
+        # channel.connect() 在 webhook 模式下：起后台 loop + 同步 fetch bot
+        # identity（10s 超时，失败会进 retry loop 不阻塞）+ 构建 dispatcher。
+        await webhook_channel.connect()
         try:
             yield
         finally:
             logger.info("closing all sessions ...")
+            await webhook_channel.disconnect()
             await session_mgr.stop()
+            fastapi_loop_ref["loop"] = None
             logger.info("ops-qa-bot feishu server stopped")
 
     app = FastAPI(lifespan=lifespan)
 
-    async def process_question(
-        chat_id: str, user_id: str, question: str, parent_msg_id: str | None
-    ) -> None:
-        await handle_question(
-            chat_id,
-            user_id,
-            question,
-            feishu,
-            session_mgr,
-            parent_msg_id=parent_msg_id,
-        )
-
-    def _check_verify_token(payload: dict) -> None:
-        if not verify_token:
-            return
-        token = (
-            (payload.get("header") or {}).get("token")  # v2
-            or payload.get("token")  # v1 / url_verification
-        )
-        if token != verify_token:
-            raise HTTPException(status_code=403, detail="invalid verify token")
-
     async def _read_and_decode(req: Request) -> dict:
         """读 body → 签名校验（可选）→ AES 解密（可选）→ 返回原始 payload dict。
 
-        encrypt_key 未配置时走老路径，只 json 解析 body。配置后全流程都走。
+        卡片回调专用：飞书要求同步返回新卡顶替原卡，channel 的 cardAction
+        路径是异步 schedule 模式对不上，所以这条路径保留手写解密 + 校验。
+        消息事件 webhook 已经委托给 FeishuChannel，不再走这里。
         """
         body = await req.body()
         if crypto is not None:
@@ -174,132 +284,23 @@ def create_app(config: AppConfig) -> FastAPI:
         return wrapped
 
     @app.post("/feishu/webhook")
-    async def webhook(req: Request, background: BackgroundTasks):
-        payload = await _read_and_decode(req)
+    async def webhook(req: Request) -> Response:
+        """消息事件 webhook 入口。
 
-        # 每个请求生成 correlation id：优先用飞书 event_id 前 8 位（方便对照飞书后台），
-        # 没有就随机。同一请求链路（含 BackgroundTasks 里的 process_question）所有日志都会带。
-        event_id = (payload.get("header") or {}).get("event_id") or ""
-        rid = event_id[:8] if event_id else uuid.uuid4().hex[:8]
-        request_id_var.set(rid)
-
-        # 1. URL 校验（配置 webhook 时飞书会打一次 challenge）
-        if payload.get("type") == "url_verification":
-            _check_verify_token(payload)
-            return {"challenge": payload["challenge"]}
-
-        # 2. 事件校验
-        _check_verify_token(payload)
-
-        # 3. 去重：飞书重试时 event_id 不变；第一条请求会 add_task 立即返 200，
-        # 重试打到这里就直接跳过，避免重复答题（也顺带防用户恶意重放）。
-        if event_id:
-            if event_id in seen_events:
-                logger.info("duplicate event, skip: event_id=%s", event_id)
-                return {"code": 0}
-            seen_events[event_id] = True
-
-        # 4. 解析消息事件（v2 格式）
-        event = payload.get("event") or {}
-        chat_id, sender_id, question, msg_id, message_type = _extract_event(event)
-        if not chat_id or not sender_id or not message_type:
-            return {"code": 0}
-
-        # 群里 @所有人 也会唤醒 bot（飞书 @_all 把 bot 也算 mention），
-        # 但全员通知不应触发答题。同时传 message.content（JSON 字符串，含 text
-        # 字面）兜底飞书 WS SDK 不在 mentions 里放 @_all 的 case。
-        raw_msg = event.get("message") or {}
-        if is_at_all_broadcast(raw_msg.get("mentions"), text=raw_msg.get("content")):
-            logger.info(
-                "skip: @所有人 broadcast chat=%s user=%s type=%s",
-                chat_id,
-                sender_id,
-                message_type,
-            )
-            return {"code": 0}
-
-        # image 消息走视觉路径：解 image_key → 后台下载 → handle_question(images=...)
-        if message_type == "image":
-            try:
-                content_dict = json.loads(
-                    (event.get("message") or {}).get("content") or "{}"
-                )
-            except json.JSONDecodeError:
-                content_dict = {}
-            image_key = content_dict.get("image_key")
-            if not image_key or not msg_id:
-                logger.info(
-                    "image message missing key/msg_id: chat=%s user=%s",
-                    chat_id,
-                    sender_id,
-                )
-                return {"code": 0}
-            caption = _extract_image_caption(content_dict)
-            background.add_task(
-                handle_image_question,
-                chat_id,
-                sender_id,
-                image_key,
-                msg_id,
-                feishu,
-                session_mgr,
-                caption=caption,
-            )
-            return {"code": 0}
-
-        # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
-        # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
-        # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
-        if message_type == "post":
-            try:
-                content_dict = json.loads(
-                    (event.get("message") or {}).get("content") or "{}"
-                )
-            except json.JSONDecodeError:
-                content_dict = {}
-            text, image_keys = _parse_post_content(content_dict)
-            background.add_task(
-                handle_post_question,
-                chat_id,
-                sender_id,
-                text,
-                image_keys,
-                msg_id,
-                feishu,
-                session_mgr,
-            )
-            return {"code": 0}
-
-        # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
-        if message_type != "text":
-            logger.info(
-                "non-text message: type=%s chat=%s user=%s",
-                message_type,
-                chat_id,
-                sender_id,
-            )
-            background.add_task(
-                handle_unsupported_message,
-                chat_id,
-                sender_id,
-                msg_id,
-                message_type,
-                feishu,
-            )
-            return {"code": 0}
-
-        if not question:
-            return {"code": 0}
-
-        logger.info(
-            "webhook received: chat=%s user=%s q=%r",
-            chat_id,
-            sender_id,
-            question[:80],
+        全权委托给 FeishuChannel：AES 解密、签名校验、verification_token、
+        url_verification challenge、event-id dedup、@所有人 检测、sender_type
+        过滤都在 channel 里跑完，业务路由由 channel.on("message", _on_inbound)
+        在 channel 后台 loop 上 fire-and-forget 到 fastapi 主 loop。
+        """
+        body = await req.body()
+        status, content = await webhook_channel.handle_webhook_request(
+            dict(req.headers), body
         )
-        # 5. 后台处理，立即返回（飞书要求 3 秒内响应）
-        background.add_task(process_question, chat_id, sender_id, question, msg_id)
-        return {"code": 0}
+        return Response(
+            content=content,
+            status_code=status,
+            media_type="application/json",
+        )
 
     @app.post("/feishu/card")
     async def card_callback(req: Request):

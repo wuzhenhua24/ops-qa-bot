@@ -580,12 +580,24 @@ class FeishuClient:
     ``ws_server.py`` / ``feishu_server.py`` 各自的 dispatcher 处理。
     """
 
-    def __init__(self, app_id: str, app_secret: str):
+    def __init__(
+        self,
+        app_id: str | None = None,
+        app_secret: str | None = None,
+        *,
+        channel: FeishuChannel | None = None,
+    ):
         # FeishuChannel 在 __init__ 就把 Client / OutboundSender / driver 建好，
         # 只要不调 .start()/.connect() 就不会拉 WS、不 fetch bot identity。
         # 纯 outbound 场景下 channel.send / .edit_message / .upload_media /
         # .download_resource 都不依赖 bg loop，可以直接 await。
-        self._channel = FeishuChannel(app_id=app_id, app_secret=app_secret)
+        # 传入 channel 时复用入站用的同一个 channel 实例（webhook 模式下避免双 token cache /
+        # 双 bot identity 查询）；不传时按 app_id/app_secret 自建。
+        if channel is None:
+            if not app_id or not app_secret:
+                raise ValueError("FeishuClient: 必须提供 app_id+app_secret 或 channel")
+            channel = FeishuChannel(app_id=app_id, app_secret=app_secret)
+        self._channel = channel
 
     @staticmethod
     def _reply_opts(parent_id: str | None) -> dict | None:
