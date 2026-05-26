@@ -1,8 +1,8 @@
 """飞书接入的共享业务核心：HTTP 模式和长连接模式都依赖这里的类和函数。
 
 拆分原则：
-- 本文件只依赖 stdlib 和 httpx；**不引入 fastapi / lark-oapi 等适配层专属依赖**，
-  这样只装 `[ws]` extra（没有 fastapi）或 `[server]` extra 的部署都能 import。
+- 本文件依赖 stdlib + lark-oapi.channel（FeishuChannel 提供 send/upload/download
+  统一封装），两种 extra（[ws] / [server]）都已经把 lark-oapi 列为依赖。
 - HTTP 适配层 `feishu_server.py` / 长连接适配层 `ws_server.py` 负责把
   各自框架的事件/请求翻译成调用 `handle_question` / `handle_feedback_click`。
 """
@@ -19,8 +19,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import httpx
 from cachetools import LRUCache, TTLCache
+from lark_oapi.channel import FeishuChannel
+from lark_oapi.channel.errors import FeishuChannelError
+from lark_oapi.channel.types import MediaSource
 
 from .bot import AnswerResult, OpsQABot
 from .config import DocQAConfig
@@ -31,8 +33,6 @@ from .feishu_format import markdown_to_feishu_post
 logger = logging.getLogger("ops_qa_bot.feishu")
 # 由 logging_config.setup_feedback_logger 配置专用 handler 写 logs/feedback.log
 feedback_logger = logging.getLogger("ops_qa_bot.feedback")
-
-FEISHU_BASE = "https://open.feishu.cn/open-apis"
 POST_TITLE = "测试环境助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 
@@ -572,86 +572,52 @@ _archive_locks: dict[Path, asyncio.Lock] = {}
 
 
 class FeishuClient:
-    """飞书 API 轻量客户端：缓存 tenant_access_token、发送文本/富文本/卡片消息。"""
+    """飞书 API 轻量客户端：发送文本/富文本/卡片消息。
+
+    实现委托给 lark-oapi 的 ``FeishuChannel``——token 缓存、reply 端点路由、
+    upload/download 都由 SDK 内部处理。我们只用 outbound 能力（send / edit /
+    upload_media / download_resource），不启动 WS / webhook 入站；inbound 仍由
+    ``ws_server.py`` / ``feishu_server.py`` 各自的 dispatcher 处理。
+    """
 
     def __init__(self, app_id: str, app_secret: str):
-        self._app_id = app_id
-        self._app_secret = app_secret
-        self._token: str | None = None
-        self._token_expires_at: float = 0.0
-        self._lock = asyncio.Lock()
+        # FeishuChannel 在 __init__ 就把 Client / OutboundSender / driver 建好，
+        # 只要不调 .start()/.connect() 就不会拉 WS、不 fetch bot identity。
+        # 纯 outbound 场景下 channel.send / .edit_message / .upload_media /
+        # .download_resource 都不依赖 bg loop，可以直接 await。
+        self._channel = FeishuChannel(app_id=app_id, app_secret=app_secret)
 
-    async def _get_token(self, client: httpx.AsyncClient) -> str:
-        async with self._lock:
-            now = time.time()
-            if self._token and self._token_expires_at > now + 60:
-                return self._token
-            resp = await client.post(
-                f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal",
-                json={"app_id": self._app_id, "app_secret": self._app_secret},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") != 0:
-                raise RuntimeError(f"get tenant_access_token failed: {data}")
-            self._token = data["tenant_access_token"]
-            self._token_expires_at = now + int(data.get("expire", 7200))
-            return self._token
+    @staticmethod
+    def _reply_opts(parent_id: str | None) -> dict | None:
+        """构造 channel.send 的 opts。
 
-    async def _send(
-        self,
-        chat_id: str,
-        msg_type: str,
-        content: dict,
-        *,
-        parent_id: str | None = None,
-    ) -> str | None:
-        """发消息。成功返回 message_id，失败返回 None（已打日志）。
-
-        `parent_id` 给定时走 reply 端点（飞书"引用回复"），消息头部带原消息引用条；
-        不给定时走普通 send 端点。reply 端点的 chat 默认就是父消息所在 chat，不再
-        需要 receive_id。
+        parent_id 给定时走飞书 reply 端点（消息头部带引用条，不开 thread）。
+        SDK 的 reply_target_gone 默认 ``"fresh"``——父消息被撤回 / 删除时退化为
+        普通 send，符合用户体验（旧实现没这个 fallback，只是干失败）。
         """
-        async with httpx.AsyncClient(timeout=10) as client:
-            token = await self._get_token(client)
-            if parent_id:
-                url = f"{FEISHU_BASE}/im/v1/messages/{parent_id}/reply"
-                params = None
-                payload = {
-                    "msg_type": msg_type,
-                    "content": json.dumps(content, ensure_ascii=False),
-                    "reply_in_thread": False,  # 引用回复，不开 thread 模式
-                }
-            else:
-                url = f"{FEISHU_BASE}/im/v1/messages"
-                params = {"receive_id_type": "chat_id"}
-                payload = {
-                    "receive_id": chat_id,
-                    "msg_type": msg_type,
-                    "content": json.dumps(content, ensure_ascii=False),
-                }
-            resp = await client.post(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {token}"},
-                json=payload,
-            )
-            body = resp.json() if resp.content else {}
-            if resp.status_code != 200 or body.get("code") != 0:
-                logger.error(
-                    "feishu send(%s, parent=%s) failed: status=%s body=%s",
-                    msg_type,
-                    parent_id,
-                    resp.status_code,
-                    resp.text,
-                )
-                return None
-            return (body.get("data") or {}).get("message_id")
+        if not parent_id:
+            return None
+        return {"reply_to": parent_id, "reply_in_thread": False}
 
     async def send_text(
         self, chat_id: str, text: str, *, parent_id: str | None = None
     ) -> str | None:
-        return await self._send(chat_id, "text", {"text": text}, parent_id=parent_id)
+        try:
+            result = await self._channel.send(
+                chat_id, {"text": text}, self._reply_opts(parent_id)
+            )
+        except Exception:
+            logger.exception(
+                "feishu send_text failed: chat=%s parent=%s", chat_id, parent_id
+            )
+            return None
+        if not result.success:
+            logger.error(
+                "feishu send_text failed: chat=%s parent=%s err=%s",
+                chat_id, parent_id, result.error,
+            )
+            return None
+        return result.message_id
 
     async def send_post(
         self,
@@ -660,72 +626,88 @@ class FeishuClient:
         *,
         parent_id: str | None = None,
     ) -> str | None:
-        """post_content 结构见 feishu_format.markdown_to_feishu_post。"""
-        return await self._send(
-            chat_id, "post", post_content, parent_id=parent_id
-        )
+        """post_content 结构见 feishu_format.markdown_to_feishu_post。
+
+        OutboundPost 接受 ``{"zh_cn": {"title": ..., "content": [[...]]}}``
+        原样作为 post 字段——SDK 直接 JSON 序列化进 ``msg_type=post`` 的 content。
+        """
+        try:
+            result = await self._channel.send(
+                chat_id, {"post": post_content}, self._reply_opts(parent_id)
+            )
+        except Exception:
+            logger.exception(
+                "feishu send_post failed: chat=%s parent=%s", chat_id, parent_id
+            )
+            return None
+        if not result.success:
+            logger.error(
+                "feishu send_post failed: chat=%s parent=%s err=%s",
+                chat_id, parent_id, result.error,
+            )
+            return None
+        return result.message_id
 
     async def update_post(self, message_id: str, post_content: dict) -> bool:
         """编辑已发送的 post 消息。要求 im:message 权限。
 
-        API: PUT /open-apis/im/v1/messages/{message_id}
-        只有 text / post 类型消息可编辑，且只能由发送方（bot 自己）编辑。
+        SDK 的 ``edit_message`` 对应 PUT /open-apis/im/v1/messages/{message_id}，
+        只有 text / post 可编辑且只能由发送方编辑。
         """
-        async with httpx.AsyncClient(timeout=10) as client:
-            token = await self._get_token(client)
-            resp = await client.put(
-                f"{FEISHU_BASE}/im/v1/messages/{message_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "msg_type": "post",
-                    "content": json.dumps(post_content, ensure_ascii=False),
-                },
+        try:
+            result = await self._channel.edit_message(
+                message_id, {"post": post_content}
             )
-            body = resp.json() if resp.content else {}
-            if resp.status_code != 200 or body.get("code") != 0:
-                logger.error(
-                    "feishu update_post failed: status=%s body=%s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return False
-            return True
+        except Exception:
+            logger.exception("feishu update_post failed: message_id=%s", message_id)
+            return False
+        if not result.success:
+            logger.error(
+                "feishu update_post failed: message_id=%s err=%s",
+                message_id, result.error,
+            )
+            return False
+        return True
 
     async def send_interactive(
         self, chat_id: str, card: dict, *, parent_id: str | None = None
     ) -> str | None:
         """发送 interactive 卡片消息，用于反馈收集等交互。"""
-        return await self._send(
-            chat_id, "interactive", card, parent_id=parent_id
-        )
+        try:
+            result = await self._channel.send(
+                chat_id, {"card": card}, self._reply_opts(parent_id)
+            )
+        except Exception:
+            logger.exception(
+                "feishu send_interactive failed: chat=%s parent=%s",
+                chat_id, parent_id,
+            )
+            return None
+        if not result.success:
+            logger.error(
+                "feishu send_interactive failed: chat=%s parent=%s err=%s",
+                chat_id, parent_id, result.error,
+            )
+            return None
+        return result.message_id
 
     async def upload_image(self, image_bytes: bytes) -> str | None:
         """上传图片到飞书拿 image_key（用于 post 消息内嵌 img 段），失败返回 None。
 
-        API: POST /open-apis/im/v1/images，image_type=message。要求 `im:resource:upload`
-        scope（实际作用域名以飞书后台为准）。image_key 在飞书侧长期有效，调用方可放
+        SDK 的 ``upload_media(kind="image")`` 走 POST /open-apis/im/v1/images
+        with image_type=message。返回的 image_key 在飞书侧长期有效，调用方可放
         心做内存级缓存，重启后再 lazy 重传即可。
         """
-        async with httpx.AsyncClient(timeout=30) as client:
-            token = await self._get_token(client)
-            files = {
-                "image_type": (None, "message"),
-                "image": ("image", image_bytes),
-            }
-            resp = await client.post(
-                f"{FEISHU_BASE}/im/v1/images",
-                headers={"Authorization": f"Bearer {token}"},
-                files=files,
+        try:
+            return await self._channel.upload_media(
+                MediaSource(kind="buffer", buffer=image_bytes), kind="image"
             )
-            body = resp.json() if resp.content else {}
-            if resp.status_code != 200 or body.get("code") != 0:
-                logger.error(
-                    "feishu upload_image failed: status=%s body=%s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return None
-            return (body.get("data") or {}).get("image_key")
+        except FeishuChannelError as e:
+            logger.error("feishu upload_image failed: %s", e)
+            return None
+        except Exception:
+            logger.exception("feishu upload_image failed")
+            return None
 
     async def download_message_resource(
         self, message_id: str, file_key: str, resource_type: str = "image"
@@ -735,25 +717,19 @@ class FeishuClient:
         API: GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=...
         要求飞书应用配置 `im:resource` scope，bot 是该消息所在群成员。
 
-        media_type 优先取响应 Content-Type（去掉 charset 等参数），缺失或非
-        Anthropic 支持的 image/* 类型时按 magic bytes 嗅探，再 fallback 到
-        image/jpeg（最常见的截图格式）。
+        SDK 的 ``download_resource`` 只返回 bytes 不暴露 Content-Type；
+        media_type 完全按 magic bytes 嗅探（PNG/JPEG/GIF/WebP 都有唯一头），
+        失配 fallback 到 image/jpeg。
         """
-        async with httpx.AsyncClient(timeout=30) as client:
-            token = await self._get_token(client)
-            resp = await client.get(
-                f"{FEISHU_BASE}/im/v1/messages/{message_id}/resources/{file_key}",
-                params={"type": resource_type},
-                headers={"Authorization": f"Bearer {token}"},
+        data = await self._channel.download_resource(
+            file_key, resource_type, message_id=message_id
+        )
+        if data is None:
+            raise RuntimeError(
+                f"download resource failed: message_id={message_id} "
+                f"file_key={file_key} type={resource_type}"
             )
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"download resource failed: status={resp.status_code} "
-                    f"body={resp.text[:200]}"
-                )
-            data = resp.content
-            ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-            return data, _normalize_image_media_type(ct, data)
+        return data, _normalize_image_media_type("", data)
 
 
 class _SessionEntry:
