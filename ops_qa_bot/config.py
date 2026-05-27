@@ -19,7 +19,6 @@ class FeishuConfig:
     app_id: str
     app_secret: str
     verify_token: str | None = None
-    card_verify_token: str | None = None
     encrypt_key: str | None = None  # 设置后启用 AES 解密 + 签名校验
 
 
@@ -107,10 +106,6 @@ def load_config(path: Path) -> AppConfig:
         )
 
     verify_token = _pick("FEISHU_VERIFY_TOKEN", feishu_raw.get("verify_token")) or None
-    card_verify_token = (
-        _pick("FEISHU_CARD_VERIFY_TOKEN", feishu_raw.get("card_verify_token"))
-        or verify_token
-    )
     encrypt_key = _pick("FEISHU_ENCRYPT_KEY", feishu_raw.get("encrypt_key")) or None
 
     docs_root = Path(
@@ -163,7 +158,6 @@ def load_config(path: Path) -> AppConfig:
             app_id=app_id,
             app_secret=app_secret,
             verify_token=verify_token,
-            card_verify_token=card_verify_token,
             encrypt_key=encrypt_key,
         ),
         server=ServerConfig(host=host, port=port),

@@ -22,7 +22,7 @@ from typing import Any
 from cachetools import LRUCache, TTLCache
 from lark_oapi.channel import FeishuChannel
 from lark_oapi.channel.errors import FeishuChannelError
-from lark_oapi.channel.types import MediaSource
+from lark_oapi.channel.types import CardActionEvent, MediaSource
 
 from .bot import AnswerResult, OpsQABot
 from .config import DocQAConfig
@@ -108,7 +108,7 @@ def _parse_post_text(post_ast: dict) -> str:
 
 
 def _iter_post_documents(post: dict) -> list[dict]:
-    """post AST 两种形态归一：返回 locale doc 列表（不带 locale key 时是自身）。
+    """post AST 两种形态归一：返回 locale doc 列表（不带 locale key 时是自身)。
 
     与 SDK ``normalize/converters/post.py`` 中的同名函数行为一致。
     """
@@ -117,6 +117,30 @@ def _iter_post_documents(post: dict) -> list[dict]:
     if "content" in post:
         return [post]
     return [doc for doc in post.values() if isinstance(doc, dict)]
+
+
+def card_form_value(event: CardActionEvent) -> dict:
+    """从 CardActionEvent.raw 抽 form_value。
+
+    channel 的 CardActionPayload 只暴露 button payload (``action.value``)，
+    form 类元素（multi_select / input）的填写结果在 envelope 内部，要从
+    ``raw["event"]["action"]["form_value"]`` 挖。
+    """
+    try:
+        return event.raw["event"]["action"].get("form_value") or {}
+    except (KeyError, TypeError, AttributeError):
+        return {}
+
+
+def normalize_card_reasons(form_value: dict) -> list[str] | None:
+    """multi_select_static 返回 list[str]；防御兼容历史 str 值（飞书 SDK
+    调整或回放旧事件时可能塞单字符串），统一归并成 list 喂给下游。"""
+    raw = form_value.get("reasons")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, str)]
+    return None
 
 
 _AT_ALL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])@_all(?![A-Za-z0-9_])")

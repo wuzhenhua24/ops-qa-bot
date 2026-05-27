@@ -19,8 +19,7 @@ ops-qa-bot/
 │   ├── cli.py               # 交互式 REPL
 │   ├── config.py            # AppConfig：toml + 环境变量加载
 │   ├── feishu_core.py       # 飞书业务核心：FeishuClient / SessionManager / handle_question 等
-│   ├── feishu_server.py     # HTTP 模式适配层（FastAPI webhook + 卡片回调）
-│   ├── feishu_crypto.py     # encrypt_key 模式的 AES 解密 + 签名校验
+│   ├── feishu_server.py     # HTTP 模式适配层（FastAPI 统一 webhook：消息 + 卡片回调）
 │   ├── feishu_format.py     # markdown → 飞书 post 富文本转换
 │   ├── ws_server.py         # 长连接模式适配层（lark-oapi WebSocket）
 │   ├── health_server.py     # 长连接模式独立的健康检查 HTTP 服务
@@ -80,7 +79,7 @@ uv run python run.py --hide-tools
    - "Verification Token" 就是代码里的 `FEISHU_VERIFY_TOKEN`（可选，配置后强校验来源）
    - **Encrypt Key**（强烈推荐公网部署时启用）：填入配置到 `feishu.encrypt_key`。启用后飞书会对 payload 做 AES 加密，并在请求头带签名，服务端会自动解密并校验 `X-Lark-Signature`（SHA256）。篡改或伪造的请求会被 401 拒绝。
 5. **事件订阅 → 添加事件**：订阅 `im.message.receive_v1`（接收消息 v2.0）。
-6. **功能 → 机器人 → 消息卡片请求网址**：填 `https://<your-host>/feishu/card`。这是反馈按钮点击回调的地址（与上面的事件 webhook 是两个独立 URL），首次保存时同样会做 `url_verification` 校验。如果卡片回调的 Verification Token 与事件订阅**不同**，通过环境变量 `FEISHU_CARD_VERIFY_TOKEN` 单独配置；默认会复用 `FEISHU_VERIFY_TOKEN`。
+6. **功能 → 机器人 → 消息卡片请求网址**：填同一个 `https://<your-host>/feishu/webhook`（消息事件 + 卡片回调统一走 SDK 的 channel dispatcher，按 event_type 内部分流，不再需要独立的 `/feishu/card` 端点）。Verification Token 和 Encrypt Key 与事件订阅一致即可。
 7. **版本管理与发布**：创建版本 → 提交发布 → 等企业管理员审批通过。
 8. 审批通过后，**在群里添加这个机器人**，群成员 `@机器人 问题` 即可触发。
 
@@ -176,7 +175,7 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 - **答案内嵌图（把原图展示给用户）**：步骤截图配箭头标注、UI 控制台界面图、强相关故障截图，文字转述不如直接发原图。LLM 在答案里独立行写 `<<IMG:redis/images/step1.png>>`，bot 校验路径（必须 docs_root 子目录下真实存在的 .png/.jpg/.jpeg/.gif/.webp，≤5MB，防 `..` 路径穿越）→ 通过 `POST /im/v1/images` 上传飞书拿 image_key（`(绝对路径, mtime)` 做 LRU 缓存 500 条避免重复上传）→ 飞书 post 渲染层把这种行转成 `{tag:img, image_key:...}` 段。每条回答最多 3 张，超限静默截断。架构图/概念图 LLM 一般转述成文字步骤更有用，prompt 里明确不要回显这类图。`logs/feedback.log` 里 `qa` 事件多个 `images_attached: ['rel/path.png',...]` 字段，事后能算触发率和具体哪些图被引用得多。
 - **非 text 消息友好提示**：除 image 走视觉路径外，其它非 text 消息（file / sticker / audio / 转发合并消息等）入口直接回一条提示 "目前只支持文字提问，关键报错请用文字描述"，避免静默丢弃让用户以为 bot 没看见。
 - **快捷追问**：答完后 LLM 按问题类型挑 1-3 个追问按钮**单独发一张追问卡**（与反馈卡解耦，避免点追问把反馈卡顶掉、用户失去打分入口）。如故障类挂"排查步骤/风险点/示例命令"，变更类挂"回滚方案/风险点/示例命令"，用户一键即发起新一轮。追问卡的按钮 value 里带原问题 message_id，新一轮的占位/答案/反馈卡都引用回原问题，线程感不断。可选项库 6 个，prompt 端枚举给 LLM 选；标记 `<<FOLLOWUPS:k1|k2|k3>>` 写在答案末尾，bot 解析剥离后渲染按钮，注入防御靠 key 白名单。仅原提问者能点（开放给整群会乱）。
-- **反馈收集**：答案后紧跟一条 interactive 卡片，带 👍 / 👎 两个按钮。用户点击 → 飞书回调 `/feishu/card` → 服务侧记录 + 返回新卡片替换按钮（防重复点击）。点 👎 时会再弹一张 v2 表单卡，让用户从 5 类原因（文档过时 / 步骤不完整 / 事实错误 / 答案啰嗦 / 其他）里**多选一个或多个**（如"过时 + 不完整"经常同时成立），可附备注；用户填完点提交或跳过都计入日志。问答和反馈都落在 `logs/feedback.log`，每行 JSON，用 `qid` 关联：
+- **反馈收集**：答案后紧跟一条 interactive 卡片，带 👍 / 👎 两个按钮。用户点击 → 飞书把 `card.action.trigger` 推到统一的 `/feishu/webhook` → SDK channel dispatcher 路由到 cardAction handler → 服务侧记录 + 通过 `channel.update_card` 异步顶替原卡（防重复点击由 channel 内置 dedup 兜底）。点 👎 时会再弹一张 v2 表单卡，让用户从 5 类原因（文档过时 / 步骤不完整 / 事实错误 / 答案啰嗦 / 其他）里**多选一个或多个**（如"过时 + 不完整"经常同时成立），可附备注；用户填完点提交或跳过都计入日志。问答和反馈都落在 `logs/feedback.log`，每行 JSON，用 `qid` 关联：
 
   ```
   2026-04-24 ... {"event": "qa", "qid": "abc123", ...}
@@ -317,8 +316,8 @@ grep -F '"event": "qa"' logs/feedback.log \
 三层防御，按安全强度递增：
 
 1. **IP 白名单**（基础）：飞书开放平台"事件订阅"页配置，只放飞书出口 IP 段。
-2. **Verification Token**（轻量）：`feishu.verify_token` + `feishu.card_verify_token`，飞书在 payload 里带的 token 字符串比对。防不了链路中间人。
-3. **Encrypt Key**（推荐）：`feishu.encrypt_key`。启用后 payload AES-256-CBC 加密，请求头带 SHA256 签名，服务端在 `ops_qa_bot/feishu_crypto.py` 里做解密 + 签名校验。可以彻底防伪造/篡改，等价于飞书官方 SDK 的保护级别。公网部署建议开启。
+2. **Verification Token**（轻量）：`feishu.verify_token`，飞书在 payload 里带的 token 字符串比对。消息事件和卡片回调走同一个端点共用一份 Token。防不了链路中间人。
+3. **Encrypt Key**（推荐）：`feishu.encrypt_key`。启用后 payload AES-256-CBC 加密，请求头带 SHA256 签名，解密 + 签名校验由 `lark-oapi` 的 FeishuChannel 在 `handle_webhook_request` 里做。可以彻底防伪造/篡改，等价于飞书官方 SDK 的保护级别。公网部署建议开启。
 
 另外：
 

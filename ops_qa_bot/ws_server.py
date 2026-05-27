@@ -57,6 +57,7 @@ from .feishu_core import (
     _extract_image_caption,
     _followup_error_card,
     _parse_post_text,
+    card_form_value,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
@@ -67,35 +68,12 @@ from .feishu_core import (
     handle_post_question,
     handle_question,
     handle_unsupported_message,
+    normalize_card_reasons,
 )
 from .health_server import HealthServer
 from .logging_config import request_id_var
 
 logger = logging.getLogger("ops_qa_bot.ws")
-
-
-def _form_value(event: CardActionEvent) -> dict:
-    """从 CardActionEvent.raw 抽 form_value。
-
-    channel 的 CardActionPayload 只暴露 button payload (``action.value``)，
-    form 类元素（multi_select / input）的填写结果在 envelope 内部，要从
-    ``raw["event"]["action"]["form_value"]`` 挖。
-    """
-    try:
-        return event.raw["event"]["action"].get("form_value") or {}
-    except (KeyError, TypeError, AttributeError):
-        return {}
-
-
-def _normalize_reasons(form_value: dict) -> list[str] | None:
-    """multi_select_static 返回 list[str]；防御兼容历史 str 值（飞书 SDK
-    调整或回放旧事件时可能塞单字符串），统一归并成 list 喂给下游。"""
-    raw = form_value.get("reasons")
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, list):
-        return [r for r in raw if isinstance(r, str)]
-    return None
 
 
 class WsRunner:
@@ -278,7 +256,7 @@ class WsRunner:
         action_name = value.get("action")
         msg_id = event.message_id
         clicker_id = event.operator.open_id or None
-        form_value = _form_value(event)
+        form_value = card_form_value(event)
 
         ack_card: dict | None = None
         try:
@@ -296,7 +274,7 @@ class WsRunner:
             elif action_name == "feedback_reason_submit":
                 qid = value.get("qid")
                 asker_id = value.get("asker_id")
-                reasons = _normalize_reasons(form_value)
+                reasons = normalize_card_reasons(form_value)
                 comment = form_value.get("comment") or None
                 ack_card = handle_feedback_reason_submit(
                     qid, reasons, comment, clicker_id, asker_id
