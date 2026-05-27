@@ -94,48 +94,29 @@ def create_app(config: AppConfig) -> FastAPI:
         docs_root=docs_root, idle_ttl=idle_ttl, doc_qa_config=config.doc_qa
     )
 
-    # 业务函数（handle_question 等）跑在 fastapi 主 loop 上（session_mgr 也在主 loop
-    # 启动）；channel 的 on(...) handler 跑在 channel 后台 loop 上，通过
-    # run_coroutine_threadsafe 把业务 schedule 到主 loop，避免跨 loop
-    # asyncio.Lock 协调问题。
-    fastapi_loop_ref: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
+    # channel 后台 loop 兜底全部 async 资源：session_mgr.start() 在 bg loop 上
+    # 调，``_manager_lock`` 绑定 bg loop；channel.on(...) handler 也跑在 bg loop。
+    # 这样消息/卡片 handler 直接 await 业务函数即可，不再需要跨 loop 桥（旧版
+    # ``fastapi_loop_ref + run_coroutine_threadsafe`` 已删）。
+    # fastapi 主 loop 只负责接 HTTP 请求 + 转发；/admin/sessions 想读 session_mgr
+    # 状态时单独走 channel.schedule(...) + wrap_future 桥过去。
 
     async def _on_inbound(inbound: InboundMessage) -> None:
-        """channel.on("message") handler — 在 channel bg loop 上跑。
+        """channel.on("message") handler — 直接在 channel bg loop 上跑业务。
 
         消息分发逻辑收在 ``feishu_core.dispatch_inbound``；本地只做 webhook
-        路径特有的：rid 前缀、fastapi loop ready 兜底、把业务协程通过
-        ``run_coroutine_threadsafe`` 桥到 fastapi 主 loop（避免跨 loop
-        asyncio.Lock 协调问题）。
+        路径特有的 rid 前缀。
         """
         rid = (inbound.id or uuid.uuid4().hex)[:8]
         request_id_var.set(rid)
-
-        fastapi_loop = fastapi_loop_ref["loop"]
-        if fastapi_loop is None:
-            logger.error("fastapi loop not ready, drop event")
-            return
-
-        await dispatch_inbound(
-            inbound,
-            feishu,
-            session_mgr,
-            schedule=lambda coro: asyncio.run_coroutine_threadsafe(
-                coro, fastapi_loop
-            ),
-        )
+        await dispatch_inbound(inbound, feishu, session_mgr)
 
     async def _on_card_action(event: CardActionEvent) -> None:
-        """channel.on("cardAction") handler — 在 channel bg loop 上跑。
-
-        sync handler（feedback 三个）直接调（只访问 logger / 内存 dict，
-        不绑 loop）；async handler（followup / clarify_giveup / archive_submit）
-        访问 session_mgr / feishu 等 fastapi loop 上的资源，通过
-        ``run_coroutine_threadsafe`` 桥到主 loop 等结果。
+        """channel.on("cardAction") handler — 直接在 channel bg loop 上跑业务。
 
         channel 内置 dedup 按 ``card:{msg_id}:{operator}:{tag}:{value}``——
-        重复点击直接 drop 不到这里，旧版的 TTLCache 幂等不再需要。非 asker
-        的拒绝走业务函数自己的 reject 路径（返回原卡视觉无变化）。
+        重复点击直接 drop 不到这里。非 asker 的拒绝走业务函数自己的 reject
+        路径（返回原卡视觉无变化）。
         """
         request_id_var.set("c" + uuid.uuid4().hex[:7])
 
@@ -145,17 +126,6 @@ def create_app(config: AppConfig) -> FastAPI:
         msg_id = event.message_id
         clicker_id = event.operator.open_id or None
         form_value = card_form_value(event)
-
-        fastapi_loop = fastapi_loop_ref["loop"]
-        if fastapi_loop is None:
-            logger.error("fastapi loop not ready, drop card action")
-            return
-
-        async def _bridge(coro):
-            """把 coroutine schedule 到 fastapi loop 并 await 结果。"""
-            return await asyncio.wrap_future(
-                asyncio.run_coroutine_threadsafe(coro, fastapi_loop)
-            )
 
         ack_card: dict | None = None
         try:
@@ -191,12 +161,10 @@ def create_app(config: AppConfig) -> FastAPI:
                 asker_id = value.get("asker_id")
                 parent_msg_id_v = value.get("parent_msg_id")
                 try:
-                    ack_card = await _bridge(
-                        handle_followup_click(
-                            qid, key, chat_id_v, asker_id, clicker_id,
-                            feishu, session_mgr,
-                            parent_msg_id=parent_msg_id_v,
-                        )
+                    ack_card = await handle_followup_click(
+                        qid, key, chat_id_v, asker_id, clicker_id,
+                        feishu, session_mgr,
+                        parent_msg_id=parent_msg_id_v,
                     )
                 except Exception:
                     logger.exception(
@@ -210,12 +178,10 @@ def create_app(config: AppConfig) -> FastAPI:
                 asker_id = value.get("asker_id")
                 parent_msg_id_v = value.get("parent_msg_id")
                 try:
-                    ack_card = await _bridge(
-                        handle_clarify_giveup_click(
-                            qid, chat_id_v, asker_id, clicker_id,
-                            feishu, session_mgr,
-                            parent_msg_id=parent_msg_id_v,
-                        )
+                    ack_card = await handle_clarify_giveup_click(
+                        qid, chat_id_v, asker_id, clicker_id,
+                        feishu, session_mgr,
+                        parent_msg_id=parent_msg_id_v,
                     )
                 except Exception:
                     logger.exception("clarify_giveup click failed: qid=%s", qid)
@@ -226,11 +192,9 @@ def create_app(config: AppConfig) -> FastAPI:
                 answer = form_value.get("answer") or ""
                 question = form_value.get("question") or ""
                 try:
-                    ack_card = await _bridge(
-                        handle_archive_submit(
-                            qid, question, answer, clicker_id,
-                            docs_root, feishu=feishu,
-                        )
+                    ack_card = await handle_archive_submit(
+                        qid, question, answer, clicker_id,
+                        docs_root, feishu=feishu,
                     )
                 except Exception:
                     logger.exception("archive submit failed: qid=%s", qid)
@@ -253,6 +217,13 @@ def create_app(config: AppConfig) -> FastAPI:
     webhook_channel.on("message", _on_inbound)
     webhook_channel.on("cardAction", _on_card_action)
 
+    async def _bootstrap() -> None:
+        """在 channel bg loop 上启动 session_mgr，确保其 asyncio.Lock 绑定 bg loop。"""
+        await session_mgr.start()
+
+    async def _teardown() -> None:
+        await session_mgr.stop()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info(
@@ -260,18 +231,23 @@ def create_app(config: AppConfig) -> FastAPI:
             docs_root,
             idle_ttl,
         )
-        fastapi_loop_ref["loop"] = asyncio.get_running_loop()
-        await session_mgr.start()
         # channel.connect() 在 webhook 模式下：起后台 loop + 同步 fetch bot
         # identity（10s 超时，失败会进 retry loop 不阻塞）+ 构建 dispatcher。
         await webhook_channel.connect()
+        # SessionManager 必须在 channel bg loop 上 start——业务 handler 也跑在
+        # 那里，asyncio.Lock 必须绑定同一个 loop。
+        await asyncio.wrap_future(webhook_channel.schedule(_bootstrap()))
         try:
             yield
         finally:
             logger.info("closing all sessions ...")
+            try:
+                await asyncio.wrap_future(
+                    webhook_channel.schedule(_teardown())
+                )
+            except Exception:
+                logger.exception("teardown failed")
             await webhook_channel.disconnect()
-            await session_mgr.stop()
-            fastapi_loop_ref["loop"] = None
             logger.info("ops-qa-bot feishu server stopped")
 
     app = FastAPI(lifespan=lifespan)
@@ -301,6 +277,7 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
+        # active_count 是纯读 dict 的 sync 方法，跨 loop 读在 GIL 下是安全的
         return {
             "ok": True,
             "active_sessions": session_mgr.active_count(),
@@ -317,7 +294,11 @@ def create_app(config: AppConfig) -> FastAPI:
     async def list_sessions(req: Request):
         """列出当前活跃会话。配置 ADMIN_TOKEN 环境变量后需带 X-Admin-Token 请求头。"""
         _check_admin(req)
-        sessions = await session_mgr.snapshot()
+        # session_mgr.snapshot 会 acquire 绑定到 channel bg loop 的 _manager_lock，
+        # 必须 schedule 回 bg loop 跑（fastapi 主 loop 上 await 会跨 loop 报错）。
+        sessions = await asyncio.wrap_future(
+            webhook_channel.schedule(session_mgr.snapshot())
+        )
         return {
             "count": len(sessions),
             "idle_ttl_seconds": session_mgr.idle_ttl,
