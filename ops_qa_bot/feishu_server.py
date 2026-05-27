@@ -69,8 +69,10 @@ def create_app(config: AppConfig) -> FastAPI:
     #
     # safety/policy 配置说明：
     # - 飞书事件订阅 im.message.receive_v1 已经在订阅层过滤了"群里 @bot 才推送"，
-    #   所以 require_mention=False 关掉 channel 这层重复检查；
-    #   respond_to_mention_all=True 把 mentioned_all 决策让给我们 handler。
+    #   所以 require_mention=False 关掉 channel 这层重复检查。
+    # - respond_to_mention_all=False：纯 @所有人 由 channel PolicyGate 直接拒
+    #   （policy_mention_all_blocked），不会到 handler；"@所有人 + 同时
+    #   单独 @bot" 仍放行答题（PolicyGate 视为定向求助）。
     # - 不批合并消息（delay_ms=0）、不做 per-chat 串行（chat_queue.enabled=False），
     #   保持现有"逐条处理"语义；并发安全由 SessionManager 的 per-(chat,user) lock 兜底。
     webhook_channel = FeishuChannel(
@@ -81,7 +83,7 @@ def create_app(config: AppConfig) -> FastAPI:
         transport="webhook",
         policy=PolicyConfig(
             require_mention=False,
-            respond_to_mention_all=True,
+            respond_to_mention_all=False,
         ),
         safety=SafetyConfig(
             text_batch=TextBatchConfig(delay_ms=0),

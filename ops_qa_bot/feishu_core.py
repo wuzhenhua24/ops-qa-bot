@@ -2893,7 +2893,8 @@ async def dispatch_inbound(
     过滤策略（共享）：
     - chat_id / sender_id / message_type 任一缺失：忽略
     - inbound.sender.is_bot：忽略（机器人互相 @ 形成的环路）
-    - inbound.mentioned_all：忽略（@所有人 全员通知不答题）
+    - @所有人 过滤交给 channel PolicyGate（``respond_to_mention_all=False``）；
+      纯 @所有人 被 channel 直接拒，"@所有人 + 同时单独 @bot" 仍然放行答题
 
     路由按 ``inbound.content`` 类型分支：
     - ImageContent → handle_image_question（caption 走 raw）
@@ -2910,12 +2911,6 @@ async def dispatch_inbound(
         return
     if inbound.sender.is_bot:
         # 其他 bot 转发 / 应用广播 / 多 bot 群里互相 @ 形成的消息环路：不答题
-        return
-    if inbound.mentioned_all:
-        logger.info(
-            "skip: @所有人 broadcast chat=%s user=%s type=%s",
-            chat_id, sender_id, message_type,
-        )
         return
 
     async def _run(coro: Awaitable[None]) -> None:

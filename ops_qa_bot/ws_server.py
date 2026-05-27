@@ -82,8 +82,10 @@ class WsRunner:
 
         # channel policy / safety 配置跟 HTTP 路径对齐：
         # - require_mention=False：飞书订阅 im.message.receive_v1 本身只在
-        #   群里 @bot 时推送，channel 这层重复检查关掉；
-        #   respond_to_mention_all=True 把 mentioned_all 决策让给 handler
+        #   群里 @bot 时推送，channel 这层重复检查关掉
+        # - respond_to_mention_all=False：纯 @所有人 由 channel PolicyGate 直接拒
+        #   （policy_mention_all_blocked），不会到 handler；"@所有人 + 同时
+        #   单独 @bot" 仍放行答题（PolicyGate 视为定向求助）
         # - text_batch.delay_ms=0：不批合并连发消息，保持"逐条处理"
         # - chat_queue.enabled=False：不做 per-chat 串行；并发安全由
         #   SessionManager 的 per-(chat,user) lock 兜底
@@ -93,7 +95,7 @@ class WsRunner:
             transport="ws",
             policy=PolicyConfig(
                 require_mention=False,
-                respond_to_mention_all=True,
+                respond_to_mention_all=False,
             ),
             safety=SafetyConfig(
                 text_batch=TextBatchConfig(delay_ms=0),
