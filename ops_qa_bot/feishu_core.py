@@ -150,42 +150,6 @@ def normalize_card_reasons(form_value: dict) -> list[str] | None:
     return None
 
 
-_AT_ALL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])@_all(?![A-Za-z0-9_])")
-
-
-def is_at_all_broadcast(
-    mentions: list | None, text: str | None = None
-) -> bool:
-    """识别 @所有人 全员通知。
-
-    群里有人 @所有人 会把 bot 也唤醒（飞书 @_all mention 所有人，含 bot），
-    全员通知不应该触发答题。先看 mentions 结构有没有 @_all 项；实测 WS SDK
-    有时不把 @_all 放进 mentions、只在 message content 文本里留 `@_all` 字面，
-    需要 text 兜底（带词边界防止误伤 `@_allowed` 之类正常 token）。
-    mentions 兼容 SDK 对象（WS，带 .key / .id.open_id）和 dict（HTTP webhook）。
-    """
-    for m in mentions or []:
-        if m is None:
-            continue
-        key = getattr(m, "key", None)
-        if key is None and isinstance(m, dict):
-            key = m.get("key")
-        if key == "@_all":
-            return True
-        mid = getattr(m, "id", None)
-        if mid is None and isinstance(m, dict):
-            mid = m.get("id")
-        if mid is not None:
-            open_id = getattr(mid, "open_id", None)
-            if open_id is None and isinstance(mid, dict):
-                open_id = mid.get("open_id")
-            if open_id == "all":
-                return True
-    if text and _AT_ALL_TOKEN_RE.search(text):
-        return True
-    return False
-
-
 def _normalize_image_media_type(content_type: str, data: bytes) -> str:
     """归一化 image media_type 到 Anthropic vision 接受的集合内。
 
