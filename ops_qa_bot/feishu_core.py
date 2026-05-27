@@ -17,12 +17,19 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from cachetools import LRUCache, TTLCache
 from lark_oapi.channel import FeishuChannel
 from lark_oapi.channel.errors import FeishuChannelError
-from lark_oapi.channel.types import CardActionEvent, MediaSource
+from lark_oapi.channel.types import (
+    CardActionEvent,
+    ImageContent,
+    InboundMessage,
+    MediaSource,
+    PostContent,
+    TextContent,
+)
 
 from .bot import AnswerResult, OpsQABot
 from .config import DocQAConfig
@@ -2906,6 +2913,118 @@ async def handle_question(
             escalate_owner,
             archive_path_repr,
         )
+
+
+async def dispatch_inbound(
+    inbound: InboundMessage,
+    feishu: "FeishuClient",
+    session_mgr: "SessionManager",
+    *,
+    schedule: Callable[[Awaitable[None]], None] | None = None,
+) -> None:
+    """把 InboundMessage 路由到 handle_image / handle_post / handle_question /
+    handle_unsupported_message，两种调用模式共享这一份分发逻辑。
+
+    schedule=None（默认）：直接 ``await`` 业务协程，handler 同 loop 跑完才返回。
+        ws 路径用这个——channel 后台 loop 上跑业务，await 与 loop 一致。
+
+    schedule=<callable>：调用 ``schedule(coro)`` 把业务协程交给另一个 loop，
+        本函数立即返回不等结果（fire-and-forget）。webhook 路径用这个——
+        channel 后台 loop 上接事件，业务跑在 fastapi 主 loop，传
+        ``lambda c: asyncio.run_coroutine_threadsafe(c, fastapi_loop)`` 桥过去。
+
+    过滤策略（共享）：
+    - chat_id / sender_id / message_type 任一缺失：忽略
+    - inbound.sender.is_bot：忽略（机器人互相 @ 形成的环路）
+    - inbound.mentioned_all：忽略（@所有人 全员通知不答题）
+
+    路由按 ``inbound.content`` 类型分支：
+    - ImageContent → handle_image_question（caption 走 raw）
+    - PostContent  → handle_post_question（image_keys 走 inbound.resources）
+    - TextContent  → handle_question（剥 mentions[].key 占位符）
+    - 其它         → handle_unsupported_message
+    """
+    chat_id = inbound.chat_id
+    sender_id = inbound.sender_id
+    msg_id = inbound.message_id
+    message_type = inbound.raw_content_type
+
+    if not chat_id or not sender_id or not message_type:
+        return
+    if inbound.sender.is_bot:
+        # 其他 bot 转发 / 应用广播 / 多 bot 群里互相 @ 形成的消息环路：不答题
+        return
+    if inbound.mentioned_all:
+        logger.info(
+            "skip: @所有人 broadcast chat=%s user=%s type=%s",
+            chat_id, sender_id, message_type,
+        )
+        return
+
+    async def _run(coro: Awaitable[None]) -> None:
+        if schedule is None:
+            await coro
+        else:
+            schedule(coro)
+
+    content = inbound.content
+
+    if isinstance(content, ImageContent):
+        if not content.image_key or not msg_id:
+            logger.info(
+                "image message missing key/msg_id: chat=%s user=%s",
+                chat_id, sender_id,
+            )
+            return
+        caption = _extract_image_caption(content.raw)
+        await _run(handle_image_question(
+            chat_id, sender_id, content.image_key, msg_id,
+            feishu, session_mgr, caption=caption,
+        ))
+        return
+
+    if isinstance(content, PostContent):
+        # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
+        # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
+        # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
+        text = _parse_post_text(content.post)
+        image_keys = [
+            r.file_key for r in inbound.resources if r.type == "image"
+        ]
+        await _run(handle_post_question(
+            chat_id, sender_id, text, image_keys, msg_id,
+            feishu, session_mgr,
+        ))
+        return
+
+    if not isinstance(content, TextContent):
+        # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
+        logger.info(
+            "non-text message: type=%s chat=%s user=%s",
+            message_type, chat_id, sender_id,
+        )
+        await _run(handle_unsupported_message(
+            chat_id, sender_id, msg_id, message_type, feishu,
+        ))
+        return
+
+    # text 消息：用 content.raw 里的原始文本（@_user_N 占位符未替换），
+    # 配合 mentions[].key 整段剥 @ 占位。inbound.content.text 已被 SDK
+    # resolve_mentions 成 @Name，再按 m.key replace 会 miss——所以走 raw。
+    question = (content.raw.get("text") or "").strip()
+    for m in inbound.mentions:
+        if m.key:
+            question = question.replace(m.key, "").strip()
+    if not question:
+        return
+
+    logger.info(
+        "inbound text: chat=%s user=%s q=%r", chat_id, sender_id, question[:80]
+    )
+    await _run(handle_question(
+        chat_id, sender_id, question, feishu, session_mgr,
+        parent_msg_id=msg_id,
+    ))
 
 
 def handle_feedback_click(

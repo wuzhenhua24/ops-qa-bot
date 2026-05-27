@@ -41,33 +41,22 @@ from lark_oapi.channel.config import (
     SafetyConfig,
     TextBatchConfig,
 )
-from lark_oapi.channel.types import (
-    CardActionEvent,
-    ImageContent,
-    InboundMessage,
-    PostContent,
-    TextContent,
-)
+from lark_oapi.channel.types import CardActionEvent, InboundMessage
 
 from .config import AppConfig
 from .feishu_core import (
     FeishuClient,
     SessionManager,
     _archive_ack_card,
-    _extract_image_caption,
     _followup_error_card,
-    _parse_post_text,
     card_form_value,
+    dispatch_inbound,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
     handle_followup_click,
-    handle_image_question,
-    handle_post_question,
-    handle_question,
-    handle_unsupported_message,
     normalize_card_reasons,
 )
 from .health_server import HealthServer
@@ -142,10 +131,11 @@ class WsRunner:
         self._channel.on("reconnected", lambda: logger.info("ws reconnected"))
 
     async def _on_inbound(self, inbound: InboundMessage) -> None:
-        """消息事件 handler — 在 channel 后台 loop 上直接 await 业务函数。
+        """消息事件 handler — 在 channel 后台 loop 上跑。
 
-        重复事件、签名校验、@所有人 检测、bot 自己发的消息全部由 channel 上游
-        处理，这里只负责"事件 → 业务函数"的路由。
+        消息分发逻辑收在 ``feishu_core.dispatch_inbound``；本地只做 ws 路径
+        特有的：rid 前缀、事件计数。无 schedule 参数 = 直接 await（业务跟
+        handler 同 loop）。
         """
         event_id = inbound.id or uuid.uuid4().hex
         request_id_var.set("ws" + event_id[:6])
@@ -153,87 +143,7 @@ class WsRunner:
         self._last_event_at = time.time()
         self._event_count += 1
 
-        chat_id = inbound.chat_id
-        sender_id = inbound.sender_id
-        msg_id = inbound.message_id
-        message_type = inbound.raw_content_type
-
-        if not chat_id or not sender_id or not message_type:
-            return
-        if inbound.sender.is_bot:
-            # 其他 bot 转发 / 应用广播 / 多 bot 群里互相 @ 形成的消息环路：不答题
-            return
-        if inbound.mentioned_all:
-            logger.info(
-                "skip: @所有人 broadcast chat=%s user=%s type=%s",
-                chat_id, sender_id, message_type,
-            )
-            return
-
-        # SDK 的 InboundPipeline 已经把 content JSON 解析成 typed dataclass，
-        # image_key / post AST 直接从 inbound.content 拿；post 里的 image
-        # 走 inbound.resources（converter 抽完了）。文本走 content.raw（原始
-        # 未解析 @ 的形式），保留按 mentions[].key 整段剥 @ 的语义。
-        content = inbound.content
-
-        if isinstance(content, ImageContent):
-            if not content.image_key or not msg_id:
-                logger.info(
-                    "image message missing key/msg_id: chat=%s user=%s",
-                    chat_id, sender_id,
-                )
-                return
-            caption = _extract_image_caption(content.raw)
-            await handle_image_question(
-                chat_id, sender_id, content.image_key, msg_id,
-                self._feishu, self._session_mgr,
-                caption=caption,
-            )
-            return
-
-        if isinstance(content, PostContent):
-            # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
-            # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
-            # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
-            text = _parse_post_text(content.post)
-            image_keys = [
-                r.file_key for r in inbound.resources if r.type == "image"
-            ]
-            await handle_post_question(
-                chat_id, sender_id, text, image_keys, msg_id,
-                self._feishu, self._session_mgr,
-            )
-            return
-
-        if not isinstance(content, TextContent):
-            # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
-            logger.info(
-                "non-text message: type=%s chat=%s user=%s",
-                message_type, chat_id, sender_id,
-            )
-            await handle_unsupported_message(
-                chat_id, sender_id, msg_id, message_type, self._feishu
-            )
-            return
-
-        # text 消息：用 content.raw 里的原始文本（@_user_N 占位符未替换），
-        # 配合 mentions[].key 整段剥 @ 占位。inbound.content.text 已被 SDK
-        # resolve_mentions 成 @Name，再按 m.key replace 会 miss——所以走 raw。
-        question = (content.raw.get("text") or "").strip()
-        for m in inbound.mentions:
-            if m.key:
-                question = question.replace(m.key, "").strip()
-        if not question:
-            return
-
-        logger.info(
-            "ws message: chat=%s user=%s q=%r", chat_id, sender_id, question[:80]
-        )
-        await handle_question(
-            chat_id, sender_id, question,
-            self._feishu, self._session_mgr,
-            parent_msg_id=msg_id,
-        )
+        await dispatch_inbound(inbound, self._feishu, self._session_mgr)
 
     async def _on_card_action(self, event: CardActionEvent) -> None:
         """卡片回调 handler — 业务结果通过 channel.update_card 顶替原卡。

@@ -30,33 +30,22 @@ from lark_oapi.channel.config import (
     SafetyConfig,
     TextBatchConfig,
 )
-from lark_oapi.channel.types import (
-    CardActionEvent,
-    ImageContent,
-    InboundMessage,
-    PostContent,
-    TextContent,
-)
+from lark_oapi.channel.types import CardActionEvent, InboundMessage
 
 from .config import AppConfig
 from .feishu_core import (
     FeishuClient,
     SessionManager,
     _archive_ack_card,
-    _extract_image_caption,
     _followup_error_card,
-    _parse_post_text,
     card_form_value,
+    dispatch_inbound,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
     handle_followup_click,
-    handle_image_question,
-    handle_post_question,
-    handle_question,
-    handle_unsupported_message,
     normalize_card_reasons,
 )
 from .logging_config import request_id_var
@@ -114,126 +103,26 @@ def create_app(config: AppConfig) -> FastAPI:
     async def _on_inbound(inbound: InboundMessage) -> None:
         """channel.on("message") handler — 在 channel bg loop 上跑。
 
-        从 InboundMessage 解出业务参数，fire-and-forget 调度到 fastapi 主 loop。
-        重复事件、url_verification、签名校验、@所有人 过滤、bot 自己发的消息全部
-        由 channel 上游处理，这里只负责"事件 → 业务函数"的路由。
+        消息分发逻辑收在 ``feishu_core.dispatch_inbound``；本地只做 webhook
+        路径特有的：rid 前缀、fastapi loop ready 兜底、把业务协程通过
+        ``run_coroutine_threadsafe`` 桥到 fastapi 主 loop（避免跨 loop
+        asyncio.Lock 协调问题）。
         """
         rid = (inbound.id or uuid.uuid4().hex)[:8]
         request_id_var.set(rid)
-
-        chat_id = inbound.chat_id
-        sender_id = inbound.sender_id
-        msg_id = inbound.message_id
-        message_type = inbound.raw_content_type
-
-        if not chat_id or not sender_id or not message_type:
-            return
-        if inbound.sender.is_bot:
-            # 其他 bot 转发 / 应用广播 / 多 bot 群里互相 @ 形成的消息环路：不答题
-            return
-        if inbound.mentioned_all:
-            logger.info(
-                "skip: @所有人 broadcast chat=%s user=%s type=%s",
-                chat_id,
-                sender_id,
-                message_type,
-            )
-            return
 
         fastapi_loop = fastapi_loop_ref["loop"]
         if fastapi_loop is None:
             logger.error("fastapi loop not ready, drop event")
             return
 
-        # SDK 的 InboundPipeline 已经把 content JSON 解析成 typed dataclass，
-        # image_key / post AST 直接从 inbound.content 拿；post 里的 image
-        # 走 inbound.resources（converter 抽完了）。文本走 content.raw（原始
-        # 未解析 @ 的形式），保留按 mentions[].key 整段剥 @ 的语义。
-        content = inbound.content
-
-        if isinstance(content, ImageContent):
-            if not content.image_key or not msg_id:
-                logger.info(
-                    "image message missing key/msg_id: chat=%s user=%s",
-                    chat_id,
-                    sender_id,
-                )
-                return
-            caption = _extract_image_caption(content.raw)
-            asyncio.run_coroutine_threadsafe(
-                handle_image_question(
-                    chat_id,
-                    sender_id,
-                    content.image_key,
-                    msg_id,
-                    feishu,
-                    session_mgr,
-                    caption=caption,
-                ),
-                fastapi_loop,
-            )
-            return
-
-        if isinstance(content, PostContent):
-            text = _parse_post_text(content.post)
-            image_keys = [
-                r.file_key for r in inbound.resources if r.type == "image"
-            ]
-            asyncio.run_coroutine_threadsafe(
-                handle_post_question(
-                    chat_id,
-                    sender_id,
-                    text,
-                    image_keys,
-                    msg_id,
-                    feishu,
-                    session_mgr,
-                ),
-                fastapi_loop,
-            )
-            return
-
-        if not isinstance(content, TextContent):
-            logger.info(
-                "non-text message: type=%s chat=%s user=%s",
-                message_type,
-                chat_id,
-                sender_id,
-            )
-            asyncio.run_coroutine_threadsafe(
-                handle_unsupported_message(
-                    chat_id, sender_id, msg_id, message_type, feishu
-                ),
-                fastapi_loop,
-            )
-            return
-
-        # text 消息：用 content.raw 里的原始文本（@_user_N 占位符未替换），
-        # 配合 mentions[].key 整段剥 @ 占位。inbound.content.text 已被 SDK
-        # resolve_mentions 成 @Name，再按 m.key replace 会 miss——所以走 raw。
-        question = (content.raw.get("text") or "").strip()
-        for m in inbound.mentions:
-            if m.key:
-                question = question.replace(m.key, "").strip()
-        if not question:
-            return
-
-        logger.info(
-            "webhook received: chat=%s user=%s q=%r",
-            chat_id,
-            sender_id,
-            question[:80],
-        )
-        asyncio.run_coroutine_threadsafe(
-            handle_question(
-                chat_id,
-                sender_id,
-                question,
-                feishu,
-                session_mgr,
-                parent_msg_id=msg_id,
+        await dispatch_inbound(
+            inbound,
+            feishu,
+            session_mgr,
+            schedule=lambda coro: asyncio.run_coroutine_threadsafe(
+                coro, fastapi_loop
             ),
-            fastapi_loop,
         )
 
     async def _on_card_action(event: CardActionEvent) -> None:
