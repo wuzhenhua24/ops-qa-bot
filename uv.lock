@@ -502,9 +502,9 @@ dependencies = [
 [package.optional-dependencies]
 server = [
     { name = "cachetools" },
-    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "lark-oapi" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 ws = [
@@ -519,10 +519,10 @@ requires-dist = [
     { name = "cachetools", marker = "extra == 'server'", specifier = ">=5.3" },
     { name = "cachetools", marker = "extra == 'ws'", specifier = ">=5.3" },
     { name = "claude-agent-sdk", specifier = ">=0.1.65" },
-    { name = "cryptography", marker = "extra == 'server'", specifier = ">=41.0" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'ws'", specifier = ">=0.27" },
+    { name = "lark-oapi", marker = "extra == 'server'", specifier = ">=1.6.6" },
     { name = "lark-oapi", marker = "extra == 'ws'", specifier = ">=1.6.6" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.30" },
 ]
