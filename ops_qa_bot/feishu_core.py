@@ -646,25 +646,43 @@ class FeishuClient:
             return None
         return {"reply_to": parent_id, "reply_in_thread": False}
 
-    async def send_text(
-        self, chat_id: str, text: str, *, parent_id: str | None = None
-    ) -> str | None:
+    async def _exec_and_log(
+        self,
+        label: str,
+        coro: Awaitable[Any],
+        **log_fields: Any,
+    ) -> Any:
+        """统一收尾 channel.send / .edit_message 的异常 + result.success 日志。
+
+        日志字段保持原来的 ``key=value`` 拼接格式（便于现有 grep 习惯），失败时
+        多带一个 ``err=<...>`` 段；transport / coercion 异常打 ``logger.exception``。
+        成功返回 SendResult，失败返回 None；调用方按签名各自挑 ``message_id`` /
+        bool 包装。
+        """
+        ctx = " ".join(f"{k}={v}" for k, v in log_fields.items())
         try:
-            result = await self._channel.send(
-                chat_id, {"text": text}, self._reply_opts(parent_id)
-            )
+            result = await coro
         except Exception:
-            logger.exception(
-                "feishu send_text failed: chat=%s parent=%s", chat_id, parent_id
-            )
+            logger.exception("feishu %s failed: %s", label, ctx)
             return None
         if not result.success:
             logger.error(
-                "feishu send_text failed: chat=%s parent=%s err=%s",
-                chat_id, parent_id, result.error,
+                "feishu %s failed: %s err=%s", label, ctx, result.error
             )
             return None
-        return result.message_id
+        return result
+
+    async def send_text(
+        self, chat_id: str, text: str, *, parent_id: str | None = None
+    ) -> str | None:
+        result = await self._exec_and_log(
+            "send_text",
+            self._channel.send(
+                chat_id, {"text": text}, self._reply_opts(parent_id)
+            ),
+            chat=chat_id, parent=parent_id,
+        )
+        return result.message_id if result else None
 
     async def send_post(
         self,
@@ -678,22 +696,14 @@ class FeishuClient:
         OutboundPost 接受 ``{"zh_cn": {"title": ..., "content": [[...]]}}``
         原样作为 post 字段——SDK 直接 JSON 序列化进 ``msg_type=post`` 的 content。
         """
-        try:
-            result = await self._channel.send(
+        result = await self._exec_and_log(
+            "send_post",
+            self._channel.send(
                 chat_id, {"post": post_content}, self._reply_opts(parent_id)
-            )
-        except Exception:
-            logger.exception(
-                "feishu send_post failed: chat=%s parent=%s", chat_id, parent_id
-            )
-            return None
-        if not result.success:
-            logger.error(
-                "feishu send_post failed: chat=%s parent=%s err=%s",
-                chat_id, parent_id, result.error,
-            )
-            return None
-        return result.message_id
+            ),
+            chat=chat_id, parent=parent_id,
+        )
+        return result.message_id if result else None
 
     async def update_post(self, message_id: str, post_content: dict) -> bool:
         """编辑已发送的 post 消息。要求 im:message 权限。
@@ -701,42 +711,25 @@ class FeishuClient:
         SDK 的 ``edit_message`` 对应 PUT /open-apis/im/v1/messages/{message_id}，
         只有 text / post 可编辑且只能由发送方编辑。
         """
-        try:
-            result = await self._channel.edit_message(
-                message_id, {"post": post_content}
-            )
-        except Exception:
-            logger.exception("feishu update_post failed: message_id=%s", message_id)
-            return False
-        if not result.success:
-            logger.error(
-                "feishu update_post failed: message_id=%s err=%s",
-                message_id, result.error,
-            )
-            return False
-        return True
+        result = await self._exec_and_log(
+            "update_post",
+            self._channel.edit_message(message_id, {"post": post_content}),
+            message_id=message_id,
+        )
+        return result is not None
 
     async def send_interactive(
         self, chat_id: str, card: dict, *, parent_id: str | None = None
     ) -> str | None:
         """发送 interactive 卡片消息，用于反馈收集等交互。"""
-        try:
-            result = await self._channel.send(
+        result = await self._exec_and_log(
+            "send_interactive",
+            self._channel.send(
                 chat_id, {"card": card}, self._reply_opts(parent_id)
-            )
-        except Exception:
-            logger.exception(
-                "feishu send_interactive failed: chat=%s parent=%s",
-                chat_id, parent_id,
-            )
-            return None
-        if not result.success:
-            logger.error(
-                "feishu send_interactive failed: chat=%s parent=%s err=%s",
-                chat_id, parent_id, result.error,
-            )
-            return None
-        return result.message_id
+            ),
+            chat=chat_id, parent=parent_id,
+        )
+        return result.message_id if result else None
 
     async def upload_image(self, image_bytes: bytes) -> str | None:
         """上传图片到飞书拿 image_key（用于 post 消息内嵌 img 段），失败返回 None。
