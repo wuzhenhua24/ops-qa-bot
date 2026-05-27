@@ -67,52 +67,56 @@ def _extract_image_caption(content_dict: dict) -> str | None:
     return None
 
 
-def _parse_post_content(content_dict: dict) -> tuple[str, list[str]]:
-    """从 post 消息 content 抽出 (text, image_keys)。
+def _parse_post_text(post_ast: dict) -> str:
+    """从 post AST 抽出供 LLM 阅读的纯文本（image_keys 由 SDK 的
+    ``inbound.resources`` 给出，不在这里重复抽）。
 
-    post 是飞书富文本：`content` 是 list[list[element]]，外层是段落，内层是
-    段内元素（text / at / img / a / code / emotion ...）。这里只关心：
+    post AST 可能是单 locale（``{"title":..., "content":[[...]]}``，旧的飞书
+    inbound 形态）或带 locale 包裹（``{"zh_cn": {...}}``，SDK 测试 fixture
+    和飞书最新 wire 形态）。``_iter_documents`` 两种都吃，取第一个 doc。
+
+    走 AST 而不复用 SDK 的 ``PostContent.text``：SDK 的 flatten 把 ``tag:at``
+    渲染成 ``@user_name`` 占位、把 ``tag:img`` 渲染成 ``[image]`` 文本——bot
+    希望 @ 整段跳过（路由标记不是问题主语）、image 单独走 resources。
 
     - tag:text → 文本拼接
     - tag:a    → 取链接显示文本（href 不暴露给 LLM，简化注入面）
-    - tag:img  → 收集 image_key（按出现顺序保序）
-    - tag:at   → **整段跳过**：@ 是路由标记不是用户输入；多数场景就是 @bot 自己
-
-    其它 tag（emotion / hr / code_inline 等）暂不抽取——常见场景里这些不是
-    问题主语；将来发现需要再补。
+    - tag:at   → **整段跳过**：多数场景就是 @bot 自己
+    - tag:img  → 跳过（image_keys 走 SDK resources）
 
     段内拼接不加分隔符（at 被剥后留下的空白由 strip 收掉），段间用 \\n。
     """
-    paragraphs = content_dict.get("content") or []
-    if not isinstance(paragraphs, list):
-        return "", []
     text_lines: list[str] = []
-    image_keys: list[str] = []
-    for para in paragraphs:
-        if not isinstance(para, list):
-            continue
-        line_parts: list[str] = []
-        for el in para:
-            if not isinstance(el, dict):
+    for doc in _iter_post_documents(post_ast):
+        for para in doc.get("content") or []:
+            if not isinstance(para, list):
                 continue
-            tag = el.get("tag")
-            if tag == "text":
-                t = el.get("text")
-                if isinstance(t, str):
-                    line_parts.append(t)
-            elif tag == "a":
-                t = el.get("text")
-                if isinstance(t, str):
-                    line_parts.append(t)
-            elif tag == "img":
-                k = el.get("image_key")
-                if isinstance(k, str) and k:
-                    image_keys.append(k)
-            # at / emotion / hr / code_inline / code 等暂不抽取
-        line = "".join(line_parts).strip()
-        if line:
-            text_lines.append(line)
-    return "\n".join(text_lines).strip(), image_keys
+            line_parts: list[str] = []
+            for el in para:
+                if not isinstance(el, dict):
+                    continue
+                tag = el.get("tag")
+                if tag in ("text", "a"):
+                    t = el.get("text")
+                    if isinstance(t, str):
+                        line_parts.append(t)
+                # at / img / emotion / hr / code_inline / code 等暂不抽取
+            line = "".join(line_parts).strip()
+            if line:
+                text_lines.append(line)
+    return "\n".join(text_lines).strip()
+
+
+def _iter_post_documents(post: dict) -> list[dict]:
+    """post AST 两种形态归一：返回 locale doc 列表（不带 locale key 时是自身）。
+
+    与 SDK ``normalize/converters/post.py`` 中的同名函数行为一致。
+    """
+    if not isinstance(post, dict) or not post:
+        return []
+    if "content" in post:
+        return [post]
+    return [doc for doc in post.values() if isinstance(doc, dict)]
 
 
 _AT_ALL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])@_all(?![A-Za-z0-9_])")

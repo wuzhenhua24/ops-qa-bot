@@ -29,7 +29,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 import uuid
@@ -42,7 +41,13 @@ from lark_oapi.channel.config import (
     SafetyConfig,
     TextBatchConfig,
 )
-from lark_oapi.channel.types import CardActionEvent, InboundMessage
+from lark_oapi.channel.types import (
+    CardActionEvent,
+    ImageContent,
+    InboundMessage,
+    PostContent,
+    TextContent,
+)
 
 from .config import AppConfig
 from .feishu_core import (
@@ -51,7 +56,7 @@ from .feishu_core import (
     _archive_ack_card,
     _extract_image_caption,
     _followup_error_card,
-    _parse_post_content,
+    _parse_post_text,
     handle_archive_submit,
     handle_clarify_giveup_click,
     handle_feedback_click,
@@ -187,42 +192,42 @@ class WsRunner:
             )
             return
 
-        # image_key / post AST / caption 这些飞书原始 wire 字段还得从 raw 里挖；
-        # InboundMessage.raw 就是飞书 message dict（已经从 v2 envelope 剥出来）。
-        raw_content_str = (inbound.raw or {}).get("content") or "{}"
-        try:
-            content_dict = json.loads(raw_content_str)
-        except json.JSONDecodeError:
-            content_dict = {}
+        # SDK 的 InboundPipeline 已经把 content JSON 解析成 typed dataclass，
+        # image_key / post AST 直接从 inbound.content 拿；post 里的 image
+        # 走 inbound.resources（converter 抽完了）。文本走 content.raw（原始
+        # 未解析 @ 的形式），保留按 mentions[].key 整段剥 @ 的语义。
+        content = inbound.content
 
-        if message_type == "image":
-            image_key = content_dict.get("image_key")
-            if not image_key or not msg_id:
+        if isinstance(content, ImageContent):
+            if not content.image_key or not msg_id:
                 logger.info(
                     "image message missing key/msg_id: chat=%s user=%s",
                     chat_id, sender_id,
                 )
                 return
-            caption = _extract_image_caption(content_dict)
+            caption = _extract_image_caption(content.raw)
             await handle_image_question(
-                chat_id, sender_id, image_key, msg_id,
+                chat_id, sender_id, content.image_key, msg_id,
                 self._feishu, self._session_mgr,
                 caption=caption,
             )
             return
 
-        if message_type == "post":
+        if isinstance(content, PostContent):
             # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
             # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
             # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
-            text, image_keys = _parse_post_content(content_dict)
+            text = _parse_post_text(content.post)
+            image_keys = [
+                r.file_key for r in inbound.resources if r.type == "image"
+            ]
             await handle_post_question(
                 chat_id, sender_id, text, image_keys, msg_id,
                 self._feishu, self._session_mgr,
             )
             return
 
-        if message_type != "text":
+        if not isinstance(content, TextContent):
             # 其它非 text（file/sticker/audio…）：回友好提示，不进答题流程
             logger.info(
                 "non-text message: type=%s chat=%s user=%s",
@@ -233,8 +238,10 @@ class WsRunner:
             )
             return
 
-        # text 消息：从原 content.text 抽问题，按 mentions[].key 去掉 @bot 占位符
-        question = (content_dict.get("text") or "").strip()
+        # text 消息：用 content.raw 里的原始文本（@_user_N 占位符未替换），
+        # 配合 mentions[].key 整段剥 @ 占位。inbound.content.text 已被 SDK
+        # resolve_mentions 成 @Name，再按 m.key replace 会 miss——所以走 raw。
+        question = (content.raw.get("text") or "").strip()
         for m in inbound.mentions:
             if m.key:
                 question = question.replace(m.key, "").strip()

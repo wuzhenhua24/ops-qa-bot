@@ -25,7 +25,12 @@ from lark_oapi.channel.config import (
     SafetyConfig,
     TextBatchConfig,
 )
-from lark_oapi.channel.types import InboundMessage
+from lark_oapi.channel.types import (
+    ImageContent,
+    InboundMessage,
+    PostContent,
+    TextContent,
+)
 
 from .config import AppConfig
 from .feishu_core import (
@@ -39,7 +44,7 @@ from .feishu_core import (
     _FOLLOWUP_LIBRARY,
     _followup_ack_card,
     _followup_error_card,
-    _parse_post_content,
+    _parse_post_text,
     get_archive_expected_owner,
     handle_archive_submit,
     handle_clarify_giveup_click,
@@ -149,29 +154,26 @@ def create_app(config: AppConfig) -> FastAPI:
             logger.error("fastapi loop not ready, drop event")
             return
 
-        # image_key / post AST / caption 这些飞书原始 wire 字段还得从 raw 里挖；
-        # InboundMessage.raw 就是飞书 message dict（已经从 v2 envelope 剥出来）。
-        raw_content_str = (inbound.raw or {}).get("content") or "{}"
-        try:
-            content_dict = json.loads(raw_content_str)
-        except json.JSONDecodeError:
-            content_dict = {}
+        # SDK 的 InboundPipeline 已经把 content JSON 解析成 typed dataclass，
+        # image_key / post AST 直接从 inbound.content 拿；post 里的 image
+        # 走 inbound.resources（converter 抽完了）。文本走 content.raw（原始
+        # 未解析 @ 的形式），保留按 mentions[].key 整段剥 @ 的语义。
+        content = inbound.content
 
-        if message_type == "image":
-            image_key = content_dict.get("image_key")
-            if not image_key or not msg_id:
+        if isinstance(content, ImageContent):
+            if not content.image_key or not msg_id:
                 logger.info(
                     "image message missing key/msg_id: chat=%s user=%s",
                     chat_id,
                     sender_id,
                 )
                 return
-            caption = _extract_image_caption(content_dict)
+            caption = _extract_image_caption(content.raw)
             asyncio.run_coroutine_threadsafe(
                 handle_image_question(
                     chat_id,
                     sender_id,
-                    image_key,
+                    content.image_key,
                     msg_id,
                     feishu,
                     session_mgr,
@@ -181,8 +183,11 @@ def create_app(config: AppConfig) -> FastAPI:
             )
             return
 
-        if message_type == "post":
-            text, image_keys = _parse_post_content(content_dict)
+        if isinstance(content, PostContent):
+            text = _parse_post_text(content.post)
+            image_keys = [
+                r.file_key for r in inbound.resources if r.type == "image"
+            ]
             asyncio.run_coroutine_threadsafe(
                 handle_post_question(
                     chat_id,
@@ -197,7 +202,7 @@ def create_app(config: AppConfig) -> FastAPI:
             )
             return
 
-        if message_type != "text":
+        if not isinstance(content, TextContent):
             logger.info(
                 "non-text message: type=%s chat=%s user=%s",
                 message_type,
@@ -212,8 +217,10 @@ def create_app(config: AppConfig) -> FastAPI:
             )
             return
 
-        # text 消息：从原 content.text 抽问题，按 mentions[].key 去掉 @bot 占位符
-        question = (content_dict.get("text") or "").strip()
+        # text 消息：用 content.raw 里的原始文本（@_user_N 占位符未替换），
+        # 配合 mentions[].key 整段剥 @ 占位。inbound.content.text 已被 SDK
+        # resolve_mentions 成 @Name，再按 m.key replace 会 miss——所以走 raw。
+        question = (content.raw.get("text") or "").strip()
         for m in inbound.mentions:
             if m.key:
                 question = question.replace(m.key, "").strip()
