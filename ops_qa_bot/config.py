@@ -67,6 +67,27 @@ class DocQAConfig:
 
 
 @dataclass
+class GatewayTraceConfig:
+    """网关链路排查接口（cat logview）的接入配置。
+
+    网关组件文档里有一套人工排查流程（拿响应头 Hi-Trace-Id 去 cat 页面查链路）。
+    bot 把页面背后的后端接口包成工具 `query_gateway_trace`，让 agent 在用户报告
+    "访问失败 + 给了 Hi-Trace-Id" 时确定性地取到链路数据。
+
+    `base_url` 为空时整个特性关闭（不挂工具），无此需求的部署零感知。内部环境
+    无鉴权，故没有 token 字段。`timeout` 是一次 logview GET 的上限，接口很快，
+    默认 15s 足够。
+    """
+
+    base_url: str | None = None
+    timeout: float = 15.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url)
+
+
+@dataclass
 class AppConfig:
     docs_root: Path
     feishu: FeishuConfig
@@ -76,6 +97,7 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     doc_qa: DocQAConfig = field(default_factory=DocQAConfig)
+    gateway_trace: GatewayTraceConfig = field(default_factory=GatewayTraceConfig)
 
 
 def _pick(env_key: str, cfg_value: Any, default: Any = None) -> Any:
@@ -152,6 +174,17 @@ def load_config(path: Path) -> AppConfig:
         _pick("DOC_QA_TIMEOUT", doc_qa_raw.get("timeout"), 60)
     )
 
+    gw_trace_raw = data.get("gateway_trace") or {}
+    gw_trace_base_url = (
+        _pick("GATEWAY_TRACE_BASE_URL", gw_trace_raw.get("base_url")) or None
+    )
+    # 末尾斜杠归一化：拼 logview 路径时不想撞出双斜杠
+    if gw_trace_base_url:
+        gw_trace_base_url = gw_trace_base_url.rstrip("/")
+    gw_trace_timeout = float(
+        _pick("GATEWAY_TRACE_TIMEOUT", gw_trace_raw.get("timeout"), 15)
+    )
+
     return AppConfig(
         docs_root=docs_root,
         feishu=FeishuConfig(
@@ -173,5 +206,9 @@ def load_config(path: Path) -> AppConfig:
             base_url=doc_qa_base_url,
             token=doc_qa_token,
             timeout=doc_qa_timeout,
+        ),
+        gateway_trace=GatewayTraceConfig(
+            base_url=gw_trace_base_url,
+            timeout=gw_trace_timeout,
         ),
     )

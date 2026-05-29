@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from .bot import OpsQABot, format_tool_call
-from .config import DocQAConfig
+from .config import DocQAConfig, GatewayTraceConfig
 
 
 def _doc_qa_from_env() -> DocQAConfig | None:
@@ -22,12 +22,28 @@ def _doc_qa_from_env() -> DocQAConfig | None:
     )
 
 
+def _gateway_trace_from_env() -> GatewayTraceConfig | None:
+    """CLI 无配置文件，从环境变量读网关链路排查接入（方便从 REPL 测）。
+
+    GATEWAY_TRACE_BASE_URL 为空则不启用。
+    """
+    base_url = (os.environ.get("GATEWAY_TRACE_BASE_URL") or "").rstrip("/")
+    if not base_url:
+        return None
+    return GatewayTraceConfig(
+        base_url=base_url,
+        timeout=float(os.environ.get("GATEWAY_TRACE_TIMEOUT") or 15),
+    )
+
+
 async def run_repl(docs_root: Path, show_tools: bool) -> None:
     print(f"运维文档问答机器人（文档根目录：{docs_root}）")
     print("输入问题后回车提问，空行或 Ctrl+C 退出。\n")
 
     async with OpsQABot(
-        docs_root=docs_root, doc_qa_config=_doc_qa_from_env()
+        docs_root=docs_root,
+        doc_qa_config=_doc_qa_from_env(),
+        gateway_trace_config=_gateway_trace_from_env(),
     ) as bot:
         while True:
             try:

@@ -16,8 +16,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from .config import DocQAConfig
+from .config import DocQAConfig, GatewayTraceConfig
 from .doc_qa import FULL_TOOL_NAME, SERVER_KEY, build_doc_qa_server
+from .gateway_trace import FULL_TOOL_NAME as GW_TRACE_FULL_TOOL_NAME
+from .gateway_trace import SERVER_KEY as GW_TRACE_SERVER_KEY
+from .gateway_trace import build_gateway_trace_server
 from .prompt import build_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -171,6 +174,8 @@ def format_tool_call(name: str, tool_input: dict) -> str:
             f"query_feishu_doc(component={tool_input.get('component', '?')}, "
             f"q_len={len(q)})"
         )
+    if name == GW_TRACE_FULL_TOOL_NAME:
+        return f"query_gateway_trace(hi_trace_id={tool_input.get('hi_trace_id', '?')})"
     return f"{name}({tool_input})"
 
 
@@ -191,6 +196,7 @@ class OpsQABot:
         self,
         docs_root: str | Path,
         doc_qa_config: DocQAConfig | None = None,
+        gateway_trace_config: GatewayTraceConfig | None = None,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -222,6 +228,14 @@ class OpsQABot:
         # MCP 工具叠加在内置 tools 之上（tools 列表只约束内置工具，不含 MCP）。
         # bypassPermissions 已跳过所有权限询问，allowed_tools 不是必须；仍显式列出
         # 工具全名做白名单收敛，意图清晰、也防 SDK/CLI 默认策略未来收紧。
+        # 网关链路排查工具：base_url 配了才启用。挂一个进程内 MCP 工具
+        # query_gateway_trace，让 agent 在用户报告"访问失败 + 给了 Hi-Trace-Id"时
+        # 确定性地取到 cat 链路日志（而不是靠读文档现拼 curl，触发不稳）。没配则
+        # 整个特性关闭，无网关链路需求的部署零感知。
+        gw_trace_enabled = bool(
+            gateway_trace_config and gateway_trace_config.enabled
+        )
+
         mcp_servers: dict = {}
         allowed_tools: list[str] = []
         if doc_qa_enabled:
@@ -230,6 +244,12 @@ class OpsQABot:
                 self.docs_root, doc_qa_config
             )
             allowed_tools.append(FULL_TOOL_NAME)
+        if gw_trace_enabled:
+            assert gateway_trace_config is not None
+            mcp_servers[GW_TRACE_SERVER_KEY] = build_gateway_trace_server(
+                gateway_trace_config
+            )
+            allowed_tools.append(GW_TRACE_FULL_TOOL_NAME)
 
         self._options = ClaudeAgentOptions(
             system_prompt=build_system_prompt(

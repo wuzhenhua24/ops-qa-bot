@@ -49,3 +49,11 @@ port    = 8001                          # env: HEALTH_PORT
 base_url = ""                           # env: DOC_QA_BASE_URL，如 http://127.0.0.1:8800（不带末尾 /doc_qa）
 token    = ""                           # env: DOC_QA_TOKEN，对端 HTTP_API_TOKEN；对端没开鉴权则留空
 timeout  = 60                           # env: DOC_QA_TIMEOUT（秒）。要 ≥ 对端最坏耗时（内部还要跑 agent + 拉图）
+
+# 可选：网关链路排查接口（cat logview）接入。网关组件文档里有一套人工排查流程
+# （拿失败响应头的 Hi-Trace-Id 去 cat 页面查链路）；配上 base_url 后 bot 会挂一个
+# query_gateway_trace 工具，用户报告"访问失败 + 给了 Hi-Trace-Id"时确定性地取链路
+# 日志。base_url 留空则整个特性关闭。内部环境无鉴权，无 token 字段。
+[gateway_trace]
+base_url = ""                           # env: GATEWAY_TRACE_BASE_URL，如 http://10.164.200.155:8080（不带末尾 /cat/...）
+timeout  = 15                           # env: GATEWAY_TRACE_TIMEOUT（秒）。logview GET 很快，默认 15s 足够
