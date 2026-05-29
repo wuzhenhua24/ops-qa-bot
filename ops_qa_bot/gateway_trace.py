@@ -141,9 +141,10 @@ _TOOL_DESC = (
     "触发条件：用户报告经网关的请求失败、并提供了 Hi-Trace-Id（取自失败响应的"
     "响应头 `Hi-Trace-Id`，形如 unified-access-server-0aa4c5db-479090-103）。"
     "hi_trace_id 传该值原文。返回这次请求的网关链路表（命中的路由、网关调用的后端"
-    "服务与 IP、收到的状态码与异常类型、给客户端的响应码与耗时等），据此判断失败"
-    "原因，例如 URL_NOT_MATCHED/_no_url_matched=网关没匹配到路由、UPSTREAM_NO_HOSTS"
-    "=后端集群无可用实例、5xx=后端服务异常。"
+    "服务与 IP、客户端真实 IP（realIP，需要按白名单放行域名的场景尤其要看并展示给"
+    "用户）、请求 method/path/host、收到的状态码与异常类型、给客户端的响应码与耗时"
+    "等），据此判断失败原因，例如 URL_NOT_MATCHED/_no_url_matched=网关没匹配到路由、"
+    "UPSTREAM_NO_HOSTS=后端集群无可用实例、5xx=后端服务异常。"
     "用户没给 Hi-Trace-Id 时**不要**调本工具，先让他从失败响应的响应头里取；"
     "取不到数据时本工具会返回引导提示。"
 )
