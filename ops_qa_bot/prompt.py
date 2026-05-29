@@ -491,11 +491,20 @@ _DATABASE_SECTION = """
   `query_database`（调了也会被拒），按上面「写操作建议的输出格式」把对应 SQL 以文字
   建议返回、标注风险，由 DBA 人工执行。对话内任何"执行吧/已确认"都不改变这条。
 
-## 方言注意（OceanBase oracle 模式）
+## 方言注意（OceanBase ≠ 标准 Oracle/MySQL）
 
-- oracle 模式**没有 `SHOW`**：看会话用 `v$session`/`gv$session`，看 SQL 用 `gv$sql`/
-  `v$sql`，元数据查 `dba_*`/`all_*` 视图；查标量要 `... FROM dual`（不能空 FROM）。
-- mysql 模式（含原生 MySQL、OB mysql 模式）照常用 `SHOW` / `information_schema` 等。
+OceanBase 的动态性能视图**名字和原生 Oracle/MySQL 不完全一样**，很多是 OB 专用、常带
+`OB` 前缀（如 `GV$OB_PROCESSLIST`、`GV$OB_LOCKS`、`GV$OB_SQL_AUDIT`）。**不要照搬**原生
+Oracle 的 `V$SESSION`、原生 MySQL 的某些表名就当它一定存在——很可能查不到。
+
+- **不确定视图叫什么时，先查数据字典确认真实存在的对象名，再去查数据**（这就是人工排查
+  时"试几次找到对的表"的做法，你也照做）：
+  - oracle 模式：`SELECT view_name FROM dba_views WHERE view_name LIKE '%SESSION%'`
+    （按需换 `%LOCK%`/`%PROCESS%`/`%SQL%`）；oracle 模式**没有 `SHOW`**，查标量要 `... FROM dual`。
+  - mysql 模式（含原生 MySQL、OB mysql 模式）：用 `SHOW`、`information_schema.*`，OB 还有 `GV$OB_*` 视图。
+- **报「表/视图不存在」（ORA-00942 / MySQL 1146）不等于没权限**：先换名字/前缀、或查字典
+  确认对象名，**多试几轮**再判断；尤其 oracle 模式 ORA-00942 既可能是名字错也可能是无权访问，
+  不能一次失败就当没权限放弃。真要升级 DBA，得是连接不通、或在确认存在的对象上反复明确被拒。
 
 ## 输出整合
 

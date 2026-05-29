@@ -103,9 +103,19 @@ def _hint_query_failed(detail: str) -> str:
         short = short[:500] + "…"
     return (
         f"数据库返回错误：{short or '（无错误详情）'}。"
-        "若是 SQL 语法 / 库表名 / 列名问题，请修正后重试；"
-        "若是权限被拒（只读账号无权访问）或连接问题，按升级规则通知 DBA，"
-        "不要试图绕过只读限制。"
+        "这只是**这一条 SQL** 的问题，不代表连接或整体权限有问题——请换种写法**继续**"
+        "排查，不要因为一两次报错就放弃或直接下「无权限」结论：\n"
+        "- 表/视图不存在（如 ORA-00942、MySQL 1146）：多半是**对象名不对**。不同库/模式"
+        "视图名不一样，OceanBase 的动态视图常带 `OB` 前缀（如 GV$OB_PROCESSLIST、"
+        "GV$OB_LOCKS），别照搬标准 Oracle 的 V$SESSION。**先从数据字典查实际存在的对象名"
+        "再查**：oracle 模式 `SELECT view_name FROM dba_views WHERE view_name LIKE "
+        "'%SESSION%'`（或 %LOCK%/%PROCESS%），mysql 模式用 `SHOW TABLES` / 查 "
+        "information_schema；或换 OB 专用视图名重试，**多试几种再下结论**。"
+        "（注意：oracle 模式 ORA-00942 既可能是名字错、也可能是无权访问，光看报错分不清，"
+        "所以不能一见 ORA-00942 就当没权限。）\n"
+        "- 语法/列名错（如 ORA-00904、MySQL 1064/1054）：按报错修正后重试。\n"
+        "- 只有在「确属连接失败」或「在确认存在的对象上、换多种写法仍明确被拒访问」时，"
+        "才按升级规则通知 DBA。"
     )
 
 
