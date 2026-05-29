@@ -32,7 +32,7 @@ from lark_oapi.channel.types import (
 )
 
 from .bot import AnswerResult, OpsQABot
-from .config import DocQAConfig, GatewayTraceConfig
+from .config import DatabaseConfig, DocQAConfig, GatewayTraceConfig
 from .doc_qa import FULL_TOOL_NAME, parse_feishu_registry
 from .doc_qa import _norm_key as _feishu_norm_key
 from .feishu_format import markdown_to_feishu_post
@@ -765,11 +765,13 @@ class SessionManager:
         idle_ttl: float = 1800.0,
         doc_qa_config: "DocQAConfig | None" = None,
         gateway_trace_config: "GatewayTraceConfig | None" = None,
+        database_config: "DatabaseConfig | None" = None,
     ):
         self._docs_root = docs_root
         self._idle_ttl = idle_ttl
         self._doc_qa_config = doc_qa_config
         self._gateway_trace_config = gateway_trace_config
+        self._database_config = database_config
         self._sessions: dict[SessionKey, _SessionEntry] = {}
         self._manager_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
@@ -800,6 +802,7 @@ class SessionManager:
                     docs_root=self._docs_root,
                     doc_qa_config=self._doc_qa_config,
                     gateway_trace_config=self._gateway_trace_config,
+                    database_config=self._database_config,
                 )
                 await bot.__aenter__()
                 entry = _SessionEntry(bot)

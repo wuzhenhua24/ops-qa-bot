@@ -109,6 +109,7 @@ class WsRunner:
             idle_ttl=config.session_idle_ttl,
             doc_qa_config=config.doc_qa,
             gateway_trace_config=config.gateway_trace,
+            database_config=config.database,
         )
 
         self._health: HealthServer | None = None

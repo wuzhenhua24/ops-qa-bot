@@ -57,3 +57,31 @@ timeout  = 60                           # env: DOC_QA_TIMEOUT（秒）。要 ≥
 [gateway_trace]
 base_url = ""                           # env: GATEWAY_TRACE_BASE_URL，如 http://10.164.200.155:8080（不带末尾 /cat/...）
 timeout  = 15                           # env: GATEWAY_TRACE_TIMEOUT（秒）。logview GET 很快，默认 15s 足够
+
+# 可选：数据库只读分析接入。部署机本身装了 mysql / obclient 客户端；asker 在问题里给
+# 连接信息（IP/端口/租户/集群），bot 用这里配的【只读账号】直连目标库跑只读 SQL
+# （工具 query_database），做 CPU 高/连接数高/慢查询等实时排查。只读由数据库账号权限
+# 强制（写操作引擎直接拒），bot 不做 SQL 白/黑名单，agent 可自由迭代地查。
+#
+# allowed_hosts 为空则整个特性关闭（无此需求的部署零感知）；它把 bot 能连到的实例限在
+# 测试环境白名单内（配合“生产天生隔离”做边界）。还需至少配一套只读账号才会真正启用。
+# 密码经 MYSQL_PWD 注入、不进命令行/日志/agent 上下文，敏感值建议只走环境变量。
+[database]
+# 允许连接的目标 IP / 网段（CIDR）白名单。env: DB_ALLOWED_HOSTS（逗号分隔，整体覆盖本列表）
+allowed_hosts    = []                   # 如 ["10.10.0.0/16", "172.28.65.2"]
+query_timeout    = 30                   # env: DB_QUERY_TIMEOUT（秒）。一条 SQL 的连接+执行硬上限
+max_result_chars = 20000                # env: DB_MAX_RESULT_CHARS。单次结果返回上限，超出截断防灌爆上下文
+
+# 三套【只读】账号，按连接类型分。哪套没配，对应类型的查询就报“未配置只读账号”。
+# 原生 MySQL（mysql client）
+[database.mysql]
+ro_user     = ""                        # env: DB_MYSQL_RO_USER
+ro_password = ""                        # env: DB_MYSQL_RO_PASSWORD
+# OceanBase mysql 模式（obclient，连接形如 -urw_review@bd_p1#hx_new）
+[database.ob_mysql]
+ro_user     = ""                        # env: DB_OB_MYSQL_RO_USER
+ro_password = ""                        # env: DB_OB_MYSQL_RO_PASSWORD
+# OceanBase oracle 模式（obclient，连接形如 -uSYS@zj#qd_dev_00001）
+[database.ob_oracle]
+ro_user     = ""                        # env: DB_OB_ORACLE_RO_USER
+ro_password = ""                        # env: DB_OB_ORACLE_RO_PASSWORD

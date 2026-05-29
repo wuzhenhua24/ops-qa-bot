@@ -97,6 +97,7 @@ def create_app(config: AppConfig) -> FastAPI:
         idle_ttl=idle_ttl,
         doc_qa_config=config.doc_qa,
         gateway_trace_config=config.gateway_trace,
+        database_config=config.database,
     )
 
     # channel 后台 loop 兜底全部 async 资源：session_mgr.start() 在 bg loop 上

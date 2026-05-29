@@ -16,7 +16,10 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from .config import DocQAConfig, GatewayTraceConfig
+from .config import DatabaseConfig, DocQAConfig, GatewayTraceConfig
+from .db_query import FULL_TOOL_NAME as DB_FULL_TOOL_NAME
+from .db_query import SERVER_KEY as DB_SERVER_KEY
+from .db_query import build_database_server
 from .doc_qa import FULL_TOOL_NAME, SERVER_KEY, build_doc_qa_server
 from .gateway_trace import FULL_TOOL_NAME as GW_TRACE_FULL_TOOL_NAME
 from .gateway_trace import SERVER_KEY as GW_TRACE_SERVER_KEY
@@ -176,6 +179,13 @@ def format_tool_call(name: str, tool_input: dict) -> str:
         )
     if name == GW_TRACE_FULL_TOOL_NAME:
         return f"query_gateway_trace(hi_trace_id={tool_input.get('hi_trace_id', '?')})"
+    if name == DB_FULL_TOOL_NAME:
+        # SQL 可能很长，日志只记连接信息 + 语句长度，不刷屏（也不落 SQL 全文）
+        sql = str(tool_input.get("sql", ""))
+        return (
+            f"query_database(db_type={tool_input.get('db_type', '?')}, "
+            f"host={tool_input.get('host', '?')}, sql_len={len(sql)})"
+        )
     return f"{name}({tool_input})"
 
 
@@ -197,6 +207,7 @@ class OpsQABot:
         docs_root: str | Path,
         doc_qa_config: DocQAConfig | None = None,
         gateway_trace_config: GatewayTraceConfig | None = None,
+        database_config: DatabaseConfig | None = None,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -236,6 +247,12 @@ class OpsQABot:
             gateway_trace_config and gateway_trace_config.enabled
         )
 
+        # 数据库只读分析工具：allowed_hosts 配了且至少一套只读账号在时才启用。挂一个
+        # 进程内 MCP 工具 query_database，让 agent 在用户报告"某测试库 CPU 高/连接数高/
+        # 慢查询"并给了连接信息时，用只读账号直连跑诊断 SQL（只读由账号权限强制）。
+        # 没配则整个特性关闭，无数据库分析需求的部署零感知。
+        db_enabled = bool(database_config and database_config.enabled)
+
         mcp_servers: dict = {}
         allowed_tools: list[str] = []
         if doc_qa_enabled:
@@ -250,10 +267,16 @@ class OpsQABot:
                 gateway_trace_config
             )
             allowed_tools.append(GW_TRACE_FULL_TOOL_NAME)
+        if db_enabled:
+            assert database_config is not None
+            mcp_servers[DB_SERVER_KEY] = build_database_server(database_config)
+            allowed_tools.append(DB_FULL_TOOL_NAME)
 
         self._options = ClaudeAgentOptions(
             system_prompt=build_system_prompt(
-                self.docs_root, doc_qa_enabled=doc_qa_enabled
+                self.docs_root,
+                doc_qa_enabled=doc_qa_enabled,
+                db_enabled=db_enabled,
             ),
             tools=["Read", "Glob", "Grep", "Bash"],
             mcp_servers=mcp_servers,

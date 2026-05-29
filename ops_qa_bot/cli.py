@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from .bot import OpsQABot, format_tool_call
-from .config import DocQAConfig, GatewayTraceConfig
+from .config import DatabaseConfig, DbCreds, DocQAConfig, GatewayTraceConfig
 
 
 def _doc_qa_from_env() -> DocQAConfig | None:
@@ -36,6 +36,32 @@ def _gateway_trace_from_env() -> GatewayTraceConfig | None:
     )
 
 
+def _database_from_env() -> DatabaseConfig | None:
+    """CLI 无配置文件，从环境变量读数据库只读分析接入（方便从 REPL 测）。
+
+    DB_ALLOWED_HOSTS（逗号分隔的 IP/CIDR）为空则不启用。
+    """
+    hosts_raw = os.environ.get("DB_ALLOWED_HOSTS") or ""
+    allowed_hosts = tuple(h.strip() for h in hosts_raw.split(",") if h.strip())
+    if not allowed_hosts:
+        return None
+
+    def _creds(env_user: str, env_pwd: str) -> DbCreds:
+        return DbCreds(
+            user=os.environ.get(env_user) or None,
+            password=os.environ.get(env_pwd) or None,
+        )
+
+    return DatabaseConfig(
+        allowed_hosts=allowed_hosts,
+        query_timeout=float(os.environ.get("DB_QUERY_TIMEOUT") or 30),
+        max_result_chars=int(os.environ.get("DB_MAX_RESULT_CHARS") or 20000),
+        mysql_ro=_creds("DB_MYSQL_RO_USER", "DB_MYSQL_RO_PASSWORD"),
+        ob_mysql_ro=_creds("DB_OB_MYSQL_RO_USER", "DB_OB_MYSQL_RO_PASSWORD"),
+        ob_oracle_ro=_creds("DB_OB_ORACLE_RO_USER", "DB_OB_ORACLE_RO_PASSWORD"),
+    )
+
+
 async def run_repl(docs_root: Path, show_tools: bool) -> None:
     print(f"运维文档问答机器人（文档根目录：{docs_root}）")
     print("输入问题后回车提问，空行或 Ctrl+C 退出。\n")
@@ -44,6 +70,7 @@ async def run_repl(docs_root: Path, show_tools: bool) -> None:
         docs_root=docs_root,
         doc_qa_config=_doc_qa_from_env(),
         gateway_trace_config=_gateway_trace_from_env(),
+        database_config=_database_from_env(),
     ) as bot:
         while True:
             try:

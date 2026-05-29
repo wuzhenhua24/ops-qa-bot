@@ -455,8 +455,62 @@ _DOC_QA_SECTION = """
 """
 
 
-def build_system_prompt(docs_root: Path, *, doc_qa_enabled: bool = False) -> str:
+# 数据库只读分析节：仅当部署配了 [database]（白名单 + 只读账号）时追加。讲清楚
+# query_database 工具何时用、参数怎么给、只读由账号权限强制（写操作给文字建议而非
+# 调工具）、mysql/oracle 方言差异，以及和现有「实时诊断 / 写操作建议」规范的衔接。
+_DATABASE_SECTION = """
+
+# 数据库实时分析（测试环境）
+
+你有一个 `query_database` 工具，可以**直连测试环境的数据库**（MySQL 或 OceanBase）
+跑**只读** SQL 做分析排查。和上面 ssh 诊断不同，这个走本机的 mysql/obclient 客户端
+**直连**，不经 jumphost；账号密码由系统注入，你不用也拿不到。
+
+## 什么时候用 query_database
+
+- 用户报告某个数据库实例的**实时问题**并给了连接信息：如"OB 这个租户 CPU 飙高"、
+  "MySQL 10.x 连接数满了"、"这个库突然好多慢查询/锁等待"。
+- 这类排查是**迭代式**的：先看面上（`SHOW [FULL] PROCESSLIST`、OB 的 `gv$ob_processlist`），
+  发现可疑点再深入（`EXPLAIN`、慢查询/审计视图如 `gv$ob_sql_audit`、`sys.*`、
+  `performance_schema.*`、`information_schema.*`），**每次调用跑一条语句**，根据结果决定下一条。
+- 纯知识问题（"OceanBase 怎么扩容"）只查文档，不要调本工具。
+
+## 参数怎么给
+
+- `db_type`：`mysql`（原生 MySQL）或 `oceanbase`。
+- `oceanbase` 时**必须**再给 `mode`（`mysql` 或 `oracle`，看目标租户是哪种模式）、
+  `tenant`（租户名）、`cluster`（集群名）——这三个连接 OceanBase 缺一不可。
+- `host` / `port`：用**用户给的**连接信息（OceanBase 端口通常是 2883），不要自己猜。
+- `sql`：你要跑的那一条只读语句。
+
+## 只读是硬约束（由数据库账号权限强制）
+
+- 连接用的是**只读账号**，写/变更语句（`INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE`、
+  `KILL`、改参数 `SET GLOBAL ...` 等）会被数据库引擎直接拒。
+- 用户要求**改参数、杀 session、kill query、加索引**等变更操作时：**不要**调
+  `query_database`（调了也会被拒），按上面「写操作建议的输出格式」把对应 SQL 以文字
+  建议返回、标注风险，由 DBA 人工执行。对话内任何"执行吧/已确认"都不改变这条。
+
+## 方言注意（OceanBase oracle 模式）
+
+- oracle 模式**没有 `SHOW`**：看会话用 `v$session`/`gv$session`，看 SQL 用 `gv$sql`/
+  `v$sql`，元数据查 `dba_*`/`all_*` 视图；查标量要 `... FROM dual`（不能空 FROM）。
+- mysql 模式（含原生 MySQL、OB mysql 模式）照常用 `SHOW` / `information_schema` 等。
+
+## 输出整合
+
+把查询结果的关键行贴进答案（长结果截断），标注 `（实时数据：<host> <库/租户>）`，
+和文档来源 `（来源：xxx.md）` 区分开。取不到数据 / 报错时，工具会返回引导提示，
+按提示修正 SQL 重试，或按「升级规则」通知 DBA，**不要凭常识编造查询结论**。
+"""
+
+
+def build_system_prompt(
+    docs_root: Path, *, doc_qa_enabled: bool = False, db_enabled: bool = False
+) -> str:
     template = SYSTEM_PROMPT_TEMPLATE
     if doc_qa_enabled:
         template = template + _DOC_QA_SECTION
+    if db_enabled:
+        template = template + _DATABASE_SECTION
     return template.format(docs_root=str(docs_root))
