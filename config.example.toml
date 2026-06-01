@@ -66,22 +66,38 @@ timeout  = 15                           # env: GATEWAY_TRACE_TIMEOUT（秒）。
 # allowed_hosts 为空则整个特性关闭（无此需求的部署零感知）；它把 bot 能连到的实例限在
 # 测试环境白名单内（配合“生产天生隔离”做边界）。还需至少配一套只读账号才会真正启用。
 # 密码经 MYSQL_PWD 注入、不进命令行/日志/agent 上下文，敏感值建议只走环境变量。
+#
+# 参数变更审批（可选、独立的更高权限能力）：asker 申请改某实例参数 → bot 用【admin 账号】
+# 拼出 SET GLOBAL / ALTER SYSTEM SET 语句 → 发确认卡到群里 → 只有 admin_open_ids 名单里
+# 的人点“确认执行”才真正改（执行在飞书回调里、不在 agent 进程内，agent 全程只提议不执行）。
+# 要启用需三条都齐：allowed_hosts 非空 + admin_open_ids 非空 + 至少一套 admin 账号。
+# admin_open_ids 与文档负责人（INDEX.md owner）刻意解耦——改库参数和答归档问题是两个量级的权限。
 [database]
 # 允许连接的目标 IP / 网段（CIDR）白名单。env: DB_ALLOWED_HOSTS（逗号分隔，整体覆盖本列表）
 allowed_hosts    = []                   # 如 ["10.10.0.0/16", "172.28.65.2"]
 query_timeout    = 30                   # env: DB_QUERY_TIMEOUT（秒）。一条 SQL 的连接+执行硬上限
 max_result_chars = 20000                # env: DB_MAX_RESULT_CHARS。单次结果返回上限，超出截断防灌爆上下文
+# 有权点“确认执行”参数变更的飞书 open_id 白名单（DBA / 库管理员，非文档负责人）。
+# 为空则参数变更审批整体关闭。env: DB_ADMIN_OPEN_IDS（逗号分隔，整体覆盖本列表）
+admin_open_ids   = []                   # 如 ["ou_xxx", "ou_yyy"]
 
-# 三套【只读】账号，按连接类型分。哪套没配，对应类型的查询就报“未配置只读账号”。
+# 各连接类型的账号：ro_*（只读，跑诊断 SQL）与 admin_*（写权限，执行已审批的参数变更）。
+# 哪套 ro 没配，对应类型查询报“未配置只读账号”；admin_* 没配则该类型不能走参数变更审批。
 # 原生 MySQL（mysql client）
 [database.mysql]
-ro_user     = ""                        # env: DB_MYSQL_RO_USER
-ro_password = ""                        # env: DB_MYSQL_RO_PASSWORD
+ro_user        = ""                     # env: DB_MYSQL_RO_USER
+ro_password    = ""                     # env: DB_MYSQL_RO_PASSWORD
+admin_user     = ""                     # env: DB_MYSQL_ADMIN_USER（参数变更才需要）
+admin_password = ""                     # env: DB_MYSQL_ADMIN_PASSWORD
 # OceanBase mysql 模式（obclient，连接形如 -urw_review@bd_p1#hx_new）
 [database.ob_mysql]
-ro_user     = ""                        # env: DB_OB_MYSQL_RO_USER
-ro_password = ""                        # env: DB_OB_MYSQL_RO_PASSWORD
+ro_user        = ""                     # env: DB_OB_MYSQL_RO_USER
+ro_password    = ""                     # env: DB_OB_MYSQL_RO_PASSWORD
+admin_user     = ""                     # env: DB_OB_MYSQL_ADMIN_USER
+admin_password = ""                     # env: DB_OB_MYSQL_ADMIN_PASSWORD
 # OceanBase oracle 模式（obclient，连接形如 -uSYS@zj#qd_dev_00001）
 [database.ob_oracle]
-ro_user     = ""                        # env: DB_OB_ORACLE_RO_USER
-ro_password = ""                        # env: DB_OB_ORACLE_RO_PASSWORD
+ro_user        = ""                     # env: DB_OB_ORACLE_RO_USER
+ro_password    = ""                     # env: DB_OB_ORACLE_RO_PASSWORD
+admin_user     = ""                     # env: DB_OB_ORACLE_ADMIN_USER
+admin_password = ""                     # env: DB_OB_ORACLE_ADMIN_PASSWORD

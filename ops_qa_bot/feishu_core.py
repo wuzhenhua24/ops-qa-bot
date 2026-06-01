@@ -33,6 +33,7 @@ from lark_oapi.channel.types import (
 
 from .bot import AnswerResult, OpsQABot
 from .config import DatabaseConfig, DocQAConfig, GatewayTraceConfig
+from .db_query import DatabaseClient, DatabaseQueryError, DbChangeRequest
 from .doc_qa import FULL_TOOL_NAME, parse_feishu_registry
 from .doc_qa import _norm_key as _feishu_norm_key
 from .feishu_format import markdown_to_feishu_post
@@ -766,12 +767,16 @@ class SessionManager:
         doc_qa_config: "DocQAConfig | None" = None,
         gateway_trace_config: "GatewayTraceConfig | None" = None,
         database_config: "DatabaseConfig | None" = None,
+        feishu: "FeishuClient | None" = None,
     ):
         self._docs_root = docs_root
         self._idle_ttl = idle_ttl
         self._doc_qa_config = doc_qa_config
         self._gateway_trace_config = gateway_trace_config
         self._database_config = database_config
+        # 参数变更审批要在工具里发飞书确认卡，需要 outbound client。注入了且
+        # admin 链路齐备时，每个 session 按 (chat, asker) 造一个 submitter 给 bot。
+        self._feishu = feishu
         self._sessions: dict[SessionKey, _SessionEntry] = {}
         self._manager_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task | None = None
@@ -798,11 +803,20 @@ class SessionManager:
         async with self._manager_lock:
             entry = self._sessions.get(key)
             if entry is None:
+                submitter = None
+                if (
+                    self._feishu is not None
+                    and self._database_config is not None
+                    and self._database_config.admin_enabled
+                ):
+                    # key = (chat_id, asker_open_id)：确认卡发到本群、@ 本提问者
+                    submitter = make_db_change_submitter(self._feishu, key[0], key[1])
                 bot = OpsQABot(
                     docs_root=self._docs_root,
                     doc_qa_config=self._doc_qa_config,
                     gateway_trace_config=self._gateway_trace_config,
                     database_config=self._database_config,
+                    db_change_submitter=submitter,
                 )
                 await bot.__aenter__()
                 entry = _SessionEntry(bot)
@@ -2419,6 +2433,339 @@ async def handle_archive_submit(
         return _archive_ack_card("✅", f"已归档至 `{rel}`{suffix}，谢谢！")
     return _archive_ack_card(
         "ℹ️", f"该 qid 的归档已存在（`{rel}`），跳过。"
+    )
+
+
+# ── 数据库参数变更审批 ──────────────────────────────────────────────────────
+# asker 申请改某实例参数 → request_db_change 工具（db_query）确定性校验 + 拼 SQL +
+# 读现值 → 经注入的 submitter 落成"群里一张确认卡 + 一条 pending 记录"。只有
+# admin_open_ids 名单里的人点「确认执行」才真正改——执行就在这里（飞书回调里）跑，
+# **不在 agent/SDK 进程内**，所以 prompt 的"agent 永不执行写操作"硬规则不被打破。
+# 与归档表单卡同构：pending TTLCache + 仅授权人可操作（非授权点击保持卡片可见）+
+# 替换卡 + @asker 通知。admin 名单与 INDEX.md 文档负责人**刻意解耦**。
+# change_id → {"req": DbChangeRequest, "chat_id", "asker_id", "card_msg_id", "created_at"}
+# 1h 没人点就过期；重启清空（测试环境不持久化）。
+_pending_db_changes: TTLCache = TTLCache(maxsize=1000, ttl=3600)
+
+
+def _db_admins(database_config: "DatabaseConfig | None") -> set[str]:
+    """有权审批参数变更的 open_id 集合。
+
+    v1 直接读 config 的 `admin_open_ids`（与 INDEX.md 文档负责人刻意解耦——改库参数
+    和答归档问题是两个量级的权限）。这是**收口点**：将来想换成 DBA-only / 按实例
+    分权，只改这一个函数、不动调用方。
+    """
+    if not database_config:
+        return set()
+    return set(database_config.admin_open_ids)
+
+
+def _fmt_db_instance(req: "DbChangeRequest") -> str:
+    """卡片/通知里展示的实例标识：host:port（OceanBase 再带 租户#集群 + 模式）。"""
+    base = f"{req.host}:{req.port}"
+    if req.kind in ("ob_mysql", "ob_oracle") and req.tenant:
+        return f"{base} · 租户 {req.tenant}#{req.cluster}（{req.db_type}/{req.mode}）"
+    return f"{base}（{req.db_type}）"
+
+
+def _db_change_card(change_id: str, req: "DbChangeRequest", asker_id: str | None) -> dict:
+    """参数变更确认卡（card v2）：实例 / 参数现值→新值 / 待执行 SQL / 申请人 +
+    「确认执行」「驳回」两个按钮。两个按钮都仅 `admin_open_ids` 名单里的人点有效
+    （校验在 handler，非授权点击保持卡片可见）。所见即所执行：卡上的 SQL 就是确认
+    时原样要跑的那条。
+    """
+    current = req.current_value or "（未取到，请确认前自行核对）"
+    asker_at = f"\n- 申请人：<at id={asker_id}></at>" if asker_id else ""
+    detail_md = (
+        "**🛠 数据库参数变更申请**（需管理员确认后执行）\n"
+        f"- 实例：{_fmt_db_instance(req)}\n"
+        f"- 参数：`{req.param}`\n"
+        f"- 变更：{current}  →  **{req.new_value}**"
+        f"{asker_at}"
+    )
+    sql_md = f"待执行 SQL（管理员确认后由 bot 执行）：\n```sql\n{req.sql}\n```"
+    confirm_btn = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "✅ 确认执行"},
+        "type": "primary",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": {"action": "db_change_confirm", "change_id": change_id},
+            }
+        ],
+    }
+    reject_btn = {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "❌ 驳回"},
+        "type": "danger",
+        "behaviors": [
+            {
+                "type": "callback",
+                "value": {"action": "db_change_reject", "change_id": change_id},
+            }
+        ],
+    }
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "数据库参数变更确认"},
+            "template": "orange",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": detail_md},
+                {"tag": "markdown", "content": sql_md},
+                {"tag": "markdown", "content": "*仅管理员可执行；其他人点击无效。*"},
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [confirm_btn],
+                        },
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [reject_btn],
+                        },
+                    ],
+                },
+            ]
+        },
+    }
+
+
+def make_db_change_submitter(
+    feishu: "FeishuClient", chat_id: str, asker_id: str
+):
+    """造一个按 (chat_id, asker) 绑定的 DbChangeSubmitter，注入给 request_db_change。
+
+    收到工具组装好的 DbChangeRequest → 发确认卡到本群 + 登记 pending，返回给 agent
+    的确认文字。卡发失败则不登记 pending、返回失败文字（让 agent 据此如实告诉用户）。
+    """
+
+    async def submit(req: "DbChangeRequest") -> str:
+        change_id = uuid.uuid4().hex
+        card = _db_change_card(change_id, req, asker_id)
+        msg_id = await feishu.send_interactive(chat_id, card)
+        if not msg_id:
+            return (
+                "⚠️ 变更已校验通过，但确认卡发送到群里失败了。请稍后让用户重试，"
+                "或把变更 SQL 交给 DBA 人工执行——目前数据库没有任何改动。"
+            )
+        _pending_db_changes[change_id] = {
+            "req": req,
+            "chat_id": chat_id,
+            "asker_id": asker_id,
+            "card_msg_id": msg_id,
+            "created_at": time.time(),
+        }
+        feedback_logger.info(
+            json.dumps(
+                {
+                    "event": "db_change_requested",
+                    "change_id": change_id,
+                    "asker_id": asker_id,
+                    "kind": req.kind,
+                    "host": req.host,
+                    "param": req.param,
+                    "new_value": req.new_value,
+                    "sql": req.sql,
+                },
+                ensure_ascii=False,
+            )
+        )
+        logger.info(
+            "db change requested: change_id=%s kind=%s host=%s param=%s asker=%s",
+            change_id,
+            req.kind,
+            req.host,
+            req.param,
+            asker_id,
+        )
+        return (
+            f"✅ 已把参数变更（`{req.param}` → {req.new_value}，实例 "
+            f"{_fmt_db_instance(req)}）以确认卡发到群里，等管理员点「确认执行」后才会"
+            "真正生效；在那之前数据库不会有任何改动。请如实告诉用户已发起审批、需管理员确认。"
+        )
+
+    return submit
+
+
+async def _notify_db_change_outcome(
+    feishu: "FeishuClient | None",
+    ctx: dict,
+    *,
+    outcome: str,
+    detail: str = "",
+) -> None:
+    """把变更结果 @ 回 asker（执行成功 / 失败 / 被驳回）。通知失败不影响主流程。"""
+    if feishu is None:
+        return
+    asker_id = ctx.get("asker_id")
+    if not asker_id:
+        return
+    req: DbChangeRequest = ctx["req"]
+    change = f"`{req.param}` → {req.new_value}（实例 {_fmt_db_instance(req)}）"
+    if outcome == "executed":
+        head = f"✅ 你申请的参数变更已由管理员确认并执行：{change}。"
+    elif outcome == "rejected":
+        head = (
+            f"❌ 你申请的参数变更被管理员驳回：{change}。"
+            "如仍需修改，请补充说明后重新申请。"
+        )
+    else:  # failed
+        head = (
+            f"⚠️ 你申请的参数变更经管理员确认后**执行失败**：{change}。"
+            f"原因：{detail or '未知'} 可联系 DBA 处理。"
+        )
+    try:
+        await feishu.send_post(
+            ctx["chat_id"], _mention_post(asker_id, head), parent_id=None
+        )
+    except Exception:
+        logger.exception(
+            "notify asker db change outcome failed: asker=%s outcome=%s",
+            asker_id,
+            outcome,
+        )
+
+
+def _db_change_audit(event: str, change_id: str, clicker_id: str | None, ctx: dict, **extra) -> None:
+    """写一条参数变更审计行（谁、对哪个实例的哪个参数、做了什么、结果）。"""
+    req: DbChangeRequest = ctx["req"]
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": event,
+                "change_id": change_id,
+                "clicker_id": clicker_id,
+                "asker_id": ctx.get("asker_id"),
+                "kind": req.kind,
+                "host": req.host,
+                "param": req.param,
+                "new_value": req.new_value,
+                "sql": req.sql,
+                **extra,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+async def handle_db_change_confirm(
+    change_id: str | None,
+    clicker_id: str | None,
+    database_config: "DatabaseConfig | None",
+    feishu: "FeishuClient | None" = None,
+) -> dict:
+    """管理员点「确认执行」：校验 admin → 用 admin 账号执行变更 → 替换卡 + 通知 asker。
+
+    返回应替换原卡的 ack 卡（card v2）。**非管理员点击例外**：返回原确认卡保持可见，
+    让真正的管理员还能点（同归档"非负责人"路径）。执行前先 pop pending 防双击重复。
+    """
+    if not change_id:
+        return _archive_ack_card("⚠️", "变更参数缺失，请联系管理员。")
+    ctx = _pending_db_changes.get(change_id)
+    if ctx is None:
+        return _archive_ack_card("⏰", "该变更申请已过期或已处理。")
+
+    req: DbChangeRequest = ctx["req"]
+    admins = _db_admins(database_config)
+    if not clicker_id or clicker_id not in admins:
+        # 非管理员：拒、保持卡片可见，记一条便于 grep 误点/越权频率
+        _db_change_audit("db_change_unauthorized", change_id, clicker_id, ctx, op="confirm")
+        logger.info(
+            "db change confirm rejected (not admin): change_id=%s by=%s",
+            change_id,
+            clicker_id,
+        )
+        return _db_change_card(change_id, req, ctx.get("asker_id"))
+
+    # 授权通过：先 pop 防两个管理员同时点导致重复执行
+    _pending_db_changes.pop(change_id, None)
+
+    if database_config is None:
+        return _archive_ack_card("⚠️", "缺少数据库配置，无法执行，请联系运维。")
+
+    client = DatabaseClient(database_config)
+    try:
+        result = await client.run_admin(req)
+    except DatabaseQueryError as e:
+        logger.warning("db change exec failed: change_id=%s err=%s", change_id, e)
+        _db_change_audit(
+            "db_change_failed", change_id, clicker_id, ctx, error=str(e)
+        )
+        await _notify_db_change_outcome(
+            feishu, ctx, outcome="failed", detail=e.agent_hint
+        )
+        return _archive_ack_card("❌", f"执行失败：{e.agent_hint}")
+    except Exception:
+        logger.exception("db change exec crashed: change_id=%s", change_id)
+        _db_change_audit(
+            "db_change_failed", change_id, clicker_id, ctx, error="exception"
+        )
+        await _notify_db_change_outcome(
+            feishu, ctx, outcome="failed", detail="执行时发生异常，请查日志。"
+        )
+        return _archive_ack_card("❌", "执行时发生异常，请联系运维查日志。")
+
+    _db_change_audit("db_change_executed", change_id, clicker_id, ctx, result=_excerpt(result, 300))
+    logger.info(
+        "db change executed: change_id=%s param=%s by=%s",
+        change_id,
+        req.param,
+        clicker_id,
+    )
+    await _notify_db_change_outcome(feishu, ctx, outcome="executed")
+    return _archive_ack_card(
+        "✅", f"已执行：`{req.param}` → {req.new_value}（by <@{clicker_id}>），已通知申请人。"
+    )
+
+
+async def handle_db_change_reject(
+    change_id: str | None,
+    clicker_id: str | None,
+    database_config: "DatabaseConfig | None",
+    feishu: "FeishuClient | None" = None,
+) -> dict:
+    """管理员点「驳回」：校验 admin → 丢弃 pending → 替换卡 + 通知 asker。
+
+    非管理员点击同样保持卡片可见（不允许随便谁驳回掉管理员要审的单子）。
+    """
+    if not change_id:
+        return _archive_ack_card("⚠️", "变更参数缺失，请联系管理员。")
+    ctx = _pending_db_changes.get(change_id)
+    if ctx is None:
+        return _archive_ack_card("⏰", "该变更申请已过期或已处理。")
+
+    req: DbChangeRequest = ctx["req"]
+    admins = _db_admins(database_config)
+    if not clicker_id or clicker_id not in admins:
+        _db_change_audit("db_change_unauthorized", change_id, clicker_id, ctx, op="reject")
+        logger.info(
+            "db change reject rejected (not admin): change_id=%s by=%s",
+            change_id,
+            clicker_id,
+        )
+        return _db_change_card(change_id, req, ctx.get("asker_id"))
+
+    _pending_db_changes.pop(change_id, None)
+    _db_change_audit("db_change_rejected", change_id, clicker_id, ctx)
+    logger.info(
+        "db change rejected: change_id=%s param=%s by=%s",
+        change_id,
+        req.param,
+        clicker_id,
+    )
+    await _notify_db_change_outcome(feishu, ctx, outcome="rejected")
+    return _archive_ack_card(
+        "🚫", f"已驳回该参数变更（`{req.param}` → {req.new_value}），by <@{clicker_id}>。"
     )
 
 

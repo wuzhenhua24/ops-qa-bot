@@ -35,6 +35,8 @@ import ipaddress
 import logging
 import os
 import re
+from dataclasses import dataclass
+from typing import Protocol
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from claude_agent_sdk.types import McpSdkServerConfig
@@ -47,6 +49,10 @@ logger = logging.getLogger("ops_qa_bot.db_query")
 TOOL_NAME = "query_database"
 SERVER_KEY = "db"
 FULL_TOOL_NAME = f"mcp__{SERVER_KEY}__{TOOL_NAME}"
+
+# 参数变更审批工具：只在 submitter 注入（即 admin 审批链路已接好）时才注册。
+CHANGE_TOOL_NAME = "request_db_change"
+CHANGE_FULL_TOOL_NAME = f"mcp__{SERVER_KEY}__{CHANGE_TOOL_NAME}"
 
 # 连接类型（引擎 + OceanBase 模式）。决定用哪个 client、哪套只读账号、哪种方言。
 _KIND_MYSQL = "mysql"  # 原生 MySQL，用 mysql client
@@ -62,6 +68,98 @@ _MAX_SQL_LEN = 8000
 
 # connect 阶段超时上限：不让它吃满整条 query_timeout（query 本身可能慢）。
 _MAX_CONNECT_TIMEOUT = 10
+
+# 参数名校验复用 _IDENT_RE（字母/数字/._-）。参数值的允许字符集刻意收紧：覆盖
+# 常见取值（数字、大小写枚举、容量 "256M"/"8G"、时长 "10s"、隔离级别
+# "READ-COMMITTED"、路径/比例等），但**禁掉引号/分号/反引号/括号**——值要被拼进
+# bot 自己构造的 `SET GLOBAL`/`ALTER SYSTEM SET` 语句，禁掉这些就堵死了注入面。
+# 不在集合内直接拒，让 asker 确认值（而不是冒险拼进 SQL）。
+_VALUE_RE = re.compile(r"^[A-Za-z0-9_.\-+:/ ]+$")
+_MAX_VALUE_LEN = 256
+# 纯整数值不加引号（如 max_connections=1000）；其余一律单引号包裹（如 '256M'）。
+# 值已过 _VALUE_RE，不含单引号，包裹安全。
+_INT_VALUE_RE = re.compile(r"^-?\d+$")
+
+
+@dataclass
+class DbChangeRequest:
+    """一笔待审批的参数变更——由 `request_db_change` 工具里确定性地组装好，交给
+    `DbChangeSubmitter` 发确认卡 + 登记 pending；管理员点确认时**原样执行 `sql`**。
+
+    `sql` 是 bot 用结构化的 param/value 拼出来的单条语句（已过标识符/值校验），
+    存进来就是为了"所见即所执行"——卡片展示它、确认时跑它，中间不再重新解析。
+    `current_value` 是用只读账号尽力读到的现值（读不到为 None），仅供卡片展示，
+    不参与执行。
+    """
+
+    kind: str  # _KIND_*
+    db_type: str
+    mode: str
+    host: str
+    port: int
+    tenant: str
+    cluster: str
+    param: str
+    new_value: str
+    sql: str
+    current_value: str | None = None
+
+
+class DbChangeSubmitter(Protocol):
+    """把一笔 DbChangeRequest 落成"群里一张确认卡 + 一条 pending 记录"。
+
+    由 feishu_core 实现并按 (chat_id, asker) 注入进 `request_db_change` 工具；
+    db_query 只依赖这个 Protocol，不 import feishu_core（避免循环依赖）。
+    返回给 agent 看的文字（如"已发审批卡，等管理员确认"），工具原样转给 LLM。
+    """
+
+    async def __call__(self, req: DbChangeRequest) -> str: ...
+
+
+def validate_param_value(param: str, value: str) -> None:
+    """校验参数名 + 目标值，非法抛 DatabaseQueryError（带 agent_hint）。"""
+    _validate_identifier(param, "param")
+    v = (value or "").strip()
+    if not v:
+        raise DatabaseQueryError("empty value", "缺少目标值（value）。请确认要把参数改成多少。")
+    if len(v) > _MAX_VALUE_LEN:
+        raise DatabaseQueryError("value too long", "目标值过长，疑似异常。请核对后重试。")
+    if not _VALUE_RE.match(v):
+        raise DatabaseQueryError(
+            f"bad value: {value!r}",
+            "目标值含不被允许的字符（只允许字母/数字/._-+:/ 和空格，不能有引号/分号等）。"
+            "请确认值是否正确；带特殊字符的复杂值暂不支持自动改，需 DBA 人工执行。",
+        )
+
+
+def _value_literal(value: str) -> str:
+    """把已校验的值渲染成 SQL 字面量：纯整数不加引号，其余单引号包裹。"""
+    v = value.strip()
+    return v if _INT_VALUE_RE.match(v) else f"'{v}'"
+
+
+def build_change_sql(kind: str, param: str, value: str) -> str:
+    """按连接类型拼参数变更语句（param/value 须已过校验）。
+
+    - MySQL：`SET GLOBAL <param> = <literal>`
+    - OceanBase（mysql/oracle 模式）：`ALTER SYSTEM SET <param> = <literal>`
+      连接串已定向到 `user@tenant#cluster`，以该租户管理员身份执行，作用于本租户，
+      无需再写 TENANT 子句。
+    """
+    literal = _value_literal(value)
+    if kind == _KIND_MYSQL:
+        return f"SET GLOBAL {param} = {literal}"
+    return f"ALTER SYSTEM SET {param} = {literal}"
+
+
+def _read_param_sql(kind: str, param: str) -> str:
+    """读参数现值的只读语句（尽力而为，仅供卡片展示）。param 已过标识符校验。"""
+    if kind == _KIND_MYSQL:
+        return f"SHOW GLOBAL VARIABLES LIKE '{param}'"
+    if kind == _KIND_OB_MYSQL:
+        return f"SHOW PARAMETERS LIKE '{param}'"
+    # oracle 模式没有 SHOW，查 OB 参数动态视图
+    return f"SELECT name, value FROM gv$ob_parameters WHERE name = '{param}'"
 
 
 class DatabaseQueryError(Exception):
@@ -83,9 +181,10 @@ _HINT_TIMEOUT = (
     "（加 WHERE/LIMIT）后重试；多次超时按升级规则通知 DBA。"
 )
 _ADMIN_NOT_SUPPORTED = (
-    "本工具当前只支持只读分析（role=read）。改参数、杀 session、kill query 等"
-    "写/变更操作尚未接入（需配合人工确认流程），请按「写操作建议输出格式」把"
-    "对应 SQL 以文字建议返回给用户、标注风险，由 DBA 人工执行。"
+    "本工具（query_database）只做只读分析（role=read），不执行任何写/变更。"
+    "若用户要改**参数**，改用 request_db_change 工具走管理员审批（若可用）；"
+    "杀 session、kill query、加索引等其它变更仍按「写操作建议输出格式」给文字"
+    "建议、标注风险，由 DBA 人工执行。"
 )
 
 
@@ -238,23 +337,27 @@ class DatabaseClient:
             _KIND_OB_MYSQL: config.ob_mysql_ro,
             _KIND_OB_ORACLE: config.ob_oracle_ro,
         }
+        # kind → admin（写）凭据，仅参数变更审批路径用
+        self._admin_creds = {
+            _KIND_MYSQL: config.mysql_admin,
+            _KIND_OB_MYSQL: config.ob_mysql_admin,
+            _KIND_OB_ORACLE: config.ob_oracle_admin,
+        }
 
-    async def run(
+    def _resolve_conn(
         self,
-        *,
-        db_type: str,
-        mode: str,
+        kind: str,
+        creds: "DbCreds",
         host: str,
         port: object,
         tenant: str,
         cluster: str,
-        sql: str,
-    ) -> str:
-        """连库跑一条只读 SQL，返回结果文本。失败抛 DatabaseQueryError（带 agent_hint）。"""
-        kind = resolve_kind(db_type, mode)
-        creds = self._creds[kind]
-        if not creds.configured:
-            raise DatabaseQueryError(f"no ro creds for {kind}", _hint_no_creds(kind))
+    ) -> tuple[int, str]:
+        """校验 host 白名单/端口/标识符，拼出 (port_int, conn_user)。
+
+        只读 / admin 两条路径共用：host 边界、OB 的 `user@tenant#cluster` 拼装、
+        防注入的字符集校验是一样的，差别只在用哪套 creds。
+        """
         if not host_allowed(host, self._allowed):
             raise DatabaseQueryError(f"host not allowed: {host}", _HINT_HOST)
         p = _validate_port(port)
@@ -265,20 +368,17 @@ class DatabaseClient:
             conn_user = f"{creds.user}@{tenant}#{cluster}"
         else:
             conn_user = creds.user or ""
-        clean_sql = sanitize_sql(sql)
+        return p, conn_user
 
-        argv = build_argv(kind, host.strip(), p, conn_user, clean_sql, self._timeout)
+    async def _exec_sql(
+        self, kind: str, host: str, port: int, conn_user: str, password: str, sql: str
+    ) -> str:
+        """跑一条语句，返回解码+截断后的 stdout（可能为空串）。失败抛
+        DatabaseQueryError。密码经 MYSQL_PWD 注入、不进 argv。只读/admin 共用。
+        """
+        argv = build_argv(kind, host.strip(), port, conn_user, sql, self._timeout)
         env = dict(os.environ)
-        env["MYSQL_PWD"] = creds.password or ""
-
-        logger.info(
-            "db query: kind=%s host=%s port=%d user=%s sql_len=%d",
-            kind,
-            host,
-            p,
-            conn_user,
-            len(clean_sql),
-        )
+        env["MYSQL_PWD"] = password or ""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -314,14 +414,149 @@ class DatabaseClient:
             )
 
         text = (out or b"").decode("utf-8", errors="replace").strip()
-        if not text:
-            return "（查询执行成功，但没有返回任何行。）"
         if len(text) > self._max_chars:
             text = (
                 text[: self._max_chars]
                 + "\n…（结果过长，已截断；请用更具体的条件或 LIMIT 收窄查询）"
             )
         return text
+
+    async def run(
+        self,
+        *,
+        db_type: str,
+        mode: str,
+        host: str,
+        port: object,
+        tenant: str,
+        cluster: str,
+        sql: str,
+    ) -> str:
+        """连库跑一条只读 SQL，返回结果文本。失败抛 DatabaseQueryError（带 agent_hint）。"""
+        kind = resolve_kind(db_type, mode)
+        creds = self._creds[kind]
+        if not creds.configured:
+            raise DatabaseQueryError(f"no ro creds for {kind}", _hint_no_creds(kind))
+        p, conn_user = self._resolve_conn(kind, creds, host, port, tenant, cluster)
+        clean_sql = sanitize_sql(sql)
+        logger.info(
+            "db query: kind=%s host=%s port=%d user=%s sql_len=%d",
+            kind,
+            host,
+            p,
+            conn_user,
+            len(clean_sql),
+        )
+        text = await self._exec_sql(kind, host, p, conn_user, creds.password or "", clean_sql)
+        if not text:
+            return "（查询执行成功，但没有返回任何行。）"
+        return text
+
+    async def prepare_change(
+        self,
+        *,
+        db_type: str,
+        mode: str,
+        host: str,
+        port: object,
+        tenant: str,
+        cluster: str,
+        param: str,
+        value: str,
+    ) -> DbChangeRequest:
+        """确定性地组装一笔待审批的参数变更（**不执行**任何写操作）。
+
+        做的事全是只读/纯校验：解析连接类型 → 确认该类型配了 admin 账号 → host
+        白名单 + 标识符/参数/值校验 → 拼出变更语句 → 用**只读账号**尽力读一次现值。
+        返回 DbChangeRequest 交给 submitter 发卡。任一校验失败抛 DatabaseQueryError。
+        """
+        kind = resolve_kind(db_type, mode)
+        admin = self._admin_creds[kind]
+        if not admin.configured:
+            raise DatabaseQueryError(
+                f"no admin creds for {kind}",
+                f"部署侧没有为该数据库类型（{kind}）配置 admin 账号，无法走参数变更审批。"
+                "请按「写操作建议输出格式」把变更 SQL 以文字建议返回，由 DBA 人工执行。",
+            )
+        p, _ = self._resolve_conn(kind, admin, host, port, tenant, cluster)
+        validate_param_value(param, value)
+        sql = build_change_sql(kind, param.strip(), value.strip())
+
+        # 现值：只读账号尽力读，纯展示用，读不到不阻断审批
+        current = await self._read_current(
+            kind, host, port, tenant, cluster, param.strip()
+        )
+        return DbChangeRequest(
+            kind=kind,
+            db_type=db_type.strip().lower(),
+            mode=(mode or "mysql").strip().lower(),
+            host=host.strip(),
+            port=p,
+            tenant=tenant.strip(),
+            cluster=cluster.strip(),
+            param=param.strip(),
+            new_value=value.strip(),
+            sql=sql,
+            current_value=current,
+        )
+
+    async def _read_current(
+        self,
+        kind: str,
+        host: str,
+        port: object,
+        tenant: str,
+        cluster: str,
+        param: str,
+    ) -> str | None:
+        """用只读账号尽力读参数现值，仅供卡片展示。任何问题返回 None（不抛）。"""
+        creds = self._creds[kind]
+        if not creds.configured:
+            return None
+        try:
+            p, conn_user = self._resolve_conn(kind, creds, host, port, tenant, cluster)
+            text = await self._exec_sql(
+                kind, host, p, conn_user, creds.password or "", _read_param_sql(kind, param)
+            )
+        except DatabaseQueryError as e:
+            logger.info("read current value failed (non-fatal): %s", e)
+            return None
+        text = (text or "").strip()
+        if not text:
+            return None
+        # 展示用，压到单段短文本（SHOW PARAMETERS 这类输出很宽，截断够看就行）
+        return text if len(text) <= 400 else text[:400] + "…"
+
+    async def run_admin(self, req: DbChangeRequest) -> str:
+        """用 admin 账号**执行**一笔已审批的参数变更，原样跑 `req.sql`。
+
+        只在飞书确认卡回调里、由管理员点确认后调用——不在 agent/SDK 进程内。
+        再做一遍 host 白名单 + admin 账号在位 + 连接标识符校验（纵深防御），
+        sql 本身是 bot 早先用结构化 param/value 拼好、卡片展示过的那条，可信。
+        成功返回简短结果文本。失败抛 DatabaseQueryError。
+        """
+        admin = self._admin_creds[req.kind]
+        if not admin.configured:
+            raise DatabaseQueryError(
+                f"no admin creds for {req.kind}",
+                f"未配置 {req.kind} 的 admin 账号，无法执行变更。",
+            )
+        p, conn_user = self._resolve_conn(
+            req.kind, admin, req.host, req.port, req.tenant, req.cluster
+        )
+        logger.info(
+            "db admin change: kind=%s host=%s port=%d user=%s param=%s",
+            req.kind,
+            req.host,
+            p,
+            conn_user,
+            req.param,
+        )
+        text = await self._exec_sql(
+            req.kind, req.host, p, conn_user, admin.password or "", req.sql
+        )
+        # SET GLOBAL / ALTER SYSTEM SET 正常无返回行；有输出就一并带回展示
+        return text or "（执行成功，无返回行。）"
 
 
 _TOOL_DESC = (
@@ -389,6 +624,106 @@ def _text_result(text: str, *, is_error: bool = False) -> dict:
     return res
 
 
+_CHANGE_TOOL_DESC = (
+    "申请修改测试环境某个数据库实例的**参数**，走管理员人工审批后执行。"
+    "调用本工具**不会立即改任何东西**——它只会在群里发一张确认卡，由管理员点"
+    "「确认执行」后才真正改；你（agent）全程只是提议，绝不自己执行。\n"
+    "什么时候用：用户明确要求**临时改某个库参数**（如调 max_connections、改 OB 的"
+    "某个 system parameter / memory 配置等）并给了实例连接信息。注意只覆盖**参数变更**；"
+    "杀 session、kill query、加索引、DML/DDL 等其它变更**不要**用本工具，仍按"
+    "「写操作建议输出格式」给文字建议。纯知识/排查问题更不要调。\n"
+    "参数：db_type=mysql 或 oceanbase（必填）；oceanbase 必须再给 mode=mysql 或 oracle、"
+    "tenant、cluster；host/port 用用户给的连接信息（必填 host）；param=要改的参数名（必填）；"
+    "value=目标值（必填，如 1000 / '256M' / 'ON'）。账号由系统注入，你不用也拿不到。\n"
+    "调用成功后工具会返回一句确认（如「已提交审批卡，等管理员确认」），把它如实转达"
+    "给用户即可——告诉用户已发起审批、需管理员确认后才生效；不要谎称已经改好。\n"
+    "若返回错误（参数/值非法、该类型没配 admin 账号、host 不在白名单、审批未启用等），"
+    "据提示处理：能改正就让用户确认信息重试，确实不支持就按「写操作建议输出格式」"
+    "给文字建议让 DBA 人工执行。"
+)
+
+_CHANGE_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "db_type": {
+            "type": "string",
+            "enum": ["mysql", "oceanbase"],
+            "description": "数据库类型",
+        },
+        "mode": {
+            "type": "string",
+            "enum": ["mysql", "oracle"],
+            "description": "OceanBase 租户模式；db_type=oceanbase 时必给",
+        },
+        "host": {"type": "string", "description": "目标实例 IP（用户提供）"},
+        "port": {
+            "type": "integer",
+            "description": "端口（用户提供，OceanBase 通常 2883）",
+        },
+        "tenant": {"type": "string", "description": "OceanBase 租户名；oceanbase 时必给"},
+        "cluster": {"type": "string", "description": "OceanBase 集群名；oceanbase 时必给"},
+        "param": {"type": "string", "description": "要修改的参数名（如 max_connections）"},
+        "value": {"type": "string", "description": "目标值（如 1000、256M、ON）"},
+    },
+    "required": ["db_type", "host", "param", "value"],
+    "additionalProperties": False,
+}
+
+
+def make_request_db_change_handler(
+    client: "DatabaseClient", submitter: DbChangeSubmitter
+):
+    """造 request_db_change 的 async handler。
+
+    prepare_change 做确定性校验 + 拼 SQL + 读现值（不写库）；submitter 发确认卡 +
+    登记 pending。失败一律返回 is_error 文字（不抛），让 agent 据引导处理。
+    """
+
+    async def handler(args: dict) -> dict:
+        db_type = str(args.get("db_type") or "").strip()
+        mode = str(args.get("mode") or "mysql").strip()
+        host = str(args.get("host") or "").strip()
+        port = args.get("port")
+        tenant = str(args.get("tenant") or "").strip()
+        cluster = str(args.get("cluster") or "").strip()
+        param = str(args.get("param") or "").strip()
+        value = str(args.get("value") or "").strip()
+
+        if not db_type or not host or not param or not value:
+            return _text_result(
+                "调用缺少必填参数：db_type / host / param / value。请补齐后重试。",
+                is_error=True,
+            )
+
+        try:
+            req = await client.prepare_change(
+                db_type=db_type,
+                mode=mode,
+                host=host,
+                port=port,
+                tenant=tenant,
+                cluster=cluster,
+                param=param,
+                value=value,
+            )
+        except DatabaseQueryError as e:
+            logger.warning("prepare db change failed: %s", e)
+            return _text_result(e.agent_hint, is_error=True)
+
+        try:
+            text = await submitter(req)
+        except Exception:
+            logger.exception("submit db change card failed")
+            return _text_result(
+                "已校验通过，但提交审批卡到飞书时出错。请稍后让用户重试，"
+                "或按「写操作建议输出格式」把变更 SQL 以文字建议返回由 DBA 人工执行。",
+                is_error=True,
+            )
+        return _text_result(text)
+
+    return handler
+
+
 def make_query_database_handler(client: "DatabaseClient"):
     """造 query_database 的 async handler（与 SDK 解耦，便于单测直接 await）。
 
@@ -433,14 +768,21 @@ def make_query_database_handler(client: "DatabaseClient"):
     return handler
 
 
-def build_database_server(config: DatabaseConfig) -> McpSdkServerConfig:
-    """构建挂数据库只读分析工具的进程内 MCP server。
+def build_database_server(
+    config: DatabaseConfig, submitter: DbChangeSubmitter | None = None
+) -> McpSdkServerConfig:
+    """构建挂数据库工具的进程内 MCP server。
 
-    工具 `query_database(db_type, mode, host, port, tenant, cluster, sql, role)`：
-    用 config 里对应类型的只读账号连库跑一条只读 SQL，结果原样返给主 agent。
+    `query_database`（只读分析）总是挂。`submitter` 注入时（即参数变更审批链路已
+    接好、admin 名单/账号齐备）额外挂 `request_db_change`——它把一笔参数变更落成
+    群里一张确认卡，由管理员点确认后在飞书回调里执行（不在本进程内）。
     """
-    handler = make_query_database_handler(DatabaseClient(config))
-    decorated = tool(TOOL_NAME, _TOOL_DESC, _TOOL_SCHEMA)(handler)
-    return create_sdk_mcp_server(
-        name="ops-qa-db", version="1.0.0", tools=[decorated]
-    )
+    client = DatabaseClient(config)
+    tools = [tool(TOOL_NAME, _TOOL_DESC, _TOOL_SCHEMA)(make_query_database_handler(client))]
+    if submitter is not None:
+        tools.append(
+            tool(CHANGE_TOOL_NAME, _CHANGE_TOOL_DESC, _CHANGE_TOOL_SCHEMA)(
+                make_request_db_change_handler(client, submitter)
+            )
+        )
+    return create_sdk_mcp_server(name="ops-qa-db", version="1.0.0", tools=tools)

@@ -53,6 +53,8 @@ from .feishu_core import (
     dispatch_inbound,
     handle_archive_submit,
     handle_clarify_giveup_click,
+    handle_db_change_confirm,
+    handle_db_change_reject,
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
@@ -110,6 +112,8 @@ class WsRunner:
             doc_qa_config=config.doc_qa,
             gateway_trace_config=config.gateway_trace,
             database_config=config.database,
+            # 参数变更审批要在工具里发确认卡，把 outbound client 传给 session 层
+            feishu=self._feishu,
         )
 
         self._health: HealthServer | None = None
@@ -244,6 +248,28 @@ class WsRunner:
                 except Exception:
                     logger.exception("archive submit failed: qid=%s", qid)
                     ack_card = _archive_ack_card("❌", "归档失败，请联系管理员。")
+
+            elif action_name == "db_change_confirm":
+                change_id = value.get("change_id")
+                try:
+                    ack_card = await handle_db_change_confirm(
+                        change_id, clicker_id,
+                        self._config.database, feishu=self._feishu,
+                    )
+                except Exception:
+                    logger.exception("db change confirm failed: id=%s", change_id)
+                    ack_card = _archive_ack_card("❌", "执行出错，请联系运维查日志。")
+
+            elif action_name == "db_change_reject":
+                change_id = value.get("change_id")
+                try:
+                    ack_card = await handle_db_change_reject(
+                        change_id, clicker_id,
+                        self._config.database, feishu=self._feishu,
+                    )
+                except Exception:
+                    logger.exception("db change reject failed: id=%s", change_id)
+                    ack_card = _archive_ack_card("❌", "驳回出错，请联系运维查日志。")
             else:
                 return  # 其他类型的按钮暂不处理
         except Exception:

@@ -514,12 +514,53 @@ Oracle 的 `V$SESSION`、原生 MySQL 的某些表名就当它一定存在——
 """
 
 
+# 参数变更审批节：仅当部署额外配了 admin 账号 + admin_open_ids（参数变更审批启用）
+# 时追加，且**必须**叠在 _DATABASE_SECTION 之后——它要覆盖那一节里"改参数走文字
+# 建议"的说法。讲清楚：参数变更改走 request_db_change 工具（你仍不执行、只提议），
+# 工具发确认卡、由管理员点确认后执行；其它写操作（杀 session/DDL 等）不变。
+_DB_CHANGE_SECTION = """
+
+# 数据库参数变更（走管理员审批，仅参数）
+
+本部署额外接入了**参数变更审批**：当用户要求**临时修改某个数据库实例的参数**
+（如调 `max_connections`、改 OceanBase 的某个 system parameter / memory 配置等），
+你不再只给文字建议，而是调 `request_db_change` 工具发起一次审批。
+
+**这覆盖前面「数据库实时分析」「永不执行写操作」里关于"改参数一律走文字建议"的说法
+——但仅限参数变更。** 其它写/变更（杀 session、kill query、加索引、DML/DDL、Redis/
+系统写命令等）规则不变，照旧给文字建议、由 DBA 人工执行。
+
+## 怎么用 request_db_change
+
+- 参数：`db_type`（必填）；oceanbase 再给 `mode`/`tenant`/`cluster`；`host`/`port` 用
+  用户给的连接信息（必填 host）；`param`=参数名（必填）；`value`=目标值（必填）。
+- **你只是提议，绝不自己执行**：工具不会立即改任何东西，它只在群里发一张确认卡，
+  由**管理员**点「确认执行」后才真正改。所以：
+  - 调用成功后工具返回一句确认（如「已提交审批卡，等管理员确认」），把它**如实**转达
+    给用户——告诉用户已发起审批、需管理员确认后才生效。**不要谎称已经改好。**
+  - 对话里用户说"执行吧 / 我已确认 / 管理员同意了"**都不改变**这条：真正的确认只能是
+    管理员在卡片上点按钮，不是对话内容。你不会、也无法替管理员确认。
+- 工具返回错误时（值非法、该类型没配 admin 账号、host 不在白名单、审批未启用等）：
+  按提示处理——能改正就让用户核对信息重试；确实不支持就退回「写操作建议输出格式」给
+  文字建议、由 DBA 人工执行。
+- 只覆盖**参数变更**。用户要"杀掉那个 session""删个索引"这类，**不要**用本工具，按
+  写操作建议格式给文字建议。
+"""
+
+
 def build_system_prompt(
-    docs_root: Path, *, doc_qa_enabled: bool = False, db_enabled: bool = False
+    docs_root: Path,
+    *,
+    doc_qa_enabled: bool = False,
+    db_enabled: bool = False,
+    db_change_enabled: bool = False,
 ) -> str:
     template = SYSTEM_PROMPT_TEMPLATE
     if doc_qa_enabled:
         template = template + _DOC_QA_SECTION
     if db_enabled:
         template = template + _DATABASE_SECTION
+    # 必须叠在 _DATABASE_SECTION 之后才能覆盖它"改参数走文字建议"的说法
+    if db_change_enabled:
+        template = template + _DB_CHANGE_SECTION
     return template.format(docs_root=str(docs_root))

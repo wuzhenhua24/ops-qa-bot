@@ -111,6 +111,14 @@ class DatabaseConfig:
     测试环境白名单内，配合"生产天生隔离"做边界。同时要求至少配了一套只读账号，
     否则特性也视作未启用（无此需求的部署零感知）。密码经 MYSQL_PWD 注入、不进
     命令行/日志/agent 上下文，可走环境变量从 secret manager 注入（见 _pick）。
+
+    **参数变更审批**（`admin_enabled`）是独立的、更高权限的能力：asker 申请改某个
+    实例参数 → bot 用 admin 账号拼出 `SET GLOBAL` / `ALTER SYSTEM SET` 语句 → 发
+    确认卡到群里 → 只有 `admin_open_ids` 名单里的人点确认才执行（执行在飞书回调里、
+    不在 agent 进程内）。admin 账号三套与只读账号同结构、同 MYSQL_PWD 注入纪律。
+    `admin_open_ids` **与文档负责人（INDEX.md owner）刻意解耦**——"答归档问题"和
+    "改库参数"是两个量级的权限。三条都满足（白名单非空 + admin 名单非空 + 至少一套
+    admin 账号）才视作启用，否则只读分析照常、变更审批整体关闭。
     """
 
     allowed_hosts: tuple[str, ...] = ()
@@ -119,11 +127,32 @@ class DatabaseConfig:
     mysql_ro: DbCreds = field(default_factory=DbCreds)
     ob_mysql_ro: DbCreds = field(default_factory=DbCreds)
     ob_oracle_ro: DbCreds = field(default_factory=DbCreds)
+    # 参数变更审批：admin 账号（写权限）+ 有权点"确认执行"的 open_id 白名单
+    mysql_admin: DbCreds = field(default_factory=DbCreds)
+    ob_mysql_admin: DbCreds = field(default_factory=DbCreds)
+    ob_oracle_admin: DbCreds = field(default_factory=DbCreds)
+    admin_open_ids: tuple[str, ...] = ()
 
     @property
     def enabled(self) -> bool:
         return bool(self.allowed_hosts) and any(
             c.configured for c in (self.mysql_ro, self.ob_mysql_ro, self.ob_oracle_ro)
+        )
+
+    @property
+    def admin_enabled(self) -> bool:
+        """参数变更审批是否启用：白名单 + admin 名单 + 至少一套 admin 账号都齐。
+
+        缺任何一条都整体关闭——尤其 `admin_open_ids` 空时"没人能批 = 不发卡"，
+        和 `allowed_hosts` 空就关只读特性同一种"零配置零感知"姿态。
+        """
+        return (
+            bool(self.allowed_hosts)
+            and bool(self.admin_open_ids)
+            and any(
+                c.configured
+                for c in (self.mysql_admin, self.ob_mysql_admin, self.ob_oracle_admin)
+            )
         )
 
 
@@ -241,12 +270,26 @@ def load_config(path: Path) -> AppConfig:
         _pick("DB_MAX_RESULT_CHARS", db_raw.get("max_result_chars"), 20000)
     )
 
-    def _db_creds(sub_key: str, env_user: str, env_pwd: str) -> DbCreds:
+    def _db_creds(
+        sub_key: str, env_user: str, env_pwd: str, *, role: str = "ro"
+    ) -> DbCreds:
+        """读某连接类型的一套账号。role="ro" 取 ro_user/ro_password，
+        role="admin" 取 admin_user/admin_password；env var 优先（见 _pick）。"""
         sub = db_raw.get(sub_key) or {}
         return DbCreds(
-            user=_pick(env_user, sub.get("ro_user")) or None,
-            password=_pick(env_pwd, sub.get("ro_password")) or None,
+            user=_pick(env_user, sub.get(f"{role}_user")) or None,
+            password=_pick(env_pwd, sub.get(f"{role}_password")) or None,
         )
+
+    # admin_open_ids：环境变量（逗号分隔）整体覆盖文件里的列表，与 allowed_hosts 同姿态
+    env_admins = os.environ.get("DB_ADMIN_OPEN_IDS")
+    if env_admins not in (None, ""):
+        db_admins_src: Any = [a for a in env_admins.split(",")]
+    else:
+        db_admins_src = db_raw.get("admin_open_ids") or []
+    admin_open_ids = tuple(
+        str(a).strip() for a in db_admins_src if str(a).strip()
+    )
 
     database = DatabaseConfig(
         allowed_hosts=allowed_hosts,
@@ -259,6 +302,22 @@ def load_config(path: Path) -> AppConfig:
         ob_oracle_ro=_db_creds(
             "ob_oracle", "DB_OB_ORACLE_RO_USER", "DB_OB_ORACLE_RO_PASSWORD"
         ),
+        mysql_admin=_db_creds(
+            "mysql", "DB_MYSQL_ADMIN_USER", "DB_MYSQL_ADMIN_PASSWORD", role="admin"
+        ),
+        ob_mysql_admin=_db_creds(
+            "ob_mysql",
+            "DB_OB_MYSQL_ADMIN_USER",
+            "DB_OB_MYSQL_ADMIN_PASSWORD",
+            role="admin",
+        ),
+        ob_oracle_admin=_db_creds(
+            "ob_oracle",
+            "DB_OB_ORACLE_ADMIN_USER",
+            "DB_OB_ORACLE_ADMIN_PASSWORD",
+            role="admin",
+        ),
+        admin_open_ids=admin_open_ids,
     )
 
     return AppConfig(

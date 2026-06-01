@@ -21,12 +21,17 @@ from ops_qa_bot.config import DatabaseConfig, DbCreds
 from ops_qa_bot.db_query import (
     DatabaseClient,
     DatabaseQueryError,
+    DbChangeRequest,
     build_argv,
+    build_change_sql,
     host_allowed,
     make_query_database_handler,
+    make_request_db_change_handler,
     resolve_kind,
     sanitize_sql,
+    validate_param_value,
     _validate_port,
+    _value_literal,
 )
 
 
@@ -373,6 +378,265 @@ def test_handler_upstream_failure_returns_hint_not_raises():
     res = _run(handler({"db_type": "mysql", "host": "10.10.1.2", "sql": "SELECT 1"}))
     assert res.get("is_error") is True
     assert "重试" in res["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# 参数变更：纯逻辑（值/参数校验、SQL 构造、config.admin_enabled）
+# ---------------------------------------------------------------------------
+
+def test_value_literal_int_unquoted_else_quoted():
+    assert _value_literal("1000") == "1000"
+    assert _value_literal("-5") == "-5"
+    assert _value_literal("256M") == "'256M'"
+    assert _value_literal("ON") == "'ON'"
+    assert _value_literal("READ-COMMITTED") == "'READ-COMMITTED'"
+
+
+def test_build_change_sql_per_kind():
+    assert (
+        build_change_sql("mysql", "max_connections", "1000")
+        == "SET GLOBAL max_connections = 1000"
+    )
+    assert (
+        build_change_sql("ob_mysql", "memory_limit", "8G")
+        == "ALTER SYSTEM SET memory_limit = '8G'"
+    )
+    assert build_change_sql("ob_oracle", "cpu_count", "4") == "ALTER SYSTEM SET cpu_count = 4"
+
+
+def test_validate_param_value_rejects_injection():
+    # 含引号/分号/反引号/括号/美元的值都要被拒（堵死拼进 SQL 的注入面）
+    for bad in ("256M'; DROP", 'a"b', "v;x", "`x`", "$(x)", "a,b", "x=y"):
+        try:
+            validate_param_value("good_param", bad)
+        except DatabaseQueryError:
+            pass
+        else:
+            raise AssertionError(f"值 {bad!r} 应被拒")
+    # 合法值放行
+    validate_param_value("max_connections", "1000")
+    validate_param_value("memory_limit", "8G")
+    validate_param_value("tx_isolation", "READ-COMMITTED")
+
+
+def test_validate_param_value_rejects_bad_param_name():
+    for bad in ("bad param", "p;x", "drop`", ""):
+        try:
+            validate_param_value(bad, "1")
+        except DatabaseQueryError:
+            pass
+        else:
+            raise AssertionError(f"参数名 {bad!r} 应被拒")
+
+
+def test_admin_enabled_requires_all_three():
+    ok = dict(
+        allowed_hosts=("10.0.0.0/8",),
+        admin_open_ids=("ou_a",),
+        mysql_admin=DbCreds(user="root", password="p"),
+    )
+    assert DatabaseConfig(**ok).admin_enabled
+    assert not DatabaseConfig(**{**ok, "admin_open_ids": ()}).admin_enabled
+    assert not DatabaseConfig(**{**ok, "allowed_hosts": ()}).admin_enabled
+    # 有白名单 + admin 名单但一套 admin 账号都没配 → 关
+    assert not DatabaseConfig(
+        allowed_hosts=("10.0.0.0/8",), admin_open_ids=("ou_a",)
+    ).admin_enabled
+
+
+# ---------------------------------------------------------------------------
+# DatabaseClient.prepare_change / run_admin
+# ---------------------------------------------------------------------------
+
+def test_prepare_change_no_admin_creds_raises():
+    client = DatabaseClient(_cfg())  # 只有 ro，没 admin
+    try:
+        _run(
+            client.prepare_change(
+                db_type="mysql", mode="", host="10.10.1.2", port=3306,
+                tenant="", cluster="", param="max_connections", value="1000",
+            )
+        )
+    except DatabaseQueryError as e:
+        assert "admin" in e.agent_hint.lower() or "admin 账号" in e.agent_hint
+    else:
+        raise AssertionError("缺 admin 账号应抛")
+
+
+def test_prepare_change_host_not_allowed_raises():
+    cfg = _cfg(mysql_admin=DbCreds(user="root", password="apw"))
+    client = DatabaseClient(cfg)
+    try:
+        _run(
+            client.prepare_change(
+                db_type="mysql", mode="", host="8.8.8.8", port=3306,
+                tenant="", cluster="", param="max_connections", value="1000",
+            )
+        )
+    except DatabaseQueryError as e:
+        assert "白名单" in e.agent_hint or "允许范围" in e.agent_hint
+    else:
+        raise AssertionError("越界 host 应抛")
+
+
+def test_prepare_change_builds_request_and_reads_current():
+    # 现值读取走只读账号 + 子进程；monkeypatch 返回 SHOW 输出
+    proc = _FakeProc(out=b"Variable_name\tValue\nmax_connections\t151", rc=0)
+    orig = dbq.asyncio.create_subprocess_exec
+    dbq.asyncio.create_subprocess_exec = _patch_spawn(proc, {})
+    try:
+        cfg = _cfg(mysql_admin=DbCreds(user="root", password="apw"))
+        client = DatabaseClient(cfg)
+        req = _run(
+            client.prepare_change(
+                db_type="mysql", mode="", host="10.10.1.2", port=3306,
+                tenant="", cluster="", param="max_connections", value="1000",
+            )
+        )
+    finally:
+        dbq.asyncio.create_subprocess_exec = orig
+    assert req.kind == "mysql"
+    assert req.sql == "SET GLOBAL max_connections = 1000"
+    assert req.new_value == "1000"
+    assert req.current_value and "151" in req.current_value
+
+
+def test_prepare_change_current_value_none_when_read_fails():
+    # 读现值失败（非零返回码）不应阻断审批——current_value 退化为 None
+    proc = _FakeProc(err=b"ERROR", rc=1)
+    orig = dbq.asyncio.create_subprocess_exec
+    dbq.asyncio.create_subprocess_exec = _patch_spawn(proc, {})
+    try:
+        cfg = _cfg(mysql_admin=DbCreds(user="root", password="apw"))
+        client = DatabaseClient(cfg)
+        req = _run(
+            client.prepare_change(
+                db_type="mysql", mode="", host="10.10.1.2", port=3306,
+                tenant="", cluster="", param="max_connections", value="1000",
+            )
+        )
+    finally:
+        dbq.asyncio.create_subprocess_exec = orig
+    assert req.current_value is None
+    assert req.sql == "SET GLOBAL max_connections = 1000"
+
+
+def _mk_req(**over) -> DbChangeRequest:
+    base = dict(
+        kind="ob_mysql", db_type="oceanbase", mode="mysql",
+        host="172.28.65.2", port=2883, tenant="bd_p1", cluster="hx_new",
+        param="memory_limit", new_value="8G",
+        sql="ALTER SYSTEM SET memory_limit = '8G'",
+    )
+    base.update(over)
+    return DbChangeRequest(**base)
+
+
+def test_run_admin_executes_with_admin_creds_and_pwd_env():
+    captured: dict = {}
+    proc = _FakeProc(out=b"", rc=0)
+    orig = dbq.asyncio.create_subprocess_exec
+    dbq.asyncio.create_subprocess_exec = _patch_spawn(proc, captured)
+    try:
+        cfg = _cfg(ob_mysql_admin=DbCreds(user="root", password="apw2"))
+        client = DatabaseClient(cfg)
+        out = _run(client.run_admin(_mk_req()))
+    finally:
+        dbq.asyncio.create_subprocess_exec = orig
+    assert "成功" in out  # 空输出 → "（执行成功，无返回行。）"
+    assert captured["env"]["MYSQL_PWD"] == "apw2"
+    assert all("apw2" not in a for a in captured["argv"])
+    assert "root@bd_p1#hx_new" in captured["argv"]
+    # 原样执行卡上那条 SQL
+    assert captured["argv"][-1] == "ALTER SYSTEM SET memory_limit = '8G'"
+
+
+def test_run_admin_no_creds_raises():
+    client = DatabaseClient(_cfg())  # 没 admin
+    try:
+        _run(client.run_admin(_mk_req()))
+    except DatabaseQueryError:
+        pass
+    else:
+        raise AssertionError("缺 admin 账号应抛")
+
+
+# ---------------------------------------------------------------------------
+# request_db_change handler
+# ---------------------------------------------------------------------------
+
+class _FakeChangeClient:
+    def __init__(self, req=None, exc=None):
+        self._req = req
+        self._exc = exc
+        self.calls: list[dict] = []
+
+    async def prepare_change(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._exc is not None:
+            raise self._exc
+        return self._req
+
+
+def test_change_handler_success_calls_submitter():
+    req = _mk_req(kind="mysql", db_type="mysql", host="10.10.1.2", port=3306,
+                  tenant="", cluster="", param="max_connections", new_value="1000",
+                  sql="SET GLOBAL max_connections = 1000")
+    fake = _FakeChangeClient(req=req)
+    sent: list = []
+
+    async def submitter(r):
+        sent.append(r)
+        return "已提交审批卡，等管理员确认"
+
+    handler = make_request_db_change_handler(fake, submitter)
+    res = _run(
+        handler({"db_type": "mysql", "host": "10.10.1.2",
+                 "param": "max_connections", "value": "1000"})
+    )
+    assert "is_error" not in res
+    assert res["content"][0]["text"] == "已提交审批卡，等管理员确认"
+    assert sent and sent[0] is req
+
+
+def test_change_handler_missing_params_is_error():
+    fake = _FakeChangeClient()
+
+    async def submitter(r):  # 不该被调到
+        raise AssertionError("缺参不应进 submitter")
+
+    handler = make_request_db_change_handler(fake, submitter)
+    res = _run(handler({"db_type": "mysql", "host": "10.10.1.2", "param": "x"}))  # 缺 value
+    assert res.get("is_error") is True
+    assert not fake.calls
+
+
+def test_change_handler_prepare_failure_returns_hint():
+    fake = _FakeChangeClient(exc=DatabaseQueryError("bad", "目标值非法，请核对"))
+
+    async def submitter(r):
+        raise AssertionError("校验失败不应进 submitter")
+
+    handler = make_request_db_change_handler(fake, submitter)
+    res = _run(
+        handler({"db_type": "mysql", "host": "10.10.1.2", "param": "p", "value": "x'"})
+    )
+    assert res.get("is_error") is True
+    assert "核对" in res["content"][0]["text"]
+
+
+def test_change_handler_submitter_failure_is_error():
+    req = _mk_req(kind="mysql", db_type="mysql", host="10.10.1.2", port=3306,
+                  tenant="", cluster="", param="p", new_value="1",
+                  sql="SET GLOBAL p = 1")
+    fake = _FakeChangeClient(req=req)
+
+    async def submitter(r):
+        raise RuntimeError("feishu down")
+
+    handler = make_request_db_change_handler(fake, submitter)
+    res = _run(handler({"db_type": "mysql", "host": "10.10.1.2", "param": "p", "value": "1"}))
+    assert res.get("is_error") is True
 
 
 # ---------------------------------------------------------------------------

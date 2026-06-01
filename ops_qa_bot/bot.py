@@ -17,9 +17,10 @@ from claude_agent_sdk import (
 )
 
 from .config import DatabaseConfig, DocQAConfig, GatewayTraceConfig
+from .db_query import CHANGE_FULL_TOOL_NAME as DB_CHANGE_FULL_TOOL_NAME
 from .db_query import FULL_TOOL_NAME as DB_FULL_TOOL_NAME
 from .db_query import SERVER_KEY as DB_SERVER_KEY
-from .db_query import build_database_server
+from .db_query import DbChangeSubmitter, build_database_server
 from .doc_qa import FULL_TOOL_NAME, SERVER_KEY, build_doc_qa_server
 from .gateway_trace import FULL_TOOL_NAME as GW_TRACE_FULL_TOOL_NAME
 from .gateway_trace import SERVER_KEY as GW_TRACE_SERVER_KEY
@@ -186,6 +187,12 @@ def format_tool_call(name: str, tool_input: dict) -> str:
             f"query_database(db_type={tool_input.get('db_type', '?')}, "
             f"host={tool_input.get('host', '?')}, sql_len={len(sql)})"
         )
+    if name == DB_CHANGE_FULL_TOOL_NAME:
+        # 记参数名（用于审计），value 不落日志
+        return (
+            f"request_db_change(db_type={tool_input.get('db_type', '?')}, "
+            f"host={tool_input.get('host', '?')}, param={tool_input.get('param', '?')})"
+        )
     return f"{name}({tool_input})"
 
 
@@ -208,6 +215,7 @@ class OpsQABot:
         doc_qa_config: DocQAConfig | None = None,
         gateway_trace_config: GatewayTraceConfig | None = None,
         database_config: DatabaseConfig | None = None,
+        db_change_submitter: DbChangeSubmitter | None = None,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -255,6 +263,8 @@ class OpsQABot:
 
         mcp_servers: dict = {}
         allowed_tools: list[str] = []
+        # 参数变更审批是否真正启用（影响 prompt 是否加 request_db_change 节）
+        db_change_enabled = False
         if doc_qa_enabled:
             assert doc_qa_config is not None
             mcp_servers[SERVER_KEY] = build_doc_qa_server(
@@ -269,14 +279,26 @@ class OpsQABot:
             allowed_tools.append(GW_TRACE_FULL_TOOL_NAME)
         if db_enabled:
             assert database_config is not None
-            mcp_servers[DB_SERVER_KEY] = build_database_server(database_config)
+            # 参数变更审批工具只在 submitter 注入（飞书审批链路接好、admin
+            # 名单/账号齐备）时才挂；纯只读部署 / CLI 直用时 submitter=None，
+            # 只有 query_database。
+            db_change_enabled = (
+                db_change_submitter is not None and database_config.admin_enabled
+            )
+            mcp_servers[DB_SERVER_KEY] = build_database_server(
+                database_config,
+                submitter=db_change_submitter if db_change_enabled else None,
+            )
             allowed_tools.append(DB_FULL_TOOL_NAME)
+            if db_change_enabled:
+                allowed_tools.append(DB_CHANGE_FULL_TOOL_NAME)
 
         self._options = ClaudeAgentOptions(
             system_prompt=build_system_prompt(
                 self.docs_root,
                 doc_qa_enabled=doc_qa_enabled,
                 db_enabled=db_enabled,
+                db_change_enabled=db_change_enabled,
             ),
             tools=["Read", "Glob", "Grep", "Bash"],
             mcp_servers=mcp_servers,
