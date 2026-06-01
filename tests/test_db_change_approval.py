@@ -171,7 +171,11 @@ def test_confirm_admin_executes_notifies_and_pops():
         )
     finally:
         fc.DatabaseClient = orig
-    assert "已执行" in _card_text(card)
+    text = _card_text(card)
+    assert "已执行" in text
+    # 管理员用飞书 at 语法渲染（@姓名），不能把原始 open_id 当文本暴露出来
+    assert "<at id=ou_admin>" in text
+    assert "<@ou_admin>" not in text
     assert cid not in fc._pending_db_changes  # 已 pop
     assert _FakeAdminClient.instances[0].ran[0] is req  # 真去执行了
     assert len(feishu.posts) == 1  # 通知 asker

@@ -2723,8 +2723,12 @@ async def handle_db_change_confirm(
         clicker_id,
     )
     await _notify_db_change_outcome(feishu, ctx, outcome="executed")
+    # 用飞书卡片的 at 语法 <at id=..></at>（渲染成 @姓名，不暴露原始 open_id）；
+    # 写成 <@ou_xxx> 卡片不识别会原样把 OUID 当文本显示出来。
     return _archive_ack_card(
-        "✅", f"已执行：`{req.param}` → {req.new_value}（by <@{clicker_id}>），已通知申请人。"
+        "✅",
+        f"已执行：`{req.param}` → {req.new_value}"
+        f"（by <at id={clicker_id}></at>），已通知申请人。",
     )
 
 
@@ -2764,8 +2768,11 @@ async def handle_db_change_reject(
         clicker_id,
     )
     await _notify_db_change_outcome(feishu, ctx, outcome="rejected")
+    # at 语法同上：<at id=..></at> 渲染 @姓名，避免暴露 open_id
     return _archive_ack_card(
-        "🚫", f"已驳回该参数变更（`{req.param}` → {req.new_value}），by <@{clicker_id}>。"
+        "🚫",
+        f"已驳回该参数变更（`{req.param}` → {req.new_value}），"
+        f"by <at id={clicker_id}></at>。",
     )
 
 
