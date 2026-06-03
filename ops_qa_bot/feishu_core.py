@@ -32,11 +32,18 @@ from lark_oapi.channel.types import (
 )
 
 from .bot import AnswerResult, OpsQABot
-from .config import DatabaseConfig, DocQAConfig, GatewayTraceConfig
+from .config import (
+    DatabaseConfig,
+    DocQAConfig,
+    GatewayTraceConfig,
+    ScheduledFollowupConfig,
+)
 from .db_query import DatabaseClient, DatabaseQueryError, DbChangeRequest
 from .doc_qa import FULL_TOOL_NAME, parse_feishu_registry
 from .doc_qa import _norm_key as _feishu_norm_key
 from .feishu_format import markdown_to_feishu_post
+from .logging_config import request_id_var
+from .scheduled_followup import ScheduledFollowupRequest
 
 logger = logging.getLogger("ops_qa_bot.feishu")
 # 由 logging_config.setup_feedback_logger 配置专用 handler 写 logs/feedback.log
@@ -746,6 +753,145 @@ class _SessionEntry:
         self.last_used = time.time()
 
 
+# 定时跟进到点时，喂回答题流程的问题前缀。把"这是定时跟进、现在到点了、请实际去查
+# 一次"的语境讲清楚，引导 agent 真去调工具（而不是只复述怎么查）；紧跟 agent 当初
+# 写的自包含 task。前缀放最前，占位摘要里也会露出"【定时跟进】"让用户认得出。
+_FOLLOWUP_QUESTION_PREFIX = (
+    "【定时跟进】用户之前要求过一会儿自动跟进下面这件事，现在时间到了，"
+    "请**立即实际执行一次检查**（按需调用 query_database / Bash 等工具真的去查，"
+    "不要只复述怎么查），把当前结果直接告诉用户；如果一次查询还看不出最终结论，"
+    "如实说明当前状态即可。\n\n任务："
+)
+
+
+class FollowupScheduler:
+    """定时跟进任务的内存定时器（MVP，无持久化）。
+
+    `schedule()` 登记一笔"N 分钟后触发"的后台任务：到点用存好的 task 跑一轮
+    `handle_question`（复用占位/答题/@ 推送/反馈卡全流程，所以到点会实际调
+    query_database 等工具去查），把结果 @ asker 推回原群。任务跑在创建它的
+    asyncio loop 上（即 channel 后台 loop——submitter 在 agent 工具调用里被
+    await，而那整条链跑在后台 loop），与所有业务同 loop，锁语义一致。
+
+    边界：按 (chat, asker) 维度限每人挂起数（`max_pending_per_user`），防误用堆爆。
+    进程退出 / `stop()` 时取消所有未触发任务（内存态，重启即丢——见
+    ScheduledFollowupConfig 的 MVP 说明）。
+    """
+
+    def __init__(
+        self,
+        feishu: "FeishuClient",
+        session_mgr: "SessionManager",
+        config: ScheduledFollowupConfig,
+    ):
+        self._feishu = feishu
+        self._session_mgr = session_mgr
+        self.max_pending_per_user = config.max_pending_per_user
+        self._tasks: set[asyncio.Task] = set()
+        # (chat, asker) → 当前挂起（含正在执行）的跟进数，给每人上限做计数
+        self._pending: dict[SessionKey, int] = {}
+        self._closing = False
+
+    def pending_count(self, key: SessionKey) -> int:
+        return self._pending.get(key, 0)
+
+    def schedule(
+        self, chat_id: str, asker_id: str, delay_minutes: int, task: str
+    ) -> bool:
+        """登记一笔定时跟进。超上限 / 正在关闭返回 False（不登记）。"""
+        key = (chat_id, asker_id)
+        if self._closing:
+            return False
+        if self.pending_count(key) >= self.max_pending_per_user:
+            return False
+        self._pending[key] = self.pending_count(key) + 1
+        t = asyncio.create_task(self._run(chat_id, asker_id, delay_minutes, task))
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
+        return True
+
+    async def _run(
+        self, chat_id: str, asker_id: str, delay_minutes: int, task: str
+    ) -> None:
+        key = (chat_id, asker_id)
+        try:
+            await asyncio.sleep(delay_minutes * 60)
+            request_id_var.set("fu" + uuid.uuid4().hex[:6])
+            logger.info(
+                "scheduled followup firing: chat=%s user=%s delay=%dmin",
+                chat_id,
+                asker_id,
+                delay_minutes,
+            )
+            question = _FOLLOWUP_QUESTION_PREFIX + task
+            # 复用整条答题链路：到点等于"以用户名义发了一条新问题"。无 parent_msg_id
+            # （原消息可能已隔很久，按 top-level 发更自然），答案会 @ asker 让他收到提醒。
+            await handle_question(
+                chat_id, asker_id, question, self._feishu, self._session_mgr
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "scheduled followup failed: chat=%s user=%s", chat_id, asker_id
+            )
+        finally:
+            n = self._pending.get(key, 0) - 1
+            if n <= 0:
+                self._pending.pop(key, None)
+            else:
+                self._pending[key] = n
+
+    async def stop(self) -> None:
+        """取消所有未触发/在跑的跟进任务（进程收尾用）。"""
+        self._closing = True
+        tasks = list(self._tasks)
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+        self._tasks.clear()
+        self._pending.clear()
+
+
+def make_followup_submitter(
+    scheduler: FollowupScheduler, chat_id: str, asker_id: str
+):
+    """造一个按 (chat_id, asker) 绑定的 FollowupSubmitter，注入给 schedule_followup。
+
+    收到工具校验好的 ScheduledFollowupRequest → 登记到 scheduler，返回给 agent 的
+    确认/拒绝文字。超每人上限时返回引导文字（让 agent 如实告诉用户精简或稍后手动问）。
+    """
+
+    async def submit(req: ScheduledFollowupRequest) -> str:
+        key = (chat_id, asker_id)
+        pending = scheduler.pending_count(key)
+        if pending >= scheduler.max_pending_per_user:
+            return (
+                f"⚠️ 你当前已有 {pending} 个定时跟进在排队（上限 "
+                f"{scheduler.max_pending_per_user}），暂时不能再加。"
+                "请等其中一个到点完成，或这次先不定时、过会儿手动再来问我。"
+            )
+        if not scheduler.schedule(chat_id, asker_id, req.delay_minutes, req.task):
+            return (
+                "⚠️ 暂时无法登记定时跟进（服务可能正在重启）。"
+                "请如实告诉用户这次没能定时，让他过会儿手动再来问我一次。"
+            )
+        logger.info(
+            "scheduled followup registered: chat=%s user=%s delay=%dmin",
+            chat_id,
+            asker_id,
+            req.delay_minutes,
+        )
+        return (
+            f"✅ 已登记定时跟进：{req.delay_minutes} 分钟后我会自动执行一次检查，"
+            "并把结果发到本群 @ 你。（在那之前你也可以随时手动来问。）"
+        )
+
+    return submit
+
+
 class SessionManager:
     """按 (chat_id, user_id) 维护独立 OpsQABot 会话。
 
@@ -767,6 +913,7 @@ class SessionManager:
         doc_qa_config: "DocQAConfig | None" = None,
         gateway_trace_config: "GatewayTraceConfig | None" = None,
         database_config: "DatabaseConfig | None" = None,
+        scheduled_followup_config: "ScheduledFollowupConfig | None" = None,
         feishu: "FeishuClient | None" = None,
     ):
         self._docs_root = docs_root
@@ -774,6 +921,7 @@ class SessionManager:
         self._doc_qa_config = doc_qa_config
         self._gateway_trace_config = gateway_trace_config
         self._database_config = database_config
+        self._scheduled_followup_config = scheduled_followup_config
         # 参数变更审批要在工具里发飞书确认卡，需要 outbound client。注入了且
         # admin 链路齐备时，每个 session 按 (chat, asker) 造一个 submitter 给 bot。
         self._feishu = feishu
@@ -783,6 +931,18 @@ class SessionManager:
         # 24h TTL：再往前的回访就当全新用户，不再提示"上下文已过期"——
         # 隔一天才回来一般是新场景，提示反而显得啰嗦
         self._last_seen: TTLCache = TTLCache(maxsize=10000, ttl=86400)
+        # 定时跟进：特性启用 + outbound client 在位时建一个内存定时器。到点用
+        # handle_question 跑一轮答题，所以 scheduler 反过来持有本 session_mgr。
+        # 每个 session 按 (chat, asker) 造一个 submitter 给 bot（同 db_change 姿态）。
+        self._followup_scheduler: FollowupScheduler | None = None
+        if (
+            feishu is not None
+            and scheduled_followup_config is not None
+            and scheduled_followup_config.enabled
+        ):
+            self._followup_scheduler = FollowupScheduler(
+                feishu, self, scheduled_followup_config
+            )
 
     async def start(self) -> None:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -793,6 +953,10 @@ class SessionManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cleanup_task
             self._cleanup_task = None
+        # 先把未触发的定时跟进取消掉，再关 session（顺序无强依赖，但先停"还会
+        # 创建新答题"的源头更干净）
+        if self._followup_scheduler is not None:
+            await self._followup_scheduler.stop()
         async with self._manager_lock:
             entries = list(self._sessions.items())
             self._sessions.clear()
@@ -811,12 +975,21 @@ class SessionManager:
                 ):
                     # key = (chat_id, asker_open_id)：确认卡发到本群、@ 本提问者
                     submitter = make_db_change_submitter(self._feishu, key[0], key[1])
+                # 定时跟进 submitter：scheduler 在位时按 (chat, asker) 造一个，
+                # 到点的答题结果就发回本群、@ 本提问者。
+                followup_submitter = None
+                if self._followup_scheduler is not None:
+                    followup_submitter = make_followup_submitter(
+                        self._followup_scheduler, key[0], key[1]
+                    )
                 bot = OpsQABot(
                     docs_root=self._docs_root,
                     doc_qa_config=self._doc_qa_config,
                     gateway_trace_config=self._gateway_trace_config,
                     database_config=self._database_config,
                     db_change_submitter=submitter,
+                    scheduled_followup_config=self._scheduled_followup_config,
+                    followup_submitter=followup_submitter,
                 )
                 await bot.__aenter__()
                 entry = _SessionEntry(bot)

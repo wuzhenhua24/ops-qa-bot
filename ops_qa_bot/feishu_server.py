@@ -100,6 +100,7 @@ def create_app(config: AppConfig) -> FastAPI:
         doc_qa_config=config.doc_qa,
         gateway_trace_config=config.gateway_trace,
         database_config=config.database,
+        scheduled_followup_config=config.scheduled_followup,
         # 参数变更审批要在工具里发确认卡，把 outbound client 传给 session 层
         feishu=feishu,
     )

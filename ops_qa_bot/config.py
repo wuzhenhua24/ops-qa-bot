@@ -157,6 +157,29 @@ class DatabaseConfig:
 
 
 @dataclass
+class ScheduledFollowupConfig:
+    """定时跟进任务（`schedule_followup` 工具）的接入配置。
+
+    用户让 bot "X 分钟后帮我看看 Y"时，agent 调 `schedule_followup` 登记一笔跟进，
+    到点由飞书侧的内存定时器跑一轮答题、把结果 @ 用户推回群。纯产品特性、无外部
+    依赖，所以用显式 `enabled` 开关（默认关：零配置零感知），而不是像 doc_qa 那样
+    从 base_url 推导。启用还需飞书 outbound client 在位（CLI 直用没有定时器、不挂工具）。
+
+    `min/max_delay_minutes`：可登记的等待区间，越界工具会拒并提示 agent 取合理值
+    （防"过 3 天提醒我"这种内存定时器扛不住的诉求）。`max_pending_per_user`：单个
+    (chat, asker) 同时挂起的跟进上限，防误用/泄漏把后台任务堆爆。
+
+    **MVP 是纯内存定时器**：进程重启会丢未触发的任务。20 分钟级场景一般够用；真出现
+    "重启丢任务"痛点再加持久化。
+    """
+
+    enabled: bool = False
+    min_delay_minutes: int = 1
+    max_delay_minutes: int = 120
+    max_pending_per_user: int = 5
+
+
+@dataclass
 class AppConfig:
     docs_root: Path
     feishu: FeishuConfig
@@ -168,6 +191,9 @@ class AppConfig:
     doc_qa: DocQAConfig = field(default_factory=DocQAConfig)
     gateway_trace: GatewayTraceConfig = field(default_factory=GatewayTraceConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    scheduled_followup: ScheduledFollowupConfig = field(
+        default_factory=ScheduledFollowupConfig
+    )
 
 
 def _pick(env_key: str, cfg_value: Any, default: Any = None) -> Any:
@@ -320,6 +346,29 @@ def load_config(path: Path) -> AppConfig:
         admin_open_ids=admin_open_ids,
     )
 
+    followup_raw = data.get("scheduled_followup") or {}
+    followup_enabled_raw = _pick(
+        "SCHEDULED_FOLLOWUP_ENABLED", followup_raw.get("enabled"), False
+    )
+    followup_enabled = (
+        followup_enabled_raw
+        if isinstance(followup_enabled_raw, bool)
+        else str(followup_enabled_raw).lower() in ("1", "true", "yes", "on")
+    )
+    followup_min = int(
+        _pick("SCHEDULED_FOLLOWUP_MIN_DELAY", followup_raw.get("min_delay_minutes"), 1)
+    )
+    followup_max = int(
+        _pick("SCHEDULED_FOLLOWUP_MAX_DELAY", followup_raw.get("max_delay_minutes"), 120)
+    )
+    followup_max_pending = int(
+        _pick(
+            "SCHEDULED_FOLLOWUP_MAX_PENDING",
+            followup_raw.get("max_pending_per_user"),
+            5,
+        )
+    )
+
     return AppConfig(
         docs_root=docs_root,
         feishu=FeishuConfig(
@@ -347,4 +396,10 @@ def load_config(path: Path) -> AppConfig:
             timeout=gw_trace_timeout,
         ),
         database=database,
+        scheduled_followup=ScheduledFollowupConfig(
+            enabled=followup_enabled,
+            min_delay_minutes=followup_min,
+            max_delay_minutes=followup_max,
+            max_pending_per_user=followup_max_pending,
+        ),
     )

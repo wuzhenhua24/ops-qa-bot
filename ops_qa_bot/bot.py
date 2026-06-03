@@ -16,7 +16,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from .config import DatabaseConfig, DocQAConfig, GatewayTraceConfig
+from .config import (
+    DatabaseConfig,
+    DocQAConfig,
+    GatewayTraceConfig,
+    ScheduledFollowupConfig,
+)
 from .db_query import CHANGE_FULL_TOOL_NAME as DB_CHANGE_FULL_TOOL_NAME
 from .db_query import FULL_TOOL_NAME as DB_FULL_TOOL_NAME
 from .db_query import SERVER_KEY as DB_SERVER_KEY
@@ -26,6 +31,9 @@ from .gateway_trace import FULL_TOOL_NAME as GW_TRACE_FULL_TOOL_NAME
 from .gateway_trace import SERVER_KEY as GW_TRACE_SERVER_KEY
 from .gateway_trace import build_gateway_trace_server
 from .prompt import build_system_prompt
+from .scheduled_followup import FULL_TOOL_NAME as FOLLOWUP_FULL_TOOL_NAME
+from .scheduled_followup import SERVER_KEY as FOLLOWUP_SERVER_KEY
+from .scheduled_followup import FollowupSubmitter, build_followup_server
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +224,8 @@ class OpsQABot:
         gateway_trace_config: GatewayTraceConfig | None = None,
         database_config: DatabaseConfig | None = None,
         db_change_submitter: DbChangeSubmitter | None = None,
+        scheduled_followup_config: ScheduledFollowupConfig | None = None,
+        followup_submitter: FollowupSubmitter | None = None,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -293,12 +303,29 @@ class OpsQABot:
             if db_change_enabled:
                 allowed_tools.append(DB_CHANGE_FULL_TOOL_NAME)
 
+        # 定时跟进工具：只在 submitter 注入（飞书侧定时器链路接好、特性 enabled）时挂。
+        # CLI 直用 / 未启用时 submitter=None，不挂工具、prompt 不加节，零感知。
+        # 到点执行发生在飞书回调里（FollowupScheduler），agent 只负责登记。
+        followup_enabled = (
+            followup_submitter is not None
+            and scheduled_followup_config is not None
+            and scheduled_followup_config.enabled
+        )
+        if followup_enabled:
+            assert scheduled_followup_config is not None
+            assert followup_submitter is not None
+            mcp_servers[FOLLOWUP_SERVER_KEY] = build_followup_server(
+                scheduled_followup_config, followup_submitter
+            )
+            allowed_tools.append(FOLLOWUP_FULL_TOOL_NAME)
+
         self._options = ClaudeAgentOptions(
             system_prompt=build_system_prompt(
                 self.docs_root,
                 doc_qa_enabled=doc_qa_enabled,
                 db_enabled=db_enabled,
                 db_change_enabled=db_change_enabled,
+                followup_enabled=followup_enabled,
             ),
             tools=["Read", "Glob", "Grep", "Bash"],
             mcp_servers=mcp_servers,

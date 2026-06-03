@@ -101,3 +101,14 @@ ro_user        = ""                     # env: DB_OB_ORACLE_RO_USER
 ro_password    = ""                     # env: DB_OB_ORACLE_RO_PASSWORD
 admin_user     = ""                     # env: DB_OB_ORACLE_ADMIN_USER
 admin_password = ""                     # env: DB_OB_ORACLE_ADMIN_PASSWORD
+
+[scheduled_followup]
+# 定时跟进：用户让 bot“X 分钟后帮我再看看 Y”时，agent 调 schedule_followup 工具登记一笔
+# 跟进，到点由内存定时器自动跑一轮检查、把结果 @ 用户推回群（到点跑的仍受同样的只读约束）。
+# 纯产品特性、无外部依赖，所以用显式开关；默认关，置 true 才挂工具 + 加 prompt 节。
+# 需飞书 outbound（ws / http 模式）在位才生效，CLI 直用不挂。
+# 注意：MVP 是纯内存定时器，进程重启会丢未触发的任务（分钟级场景一般够用）。
+enabled              = false             # env: SCHEDULED_FOLLOWUP_ENABLED（1/true/yes/on）
+min_delay_minutes    = 1                 # env: SCHEDULED_FOLLOWUP_MIN_DELAY。可登记的最短等待
+max_delay_minutes    = 120               # env: SCHEDULED_FOLLOWUP_MAX_DELAY。超出工具会拒（内存定时器扛不住超长等待）
+max_pending_per_user = 5                 # env: SCHEDULED_FOLLOWUP_MAX_PENDING。单用户同时挂起上限，防堆爆

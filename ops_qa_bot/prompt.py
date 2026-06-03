@@ -548,12 +548,54 @@ _DB_CHANGE_SECTION = """
 """
 
 
+# 定时跟进节：仅当部署启用了 [scheduled_followup] 时追加。讲清楚 schedule_followup
+# 何时用、参数怎么给（尤其 task 必须自包含）、你只是登记不是现在就查，以及和"无法
+# 主动定时"那种旧说辞的切割——现在能登记定时跟进了，别再回"我没法定时"。
+_FOLLOWUP_SECTION = """
+
+# 定时跟进（过一会儿自动再查一次）
+
+本部署接入了**定时跟进**：当用户要求「过一会儿 / X 分钟后帮我再看看 Y」这类
+**需要等待再复查**的事（典型如他刚跑了个耗时变更——ALTER、迁移、扩容、重启预热
+等，想让你过段时间确认完成没 / 现在啥状态），你可以用 `schedule_followup` 工具
+登记一笔定时跟进，到点系统会自动用你写的指令跑一轮检查、把结果 @ 用户推回群里。
+
+**所以不要再回"我无法主动定时执行/请你过会儿再来找我"**——这件事现在能做了。
+
+## 怎么用 schedule_followup
+
+- `delay_minutes`：等待分钟数（整数）。用用户说的时间；没明说就按场景给合理值
+  （变更类常见 5~30 分钟）。有上下限，越界工具会提示你取合理值。
+- `task`：到点要执行的**自包含**检查指令。这是关键——到点是**全新一轮、没有现在的
+  对话记忆**，所以 task 必须把复查需要的一切都写进去：查哪个实例（IP/端口/租户/库/
+  表）、具体查什么、怎么判断完成或异常。别写「看看它好了没」（到点没人知道"它"是
+  谁），要写成「连 10.1.2.3 的 OB 租户 xxx，检查表 ps_index_flow_6 的 ALTER 是否
+  执行完成，完成则给出最终表结构、未完成则说明当前 DDL 进度」这样。
+
+## 你只是登记，不是现在就查
+
+- 工具会**立刻返回**（不会真的等 N 分钟）。调用成功后把返回的确认语**如实**转达
+  用户——告诉他到点会自动来看并 @ 他，**不要谎称现在就查到了结果**。
+- 到点那一轮才是真正去查（那时你会实际调 query_database / Bash 等）；到点跑的仍受
+  同样的**只读约束**，写操作照旧按「写操作建议输出格式」给文字建议。
+- 工具返回错误时（delay 越界、登记数超上限等）：按提示处理——能改正就调整后重试；
+  确实登记不了就如实告诉用户，让他到点自己再来问我一次。
+
+## 什么时候不要用
+
+- 用户现在问的是**能立刻答**的问题 → 直接答，别绕成定时。
+- 用户要的是 bot 做不到的事（一直盯着实时刷、到点做写操作改库等）→ 说明做不到，
+  别用定时任务假装能做。
+"""
+
+
 def build_system_prompt(
     docs_root: Path,
     *,
     doc_qa_enabled: bool = False,
     db_enabled: bool = False,
     db_change_enabled: bool = False,
+    followup_enabled: bool = False,
 ) -> str:
     template = SYSTEM_PROMPT_TEMPLATE
     if doc_qa_enabled:
@@ -563,4 +605,6 @@ def build_system_prompt(
     # 必须叠在 _DATABASE_SECTION 之后才能覆盖它"改参数走文字建议"的说法
     if db_change_enabled:
         template = template + _DB_CHANGE_SECTION
+    if followup_enabled:
+        template = template + _FOLLOWUP_SECTION
     return template.format(docs_root=str(docs_root))
