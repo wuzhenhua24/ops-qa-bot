@@ -10,7 +10,9 @@
 
 任何字段也可以用同名环境变量覆盖（见 config.example.toml 中注释）。
 
-安全：未包含签名校验，请在飞书开放平台配置 IP 白名单限制来源。
+安全：签名校验 / AES 解密 / verify_token 由 lark-oapi 的 FeishuChannel
+在 handle_webhook_request 里完成（配了 feishu.encrypt_key / verify_token 即生效）。
+公网部署建议再叠一层飞书开放平台的出口 IP 白名单限制来源。
 """
 
 import argparse
