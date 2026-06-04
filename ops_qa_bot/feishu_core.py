@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from cachetools import LRUCache, TTLCache
 from lark_oapi.channel import FeishuChannel
@@ -976,8 +976,14 @@ class SessionManager:
                     and self._database_config is not None
                     and self._database_config.admin_enabled
                 ):
-                    # key = (chat_id, asker_open_id)：确认卡发到本群、@ 本提问者
-                    submitter = make_db_change_submitter(self._feishu, key[0], key[1])
+                    # key = (chat_id, asker_open_id)：确认卡发到本群、@ 本提问者，
+                    # 卡顶再 @ admin 名单通知审批方
+                    submitter = make_db_change_submitter(
+                        self._feishu,
+                        key[0],
+                        key[1],
+                        self._database_config.admin_open_ids,
+                    )
                 # 定时跟进 submitter：scheduler 在位时按 (chat, asker) 造一个，
                 # 到点的答题结果就发回本群、@ 本提问者。
                 followup_submitter = None
@@ -2644,15 +2650,26 @@ def _fmt_db_instance(req: "DbChangeRequest") -> str:
     return f"{base}（{req.db_type}）"
 
 
-def _db_change_card(change_id: str, req: "DbChangeRequest", asker_id: str | None) -> dict:
+def _db_change_card(
+    change_id: str,
+    req: "DbChangeRequest",
+    asker_id: str | None,
+    admin_ids: Iterable[str] | None = None,
+) -> dict:
     """参数变更确认卡（card v2）：实例 / 参数现值→新值 / 待执行 SQL / 申请人 +
     「确认执行」「驳回」两个按钮。两个按钮都仅 `admin_open_ids` 名单里的人点有效
     （校验在 handler，非授权点击保持卡片可见）。所见即所执行：卡上的 SQL 就是确认
     时原样要跑的那条。
+
+    `admin_ids` 非空时在卡顶加一行 @ 管理员（飞书 `<at id=..></at>` 渲染 @姓名、
+    不暴露 open_id，且会给被 @ 的管理员推通知），让审批方知道有单子待处理。
     """
     current = req.current_value or "（未取到，请确认前自行核对）"
+    admin_at = " ".join(f"<at id={a}></at>" for a in (admin_ids or []))
+    notify_md = f"📣 请管理员审批：{admin_at}\n" if admin_at else ""
     asker_at = f"\n- 申请人：<at id={asker_id}></at>" if asker_id else ""
     detail_md = (
+        f"{notify_md}"
         "**🛠 数据库参数变更申请**（需管理员确认后执行）\n"
         f"- 实例：{_fmt_db_instance(req)}\n"
         f"- 参数：`{req.param}`\n"
@@ -2717,17 +2734,21 @@ def _db_change_card(change_id: str, req: "DbChangeRequest", asker_id: str | None
 
 
 def make_db_change_submitter(
-    feishu: "FeishuClient", chat_id: str, asker_id: str
+    feishu: "FeishuClient", chat_id: str, asker_id: str, admin_ids: Iterable[str] = ()
 ):
     """造一个按 (chat_id, asker) 绑定的 DbChangeSubmitter，注入给 request_db_change。
 
     收到工具组装好的 DbChangeRequest → 发确认卡到本群 + 登记 pending，返回给 agent
     的确认文字。卡发失败则不登记 pending、返回失败文字（让 agent 据此如实告诉用户）。
+
+    `admin_ids` 是有权审批的管理员 open_id 列表：确认卡顶部会 @ 这些人，给他们推
+    通知（不在册的人无须关注）。
     """
+    admin_ids = tuple(admin_ids)
 
     async def submit(req: "DbChangeRequest") -> str:
         change_id = uuid.uuid4().hex
-        card = _db_change_card(change_id, req, asker_id)
+        card = _db_change_card(change_id, req, asker_id, admin_ids)
         msg_id = await feishu.send_interactive(chat_id, card)
         if not msg_id:
             return (

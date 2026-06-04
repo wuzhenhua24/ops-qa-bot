@@ -134,6 +134,29 @@ def test_submitter_sends_card_and_registers_pending():
     assert ctx["asker_id"] == "ou_asker" and ctx["chat_id"] == "oc_chat"
 
 
+def test_submitter_at_mentions_admins_on_card():
+    fc._pending_db_changes.clear()
+    feishu = _FakeFeishu()
+    submit = fc.make_db_change_submitter(
+        feishu, "oc_chat", "ou_asker", ("ou_admin", "ou_admin2")
+    )
+    _run(submit(_mk_req()))
+    card_json = json.dumps(feishu.cards[0][1], ensure_ascii=False)
+    # 卡顶 @ 每个管理员，飞书 at 语法（不暴露 <@ou_xxx> 原始形式）
+    assert "<at id=ou_admin>" in card_json
+    assert "<at id=ou_admin2>" in card_json
+    assert "<@ou_admin>" not in card_json
+
+
+def test_submitter_no_admins_no_at_line():
+    fc._pending_db_changes.clear()
+    feishu = _FakeFeishu()
+    submit = fc.make_db_change_submitter(feishu, "oc_chat", "ou_asker")
+    _run(submit(_mk_req()))
+    card_json = json.dumps(feishu.cards[0][1], ensure_ascii=False)
+    assert "请管理员审批" not in card_json
+
+
 def test_submitter_card_send_fail_no_pending():
     fc._pending_db_changes.clear()
     submit = fc.make_db_change_submitter(_FakeFeishu(card_msg_id=None), "c", "a")
