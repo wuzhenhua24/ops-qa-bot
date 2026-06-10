@@ -50,6 +50,9 @@ logger = logging.getLogger("ops_qa_bot.feishu")
 feedback_logger = logging.getLogger("ops_qa_bot.feedback")
 POST_TITLE = "测试环境助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
+# 帮助指令：列 bot 能力 + 可用指令，新人进群不用翻部署文档。匹配前先 lower，
+# "HELP"/"Help" 也认；中文触发词不受影响
+HELP_TRIGGERS = {"/help", "help", "帮助"}
 
 # 图片输入：Anthropic vision 支持 png/jpeg/gif/webp；超过 5MB 大概率被 API 拒
 # （像素 + 字节双重限制），让 bot 友好提示用户压缩，而不是甩 LLM 报错原文
@@ -2250,6 +2253,45 @@ def _index_owner_to_dirs(docs_root: Path) -> dict[str, list[str]]:
     return mapping
 
 
+def _index_component_names(docs_root: Path) -> list[str]:
+    """解析 docs_root/INDEX.md 组件表的「组件」列 → 保序去重的组件名列表。
+
+    给 /help 列"能问哪些组件"用。解析容错与 _index_owner_to_dirs 同姿态
+    （表头需含"组件"和"目录"两列、分隔行跳过）；/help 低频，不做 mtime 缓存。
+    解析失败返回空列表，帮助文案降级成不带组件清单。
+    """
+    index_path = docs_root / "INDEX.md"
+    names: list[str] = []
+    in_table = False
+    comp_idx = -1
+    try:
+        with index_path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line.startswith("|"):
+                    if in_table:
+                        break
+                    continue
+                cols = [c.strip() for c in line.strip("|").split("|")]
+                if not in_table:
+                    if "组件" in cols and "目录" in cols:
+                        comp_idx = cols.index("组件")
+                        in_table = True
+                    continue
+                # 分隔行 |---|---|
+                if all(set(c) <= set("-: ") and c for c in cols):
+                    continue
+                if comp_idx >= len(cols):
+                    continue
+                name = cols[comp_idx].strip("`").strip()
+                if name and name not in names:
+                    names.append(name)
+    except OSError as e:
+        logger.warning("read INDEX.md for component names failed: %s", e)
+        return []
+    return names
+
+
 def _archive_form_card(
     qid: str,
     question_default: str,
@@ -2992,6 +3034,60 @@ async def handle_db_change_reject(
     )
 
 
+def _help_text(session_mgr: SessionManager) -> str:
+    """/help 的能力清单文案。按实际启用的可选工具动态拼——没启用的特性不出现，
+    避免新人照着帮助试了个被关掉的功能。组件清单来自 INDEX.md（解析失败就不列）。
+    """
+    lines: list[str] = [
+        "👋 我是运维问答机器人，**@ 我 + 问题** 即可提问。",
+        "",
+        "**我能做什么**",
+    ]
+    comps = _index_component_names(session_mgr.docs_root)
+    comp_suffix = f"（当前覆盖：{'、'.join(comps)}）" if comps else ""
+    lines.append(f"- 📚 文档问答：基于运维文档库回答组件问题{comp_suffix}")
+    lines.append(
+        "- 🖥️ 实时诊断：带上机器 IP/名字问「现在内存/连接数/load 怎么样」，"
+        "我会连到测试环境跑只读命令看实况（永不执行写操作；生产环境不支持）"
+    )
+    lines.append("- 🖼️ 看图提问：直接发报错弹窗/监控面板等截图，可附文字说明")
+    gw_cfg = session_mgr._gateway_trace_config
+    if gw_cfg is not None and gw_cfg.enabled:
+        lines.append(
+            "- 🔗 网关链路排查：访问失败时把响应头里的 Hi-Trace-Id 发我，"
+            "我帮你查链路日志定位哪一跳出的问题"
+        )
+    db_cfg = session_mgr._database_config
+    if db_cfg is not None and db_cfg.enabled:
+        lines.append(
+            "- 🗄️ 数据库实时分析：给出测试库 IP/端口（OceanBase 还需租户），"
+            "我用只读账号帮你查 CPU/连接数/慢查询"
+        )
+        if session_mgr._feishu is not None and db_cfg.admin_enabled:
+            lines.append(
+                "- 🔧 参数变更申请：可帮你发起数据库参数修改，"
+                "管理员在群里点确认后才会执行"
+            )
+    if session_mgr._followup_scheduler is not None:
+        lines.append(
+            "- ⏰ 定时跟进：「20 分钟后帮我看看 XX 完成没」，到点我自动复查并 @ 你"
+        )
+    lines.append("")
+    lines.append(
+        "**答不上来时**：我会自动 @ 对应组件负责人协助，负责人的回答会沉淀回文档库。"
+    )
+    lines.append("")
+    lines.append("**指令**")
+    lines.append("- `/reset`（或 `/new`、新对话、重置）：清空你的对话历史，开新会话")
+    lines.append("- `/help`（或 帮助）：显示本帮助")
+    idle_minutes = max(1, int(session_mgr.idle_ttl // 60))
+    lines.append("")
+    lines.append(
+        f"💡 同一会话里可以直接追问；{idle_minutes} 分钟没动静上下文会自动过期。"
+    )
+    return "\n".join(lines)
+
+
 async def handle_question(
     chat_id: str,
     user_id: str,
@@ -3026,6 +3122,17 @@ async def handle_question(
         )
         await feishu.send_post(
             chat_id, _mention_post(user_id, reply), parent_id=parent_msg_id
+        )
+        return
+
+    # 帮助指令：直接回能力清单 + 可用指令，不进答题流程（零 LLM 成本）、不创建
+    # session。放在 take_expired_notice 之前——一句 /help 不该把"上下文已过期"
+    # 的一次性提示消费掉。
+    if not images and question.lower() in HELP_TRIGGERS:
+        await feishu.send_post(
+            chat_id,
+            _mention_post(user_id, _help_text(session_mgr)),
+            parent_id=parent_msg_id,
         )
         return
 
