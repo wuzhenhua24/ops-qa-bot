@@ -7,6 +7,8 @@
 - 取消运行中的答题：bot.interrupt() 被调用、流收尾后占位刷成"已取消"、结果
   丢弃、不发反馈卡；取消指令本身得到回执；feedback 日志落 event=cancelled。
 - 取消排队中的答题：bot.ask 根本不被调用（拿到锁后直接放弃），占位同样收尾。
+- 跨用户隔离：B 发 /cancel 取消不掉 A 的在途答题（按 (chat, user) 隔离，
+  B 只得到"无需取消"），A 自己取消照常生效。
 - 答题正常结束后 /cancel：在途已注销，回"无需取消"。
 
 跑法：
@@ -211,6 +213,49 @@ def test_cancel_queued_answer_never_asks(tmp_path: Path, monkeypatch):
     assert "已请求取消" in _flat(feishu.posts[-1][1])
     assert "已取消" in _flat(feishu.updates[-1][1])
     assert feishu.cards == []
+
+
+def test_cancel_by_other_user_does_not_touch_askers_question(
+    tmp_path: Path, monkeypatch
+):
+    """B 发 /cancel 取消不掉 A 的在途答题——取消按 (chat, user) 隔离。"""
+    bot = _HangingBot()
+    entry = _Entry(bot)
+
+    async def fake_get(self, key):
+        return entry
+
+    monkeypatch.setattr(fc.SessionManager, "get", fake_get)
+    feishu = _RecordingFeishu()
+    sm = fc.SessionManager(docs_root=_docs_root(tmp_path))
+
+    async def go():
+        task = asyncio.create_task(
+            fc.handle_question(
+                "chatA", "asker", "redis 怎么扩容", feishu, sm,
+                parent_msg_id="om_q",
+            )
+        )
+        await asyncio.sleep(0.05)  # A 的答题进入流式挂起阶段
+        # B 在同一个群里发 /cancel：查的是 (chatA, intruder) 名下的在途
+        await fc.handle_question(
+            "chatA", "intruder", "/cancel", feishu, sm, parent_msg_id="om_c"
+        )
+        assert bot.interrupt_calls == 0  # A 的 agent 没有被打断
+        # A 自己取消，正常生效
+        await fc.handle_question(
+            "chatA", "asker", "取消", feishu, sm, parent_msg_id="om_c2"
+        )
+        await task
+
+    _run(go())
+    assert bot.interrupt_calls == 1  # 只有 asker 自己那次生效
+    # B 得到的是"无需取消"，且回执 @ 的是 B 自己
+    intruder_reply = _flat(feishu.posts[1][1])
+    assert "无需取消" in intruder_reply
+    assert "intruder" in intruder_reply
+    # A 的占位最终因 A 自己的取消而收尾
+    assert "已取消" in _flat(feishu.updates[-1][1])
 
 
 def test_cancel_after_done_is_noop(tmp_path: Path, monkeypatch):
