@@ -219,6 +219,17 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 
 ### 反馈日志分析
 
+**一条命令出报表**（满意率 / 被踩问题及原因 / 升级率 / drift 与 max_turns 命中 / 归档沉淀 / 追问分布 / token 成本）：
+
+```bash
+uv run python -m ops_qa_bot.feedback_stats              # 近 7 天
+uv run python -m ops_qa_bot.feedback_stats --days 30    # 近 30 天；--days 0 全量
+uv run python -m ops_qa_bot.feedback_stats --log /path/to/feedback.log \
+    --price-input 3 --price-output 15                   # 有真实单价时才传，追加美元估算
+```
+
+用量口径以**纯 token 数**为主（总量 / 四类拆分 / 平均每题 / 缓存命中率）——订阅、coding plan 类套餐没有严格的 token 单价，美元数反而误导；只有显式传了 `--price-*`（按量计费 / 第三方代理有真实单价）才追加美元估算行。纯 stdlib、只读日志文件，不要求服务在跑。将来若要"周报自动推群"，cron + 本模块 + 一次 send_post 即可，聚合逻辑直接复用。下面的 jq 命令适合临时性的自由查询。
+
 `logs/feedback.log` 每行是 `时间戳 + JSON`。用 `sed 's/^[^{]*//'` 去掉时间戳前缀后就能喂给 `jq`。
 
 **`qa` 事件的字段**：
