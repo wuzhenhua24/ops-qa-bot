@@ -21,7 +21,9 @@ ops-qa-bot/
 │   ├── bot.py               # OpsQABot（ClaudeSDKClient 封装，含视觉输入 + MCP 工具挂载）
 │   ├── cli.py               # 交互式 REPL
 │   ├── config.py            # AppConfig：toml + 环境变量加载
-│   ├── feishu_core.py       # 飞书业务核心：FeishuClient / SessionManager / handle_question 等
+│   ├── feishu_core.py       # 飞书业务核心：FeishuClient / SessionManager / handle_question 等编排
+│   ├── cards.py             # 飞书卡片 / post 构造（纯 builder，从 feishu_core 拆出）
+│   ├── markers.py           # 答案 marker 解析（ESCALATE/CLARIFY/FOLLOWUPS/IMG 等，纯函数）
 │   ├── feishu_server.py     # HTTP 模式适配层（FastAPI 统一 webhook：消息 + 卡片回调）
 │   ├── feishu_format.py     # markdown → 飞书 post 富文本转换（解析委托 lark-oapi）
 │   ├── ws_server.py         # 长连接模式适配层（lark-oapi WebSocket）

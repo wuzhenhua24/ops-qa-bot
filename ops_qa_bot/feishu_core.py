@@ -32,6 +32,29 @@ from lark_oapi.channel.types import (
 )
 
 from .bot import AnswerResult, OpsQABot
+
+# cards / markers 是从本模块拆出的纯函数层（卡片构造 / marker 解析）。这里
+# 全量 re-export：本模块编排代码与既有测试（fc._feedback_card 等引用）都
+# 不用改；monkeypatch fc.xxx 的语义也保持不变（编排代码经本模块命名空间引用）。
+from .cards import (
+    POST_TITLE,
+    _FEEDBACK_REASONS,
+    _append_escalate_at,
+    _archive_ack_card,
+    _archive_answer_notify_post,
+    _archive_form_card,
+    _clarify_giveup_ack_card,
+    _clarify_giveup_card,
+    _db_change_card,
+    _feedback_ack_card,
+    _feedback_card,
+    _feedback_reason_form_card,
+    _fmt_db_instance,
+    _followup_ack_card,
+    _followup_card,
+    _followup_error_card,
+    _mention_post,
+)
 from .config import (
     DatabaseConfig,
     DocQAConfig,
@@ -41,14 +64,36 @@ from .config import (
 from .db_query import DatabaseClient, DatabaseQueryError, DbChangeRequest
 from .doc_qa import FULL_TOOL_NAME, parse_feishu_registry
 from .doc_qa import _norm_key as _feishu_norm_key
-from .feishu_format import markdown_to_feishu_post
 from .logging_config import request_id_var
+from .markers import (
+    _ARCHIVE_Q_MAX_LEN,
+    _ARCHIVE_Q_RE,
+    _AT_OWNER_RE,
+    _CLARIFY_RE,
+    _ESCALATE_RE,
+    _ESCALATE_TICKET_RE,
+    _FOLLOWUP_LIBRARY,
+    _FOLLOWUPS_RE,
+    _IMG_ALLOWED_EXT,
+    _IMG_MAX_BYTES,
+    _IMG_MAX_PER_ANSWER,
+    _IMG_RE,
+    _NOT_FOUND_RE,
+    _OPEN_ID_RE,
+    _excerpt,
+    _is_escalate_drift,
+    _parse_archive_q,
+    _parse_clarify,
+    _parse_escalate,
+    _parse_escalate_ticket,
+    _parse_followups,
+    _rewrite_owner_at_mentions,
+)
 from .scheduled_followup import ScheduledFollowupRequest
 
 logger = logging.getLogger("ops_qa_bot.feishu")
 # 由 logging_config.setup_feedback_logger 配置专用 handler 写 logs/feedback.log
 feedback_logger = logging.getLogger("ops_qa_bot.feedback")
-POST_TITLE = "测试环境助手"
 RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 # 帮助指令：列 bot 能力 + 可用指令，新人进群不用翻部署文档。匹配前先 lower，
 # "HELP"/"Help" 也认；中文触发词不受影响
@@ -422,93 +467,10 @@ class ProgressTracker:
 
 SessionKey = tuple[str, str]  # (chat_id, user_open_id)
 
-# 升级机制：bot 答不上来时，按 prompt 输出 <<ESCALATE:ou_xxx:component_dir>>
-# 标记，handle_question 拦截 → 移除标记 → 在 post 末尾注入 @owner 提醒。
-# owner 接受 ou_xxx 或 none；后缀目录可选，由 LLM 基于"问题归属哪个组件"给出，
-# 用于归档卡选目录。owner / dir 都做白名单校验防注入和路径穿越。
-# 冒号 / who / dir 周围都容许 \s*——LLM 偶尔会写成 `<<ESCALATE: ou_xxx:redis>>`
-# 或 `<<ESCALATE:ou_xxx : redis >>`，严格正则漏匹配 → marker 字面糊到答案末尾 +
-# @ 不发。和 _FOLLOWUPS_RE 修复一同思路：宽松匹配，下游已有 strip 兜底。
-_ESCALATE_RE = re.compile(
-    r"<<ESCALATE:\s*(?P<who>ou_[A-Za-z0-9_-]+|none)\s*"
-    r"(?::\s*(?P<dir>[A-Za-z0-9._/-]+)\s*)?>>"
-)
-# 工单类升级：用户让人代为执行变更（加权限/开账号），不是知识 Q&A。bot 只 @
-# 负责人、不发归档表单卡（没什么可归档的"答案"）。和 _ESCALATE_RE 互斥，两者同时
-# 出现时 ticket 优先。不带 dir：工单不归档，dir 没意义。
-_ESCALATE_TICKET_RE = re.compile(
-    r"<<ESCALATE_TICKET:\s*(?P<who>ou_[A-Za-z0-9_-]+|none)\s*>>"
-)
-_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
 # 同一 (chat, owner) 30 分钟内只 @ 一次，防止用户连环问把负责人刷烦
 _escalate_cooldown: TTLCache = TTLCache(maxsize=10000, ttl=1800)
 
-# Escalate drift 兜底：LLM 答出"文档中未找到 / 找不到相关内容"但忘了输出 ESCALATE
-# marker。这种 asker 看到答案是"找不到 + 空气"，没人接手——属于 LLM 概率漂移
-# （[[project-escalate-trigger-probabilistic]]）。命中时给答案追加一句 asker-facing
-# 提示让他有 next step（"在群里 @ 负责人"），并在日志里打 warning + qa 事件加
-# escalate_drift_fallback=True 字段，方便事后 grep 漂移频率。
-# 不强行猜 owner @：我们没有可靠依据从问题文本推断组件，乱 @ 错人比不 @ 更糟。
-_NOT_FOUND_RE = re.compile(
-    r"文档(中|里)?(未|没)(找到|有)|"
-    r"未找到相关|"
-    r"找不到相关"
-)
 
-# 正文 @ owner 渲染：LLM 在答案正文里写 `<@ou_xxx>` 字面想表达"候选负责人"（典型
-# 场景：drift 兜底时不确定主 owner 是谁，列两三个候选让用户挑）。markdown 解析
-# 不认这个语法，会原样渲染成丑陋的尖括号文本。bot 端识别该 pattern → 对照 INDEX.md
-# 注册白名单 → 在册的转 feishu <at> tag（用户能点 ping），不在册的（LLM 幻觉编出
-# 来的 open_id）静默剥除。容忍空格防 LLM 输出 `< @ou_xxx >` 等变种。
-_AT_OWNER_RE = re.compile(r"<\s*@\s*(ou_[A-Za-z0-9_-]+)\s*>")
-
-
-def _is_escalate_drift(
-    raw_answer: str,
-    stripped_answer: str,
-    escalate_owner: str | None,
-    is_clarification: bool,
-) -> bool:
-    """Escalate marker drift 判定（纯函数，便于单测）。
-
-    True 表示 LLM 说"找不到"但忘了输出 ESCALATE/CLARIFY marker，需要兜底。
-    raw_answer 是 LLM 原文（剥 marker 之前），stripped_answer 是剥完 marker
-    的答案。escalate_owner 来自 ticket/普通 ESCALATE parser 合并后的结果。
-
-    四个条件全部满足才算 drift：
-    1. 非反问轮——反问轮 LLM 本来就不该输出 ESCALATE，不算漂移；
-    2. 没识别到任何 owner——已经 @ 上人就不需要兜底；
-    3. raw_answer 不含 <<ESCALATE 也不含 <<CLARIFY——LLM 自己 mark 过（哪怕
-       是 ESCALATE:none 表示"找不到但也不知道找谁"），按其意图办，不覆盖；
-    4. stripped_answer 文本命中"文档中未找到/找不到相关"句式——LLM 确实表达
-       了找不到，而不是答了别的东西。
-    """
-    if is_clarification:
-        return False
-    if escalate_owner is not None:
-        return False
-    if "<<ESCALATE" in raw_answer or "<<CLARIFY" in raw_answer:
-        return False
-    return bool(_NOT_FOUND_RE.search(stripped_answer))
-
-# 快捷追问机制：bot 答完后按 prompt 输出 <<FOLLOWUPS:k1|k2|k3>> 标记，
-# handle_question 解析 → 在反馈卡上面挂对应按钮。点击 → 用预设 prompt
-# 触发新一轮 handle_question，把用户自然带进下一轮。
-# key 必须出自 _FOLLOWUP_LIBRARY；最多 3 个；不在白名单的 key 静默过滤。
-# 正则宽松（含空格 / 大小写 / 数字 / 横杠都先收下），合法性靠 _FOLLOWUP_LIBRARY
-# 白名单过滤 + _parse_followups 里逐 key strip。**必须容忍空格**：实测 LLM 偶尔
-# 写成 `<<FOLLOWUPS: troubleshoot|commands|related>>`（冒号后多个空格）或
-# `<<FOLLOWUPS:troubleshoot | commands | related>>`（竖线两侧空格），严格正则
-# 会漏匹配 → marker 字面糊到答案末尾 + 追问卡不发。和 _ARCHIVE_Q_RE / _IMG_RE
-# 一致用 `[^<>\n\r]+?`（允许除尖括号和换行外的任意字符）。
-_FOLLOWUPS_RE = re.compile(r"<<FOLLOWUPS:([^<>\n\r]+?)>>")
-
-# 反问标记：LLM 检测到信息不足以准确答时输出 <<CLARIFY>>，把答案当成反问轮处理。
-# 反问轮：不发反馈卡 / 追问按钮 / 升级 @ / 归档卡，让用户专注回答反问；
-# 用户在同一 session 里答完，下一轮就按补充信息直接答。
-# 内外都容 \s*：LLM 偶尔写成 `<<CLARIFY >>` / `<< CLARIFY>>`，严格正则漏匹配
-# → 反问轮被当成普通答完，会挂反馈卡 + 追问卡，用户体验错乱。
-_CLARIFY_RE = re.compile(r"<<\s*CLARIFY\s*>>")
 
 # 反问"我也说不清"出口：用户没法回填版本/环境等关键差异时点这个按钮，触发新一轮
 # handle_question 喂这段 preset prompt——告诉 LLM 用户无法提供更多信息，按最常见
@@ -520,54 +482,10 @@ _CLARIFY_GIVEUP_PROMPT = (
     '并在答案最前面用一行 "⚠️ 假设：xxx；如有不同请告知" 列出你做的关键假设。'
 )
 
-# 答案内嵌图机制：步骤截图 / 标注图 / 强相关故障截图，文字转述不如直接展示。
-# LLM 在答案里独立一行写 <<IMG:redis/images/step1.png>>（路径相对 docs_root），
-# bot 校验路径 → 上传飞书拿 image_key → 把标记换成 <<IMG_KEY:img_xxx>>，渲染层
-# 把这种行渲染为飞书 post 的 img 段。每条最多 5 张，超限剥除 + 末尾告知用户。
-# 路径正则放宽到非控制字符以兼容中文/带空格的文件名；安全校验在 _validate 里做。
-_IMG_RE = re.compile(r"<<IMG:([^<>\n\r]+?)>>")
-_IMG_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
-_IMG_MAX_BYTES = 5 * 1024 * 1024  # 飞书消息图官方上限 10MB，留点余量
-_IMG_MAX_PER_ANSWER = 5
 # 同一 docs 图在多轮答案里会被反复引用，缓存 (绝对路径, mtime) → image_key 避免
 # 重复上传；mtime 变化（图被替换）天然失效。LRU 500 条对常规文档量够用。
 _image_key_cache: LRUCache = LRUCache(maxsize=500)
 
-# 归档问题标题草稿：升级到负责人时，答题那轮 LLM 顺带在答案里输出
-# <<ARCHIVE_Q:归一化后的问题标题>>，bot 剥掉标记、把内容当成归档表单里那个
-# 可编辑的"问题"输入框的默认值——用户原话往往口语化、带个人上下文，LLM 的
-# 归一化标题做归档标题/检索关键词更合适，负责人提交前还能再改。marker 缺失
-# 或内容为空时自动回退到用户原话。路径正则放宽到非控制字符，长度/空白净化
-# 在 _parse_archive_q 里做；标记只在 <<ESCALATE:ou_xxx>> 那一支要求输出
-# （<<ESCALATE:none>> / 无升级都不发归档表单，吐了也没用）。
-_ARCHIVE_Q_RE = re.compile(r"<<ARCHIVE_Q:([^<>\n\r]+?)>>")
-_ARCHIVE_Q_MAX_LEN = 80  # 字符；超长截断而不是丢弃，负责人可在表单里改
-_FOLLOWUP_LIBRARY: dict[str, tuple[str, str]] = {
-    "troubleshoot": (
-        "📋 排查步骤",
-        "把刚才的内容整理成具体的排查步骤，按顺序列出每一步要查什么、用什么命令、看哪个指标判断。",
-    ),
-    "risks": (
-        "⚠️ 风险点",
-        "做这件事有哪些风险点和注意事项？特别是不可逆操作或可能影响其他业务的地方。",
-    ),
-    "rollback": (
-        "↩️ 回滚方案",
-        "如果按上面的方案做完发现有问题，怎么回滚？给出具体步骤和回滚后的检查清单。",
-    ),
-    "checklist": (
-        "✅ Checklist",
-        "把上面的内容总结成一个可勾选的 checklist，每条尽量短、可执行。",
-    ),
-    "commands": (
-        "💻 示例命令",
-        "给出可以直接复制运行的命令示例，每条带一行注释说明用途和参数含义。",
-    ),
-    "related": (
-        "🔗 相关文档",
-        "还有哪些相关的运维文档（INDEX 里登记的或没登记的）我可能需要看？给出文件路径。",
-    ),
-}
 
 # 归档机制：bot 升级到负责人后，同时发一张表单卡（card v2 form）。
 # 负责人在群里答完后填写卡片提交，内容写入 docs/<component>/qa-archive.md，
@@ -1180,72 +1098,6 @@ class SessionManager:
         return items
 
 
-def _mention_post(user_id: str, answer_markdown: str, title: str = POST_TITLE) -> dict:
-    """在答案开头插入 `@用户` 提醒，让群里一眼看出回的是谁。"""
-    post = markdown_to_feishu_post(answer_markdown, title)
-    mention_paragraph = [
-        {"tag": "at", "user_id": user_id},
-        {"tag": "text", "text": " "},
-    ]
-    post["zh_cn"]["content"].insert(0, mention_paragraph)
-    return post
-
-
-def _rewrite_owner_at_mentions(
-    post: dict, registered_owners: set[str]
-) -> tuple[int, int]:
-    """把答案正文里 LLM 写的 `<@ou_xxx>` 字面文字转成飞书 <at> tag，对照白名单过滤。
-
-    遍历每段每段 `tag=text` 的文字找 _AT_OWNER_RE 命中点。对每个命中：
-    - open_id 在 `registered_owners` 里 → 拆 text 段，把 `<@ou_xxx>` 那截换成
-      `{tag: at, user_id: ou_xxx}` 段，飞书会渲染成 @ + 推送
-    - 不在白名单 → 直接删，**不保留字面**（不在册多半是 LLM 幻觉编的 open_id，
-      留着是丑陋字符，又怕 LLM 蒙对了真的 @ 错人）
-
-    返回 `(rendered, dropped)`：分别是渲染成 @ 段的数量、白名单外被丢的数量；
-    调用方用来打日志 + 写 qa_record 监控漂移频率。已 tag=at 的段（如答案首段的
-    asker @ / 末尾 `_append_escalate_at` 加的 owner @）天然跳过。保留原 text 段
-    上的 style（bold/italic 等），拆分后每个文本片段都继承。
-    """
-    rendered = 0
-    dropped = 0
-    content = post.get("zh_cn", {}).get("content", [])
-    for i, paragraph in enumerate(content):
-        new_para: list[dict] = []
-        for seg in paragraph:
-            if seg.get("tag") != "text":
-                new_para.append(seg)
-                continue
-            text = seg.get("text", "")
-            matches = list(_AT_OWNER_RE.finditer(text))
-            if not matches:
-                new_para.append(seg)
-                continue
-            style = seg.get("style")
-            last = 0
-            for m in matches:
-                if m.start() > last:
-                    chunk: dict = {"tag": "text", "text": text[last:m.start()]}
-                    if style:
-                        chunk["style"] = style
-                    new_para.append(chunk)
-                open_id = m.group(1)
-                if open_id in registered_owners:
-                    new_para.append({"tag": "at", "user_id": open_id})
-                    rendered += 1
-                else:
-                    dropped += 1
-                last = m.end()
-            if last < len(text):
-                chunk = {"tag": "text", "text": text[last:]}
-                if style:
-                    chunk["style"] = style
-                new_para.append(chunk)
-        # 段被替换成空（全是被丢的 @ + 没文字）时塞个空 text 段，避免后续渲染崩
-        content[i] = new_para if new_para else [{"tag": "text", "text": ""}]
-    return rendered, dropped
-
-
 async def handle_image_question(
     chat_id: str,
     user_id: str,
@@ -1483,160 +1335,6 @@ async def handle_unsupported_message(
     )
 
 
-def _feedback_card(qid: str, user_id: str) -> dict:
-    """问答结束后附带的反馈卡片：纯 👍 / 👎。
-
-    追问按钮拆到独立的 `_followup_card`，避免点追问把整张反馈卡顶掉、用户失去打分入口。
-
-    用 v2 schema：👎 后要替换成带 form 的原因表单（form 是 v2 才有），原卡和替换卡
-    schema 不一致飞书侧渲染会失败。v2 不再支持 `tag:action` 容器，按钮直接放进
-    column_set 并排，回调走 `behaviors:[{type:"callback", value:...}]`。
-    """
-    btn_up = {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "👍 有帮助"},
-        "type": "primary",
-        "behaviors": [
-            {
-                "type": "callback",
-                "value": {
-                    "action": "feedback",
-                    "qid": qid,
-                    "rating": "up",
-                    "asker_id": user_id,
-                },
-            }
-        ],
-    }
-    btn_down = {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "👎 待改进"},
-        "type": "default",
-        "behaviors": [
-            {
-                "type": "callback",
-                "value": {
-                    "action": "feedback",
-                    "qid": qid,
-                    "rating": "down",
-                    "asker_id": user_id,
-                },
-            }
-        ],
-    }
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True},
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": "这次回答是否有帮助？"},
-                {
-                    "tag": "column_set",
-                    "columns": [
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 1,
-                            "elements": [btn_up],
-                        },
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 1,
-                            "elements": [btn_down],
-                        },
-                    ],
-                },
-            ]
-        },
-    }
-
-
-def _followup_card(
-    qid: str,
-    user_id: str,
-    chat_id: str,
-    parent_msg_id: str | None,
-    followup_keys: list[str],
-) -> dict:
-    """问答结束后附带的追问按钮卡：独立卡片，与反馈卡解耦。
-
-    `followup_keys` 来自 LLM 输出的 `<<FOLLOWUPS:...>>`，已过滤到白名单内、最多 3 个。
-    每个 button.behaviors.callback.value 自带 chat_id 和 parent_msg_id：parent_msg_id
-    是用户原始问题的 message_id，回调时透传给新一轮 `handle_question`，让追问的
-    占位/答案/卡片继续引用回到原问题，线程感不断。
-
-    v2 schema：与同模式的 `_feedback_card` / `_clarify_giveup_card` 对齐。原卡 v1 +
-    替换卡 v2 的跨版本切换在飞书上不是官方推荐做法，统一到 v2 后未来 SDK / 飞书侧
-    schema 校验收紧也不会突然炸。
-    """
-    columns: list[dict] = []
-    for k in followup_keys:
-        label, _ = _FOLLOWUP_LIBRARY[k]
-        btn = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": label},
-            "type": "default",
-            "behaviors": [
-                {
-                    "type": "callback",
-                    "value": {
-                        "action": "followup",
-                        "qid": qid,
-                        "key": k,
-                        "asker_id": user_id,
-                        "chat_id": chat_id,
-                        "parent_msg_id": parent_msg_id,
-                    },
-                }
-            ],
-        }
-        columns.append(
-            {
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "elements": [btn],
-            }
-        )
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True},
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": "**想再深入？**"},
-                {"tag": "column_set", "columns": columns},
-            ]
-        },
-    }
-
-
-def _parse_followups(answer: str) -> tuple[str, list[str]]:
-    """从答案抽 <<FOLLOWUPS:k1|k2|k3>> 标记，返回 (清理后的答案, 合法 key 列表)。
-
-    最多保留 3 个；不在 _FOLLOWUP_LIBRARY 里的 key 静默过滤；去重。
-    没有标记返回 (原文, [])。
-    """
-    m = _FOLLOWUPS_RE.search(answer)
-    if not m:
-        return answer, []
-    cleaned = _FOLLOWUPS_RE.sub("", answer).strip()
-    valid: list[str] = []
-    for k in (k.strip() for k in m.group(1).split("|")):
-        if k and k in _FOLLOWUP_LIBRARY and k not in valid:
-            valid.append(k)
-        if len(valid) >= 3:
-            break
-    return cleaned, valid
-
-
-def _parse_clarify(answer: str) -> tuple[str, bool]:
-    """抽 <<CLARIFY>> 标记，返回 (清理后的答案, 是否为反问轮)。"""
-    if _CLARIFY_RE.search(answer):
-        return _CLARIFY_RE.sub("", answer).strip(), True
-    return answer, False
-
-
 def _validate_image_path(rel: str, docs_root: Path) -> Path | None:
     """校验 LLM 在 <<IMG:path>> 里给的路径：必须 docs_root 子目录下真实图片文件，
     扩展名在白名单内，大小 ≤ _IMG_MAX_BYTES。
@@ -1744,105 +1442,6 @@ async def _resolve_image_markers(
     # 剥除标记后可能留多余空行，归并相邻空行减少视觉噪音
     new_answer = re.sub(r"\n{3,}", "\n\n", new_answer).strip()
     return new_answer, attached, truncated
-
-
-def _followup_ack_card(label: str) -> dict:
-    """点完追问按钮后用来替换原反馈卡的状态卡（v2）。
-
-    UI 层面：原卡（含 👍/👎 + 追问按钮）整张被替换；用户想反馈得在点追问前点。
-    """
-    return {
-        "schema": "2.0",
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"✅ 已发起追问：**{label}** —— 正在生成…",
-                }
-            ]
-        },
-    }
-
-
-def _followup_error_card(message: str) -> dict:
-    return {
-        "schema": "2.0",
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": f"⚠️ {message}"},
-            ]
-        },
-    }
-
-
-def _clarify_giveup_card(
-    qid: str,
-    user_id: str,
-    chat_id: str,
-    parent_msg_id: str | None,
-) -> dict:
-    """反问轮卡片：单按钮 "🤷 说不清楚，按常见情况直接答"。
-
-    用 v2 schema 单按钮（与反馈卡 / 反馈原因表单卡一致），点击触发 clarify_giveup
-    回调，后台跑新一轮 handle_question 喂 _CLARIFY_GIVEUP_PROMPT。chat_id /
-    parent_msg_id 透过 button value 带回，新一轮按原问题引用回复维持线程。
-    asker-only 校验在 handle_clarify_giveup_click 里做。
-    """
-    btn = {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "🤷 说不清楚，按常见情况直接答"},
-        "type": "default",
-        "behaviors": [
-            {
-                "type": "callback",
-                "value": {
-                    "action": "clarify_giveup",
-                    "qid": qid,
-                    "asker_id": user_id,
-                    "chat_id": chat_id,
-                    "parent_msg_id": parent_msg_id,
-                },
-            }
-        ],
-    }
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True},
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": (
-                        "答不上来？点下面这颗按钮让 bot 按最常见情况假设直接答，"
-                        "答案会标 ⚠️ 假设。"
-                    ),
-                },
-                {"tag": "column_set", "columns": [
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 1,
-                        "elements": [btn],
-                    }
-                ]},
-            ]
-        },
-    }
-
-
-def _clarify_giveup_ack_card() -> dict:
-    """点完"说不清"按钮替换原卡：v2 简单 ack。"""
-    return {
-        "schema": "2.0",
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": "✅ 收到，按常见情况重新作答中…",
-                }
-            ]
-        },
-    }
 
 
 async def handle_followup_click(
@@ -1960,176 +1559,6 @@ async def handle_clarify_giveup_click(
     return _clarify_giveup_ack_card()
 
 
-def _feedback_ack_card(rating: str, clicker_name: str | None = None) -> dict:
-    """点击后用来替换原卡片的"已收到反馈"提示。
-
-    v2 schema，对齐 `_feedback_card` / `_feedback_reason_form_card`。
-    """
-    msg = "✅ 感谢反馈！" if rating == "up" else "🙏 已收到，我们会持续改进。"
-    if clicker_name:
-        msg = f"{msg}（by {clicker_name}）"
-    return {
-        "schema": "2.0",
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": msg},
-            ]
-        },
-    }
-
-
-# 👎 后弹出的原因枚举：覆盖最常见的几类可执行抓手（更新文档 / 调 prompt）
-_FEEDBACK_REASONS: dict[str, str] = {
-    "outdated": "文档过时",
-    "incomplete": "步骤不完整",
-    "incorrect": "事实错误",
-    "verbose": "答案啰嗦 / 没重点",
-    "other": "其他",
-}
-
-
-def _feedback_reason_form_card(qid: str, asker_id: str | None) -> dict:
-    """👎 后替换原卡的原因收集表单（card v2 form）。
-
-    multi_select 多选原因 + 多行 input 写备注（可选）+ 提交按钮，跳过按钮放 form 外
-    （form 内放无 form_action_type 的纯 callback button 行为不明确，官方 demo 没这种
-    写法）。submit 不挂 behaviors callback，仅靠 form_action_type:"submit" + button.value
-    触发提交回调；事件里 action.value 带 payload，action.form_value 带字段值（多选返回
-    数组）。qid / asker_id 透过按钮 value 带回，不依赖服务端状态。
-    """
-    options = [
-        {"text": {"tag": "plain_text", "content": label}, "value": value}
-        for value, label in _FEEDBACK_REASONS.items()
-    ]
-    btn_common = {"qid": qid, "asker_id": asker_id}
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True},
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": (
-                        "想了解一下这次回答哪里需要改进，方便我们补文档 / 调 prompt："
-                    ),
-                },
-                {
-                    "tag": "form",
-                    "name": "feedback_reason_form",
-                    "elements": [
-                        {
-                            "tag": "multi_select_static",
-                            "name": "reasons",
-                            "placeholder": {
-                                "tag": "plain_text",
-                                "content": "可多选（如过时 + 不完整）",
-                            },
-                            "required": True,
-                            "options": options,
-                        },
-                        {
-                            "tag": "input",
-                            "name": "comment",
-                            "input_type": "multiline_text",
-                            "rows": 3,
-                            "max_length": 500,
-                            "placeholder": {
-                                "tag": "plain_text",
-                                "content": "可选：举例哪步错了 / 哪条步骤少了 / 哪段过时了",
-                            },
-                        },
-                        {
-                            "tag": "button",
-                            "name": "submit_btn",
-                            "text": {"tag": "plain_text", "content": "提交"},
-                            "type": "primary",
-                            "form_action_type": "submit",
-                            "behaviors": [
-                                {
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "feedback_reason_submit",
-                                        **btn_common,
-                                    },
-                                }
-                            ],
-                        },
-                    ],
-                },
-                {
-                    "tag": "button",
-                    "name": "skip_btn",
-                    "text": {"tag": "plain_text", "content": "跳过"},
-                    "type": "default",
-                    "behaviors": [
-                        {
-                            "type": "callback",
-                            "value": {
-                                "action": "feedback_reason_skip",
-                                **btn_common,
-                            },
-                        }
-                    ],
-                },
-            ]
-        },
-    }
-
-
-def _excerpt(text: str, limit: int = 200) -> str:
-    text = text.strip().replace("\n", " ")
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def _parse_escalate(answer: str) -> tuple[str, str | None, str | None]:
-    """从答案里抽 <<ESCALATE:owner[:component_dir]>> 标记。
-
-    返回 (清理后的答案文本, 要 @ 的 open_id 或 None, LLM 给的组件目录 hint 或 None)。
-    none 视作"不 @ 任何人"，与"未匹配到标记"等价。component_dir 是 LLM 基于答案
-    路由判断给出的归档目录提示，调用方需先 `_resolve_component_dir` 校验落地。
-    """
-    m = _ESCALATE_RE.search(answer)
-    if not m:
-        return answer, None, None
-    cleaned = _ESCALATE_RE.sub("", answer).strip()
-    who = m.group("who")
-    dir_hint = m.group("dir")
-    return cleaned, (who if who != "none" else None), dir_hint
-
-
-def _parse_escalate_ticket(answer: str) -> tuple[str, str | None]:
-    """抽 <<ESCALATE_TICKET:owner>> 标记 → (清理后的答案, owner_id or None)。
-
-    工单类升级：@ 负责人但不发归档表单卡（"加权限"等操作请求不是知识 Q&A）。
-    调用方负责把它和 _parse_escalate 的结果合并；两者同时出现时 ticket 优先。
-    """
-    m = _ESCALATE_TICKET_RE.search(answer)
-    if not m:
-        return answer, None
-    cleaned = _ESCALATE_TICKET_RE.sub("", answer).strip()
-    who = m.group("who")
-    return cleaned, (who if who != "none" else None)
-
-
-def _parse_archive_q(answer: str) -> tuple[str, str | None]:
-    """抽 <<ARCHIVE_Q:...>> 标记，返回 (清理后的答案文本, 净化后的问题标题草稿 or None)。
-
-    草稿净化：折叠内部空白/换行、去首尾空白；清理后为空则当没给（返回 None）；
-    超 _ARCHIVE_Q_MAX_LEN 截断加省略号（不丢弃——它会成为归档表单问题框的
-    默认值，负责人可再改）。多次出现取第一处，全部从答案里剥掉。
-    """
-    m = _ARCHIVE_Q_RE.search(answer)
-    if not m:
-        return answer, None
-    cleaned = _ARCHIVE_Q_RE.sub("", answer).strip()
-    draft = " ".join(m.group(1).split()).strip()
-    if not draft:
-        return cleaned, None
-    if len(draft) > _ARCHIVE_Q_MAX_LEN:
-        draft = draft[:_ARCHIVE_Q_MAX_LEN].rstrip() + "…"
-    return cleaned, draft
-
-
 def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
     """把 LLM 给的目录 hint 校验成"docs_root 下真实存在的相对目录"，否则返回 None。
 
@@ -2154,55 +1583,6 @@ def _resolve_component_dir(dir_hint: str | None, docs_root: Path) -> str | None:
     except ValueError:
         return None
     return cleaned
-
-
-def _append_escalate_at(
-    post: dict,
-    owner_id: str,
-    archive_path: str,
-    *,
-    is_ticket: bool = False,
-    is_feishu: bool = False,
-) -> None:
-    """在 post 末尾追加 "📣 已通知负责人 @xxx" 行（+ 普通升级时再加归档去向）。
-
-    is_ticket=False（默认，"文档没答案"升级）：追加两行——@ + 归档去向告知。
-
-    本地组件（is_feishu=False）：archive_path 是相对 docs_root 的路径（如
-    "redis/qa-archive.md"），与紧随其后发出的归档表单卡一致。告诉 asker 答案最终
-    会落到哪、下次类似问题 bot 能从哪里直接答，避免"通知完就没下文"的预期空白。
-
-    飞书来源组件（is_feishu=True）：这类组件的知识维护在飞书文档里，bot 不会回读
-    本地 qa-archive.md（见 [[project_feishu_doc_qa_integration]] 的归档回读缺口），
-    所以**不能**承诺"下次我能直接从这里答"——那是假的。改成告诉 asker 答案会同步
-    给他，并点明知识维护在飞书文档（第一信号源是负责人维护的飞书文档）。本地仍会
-    静默写一份 archive 作留档 + 为将来万一要切"兼读本地"预热数据，但不对外宣称。
-
-    is_ticket=True（工单类升级，"加权限/开账号"操作请求）：只 @ 不提归档；动词
-    用"协助处理"而不是"协助回答"——工单 ≠ 知识答疑。archive_path 在 ticket 模式
-    下被忽略，调用方可以传空串。
-    """
-    post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
-    verb = "协助处理" if is_ticket else "协助回答"
-    post["zh_cn"]["content"].append(
-        [
-            {"tag": "text", "text": "📣 已通知负责人 "},
-            {"tag": "at", "user_id": owner_id},
-            {"tag": "text", "text": f" {verb} 🙏"},
-        ]
-    )
-    if not is_ticket:
-        if is_feishu:
-            line = (
-                "📁 答案整理后会同步给你；这个组件的运维知识维护在飞书文档里，"
-                "已请负责人补充进去。"
-            )
-        else:
-            line = (
-                f"📁 负责人填写后会归档到 {archive_path}，"
-                "下次类似问题我能直接从这里答。"
-            )
-        post["zh_cn"]["content"].append([{"tag": "text", "text": line}])
 
 
 def _feishu_reference_links(components: list[str], docs_root: Path) -> str | None:
@@ -2333,161 +1713,6 @@ def _index_component_names(docs_root: Path) -> list[str]:
         logger.warning("read INDEX.md for component names failed: %s", e)
         return []
     return names
-
-
-def _archive_form_card(
-    qid: str,
-    question_default: str,
-    owner_id: str,
-    archive_path_repr: str,
-    *,
-    is_feishu: bool = False,
-) -> dict:
-    """归档表单卡（card v2 form）：可编辑问题标题 + 多行答案输入框 + 提交按钮。
-
-    question_default：预填进"问题"输入框的标题——优先是答题那轮 LLM 给的归一化
-    标题，否则是用户原话。负责人可在框里改成更通用的说法再提交；最终写盘用框里的值。
-    archive_path_repr：展示给 owner 的相对路径（如 "redis/qa-archive.md"），
-    让他知道答案会落到哪个文件再决定写多详细。
-
-    is_feishu=True（飞书来源组件）：bot 不回读本地 archive，所以引导文案不提"追加进
-    xxx.md / 检索关键词"那套（会误导负责人以为填表单 bot 就学会了），改成"答案会
-    同步给提问者 + 请维护飞书文档"。表单照常提交、本地照常静默留档（见
-    [[project_feishu_doc_qa_integration]]）。
-    """
-    if is_feishu:
-        intro = (
-            f"<at id={owner_id}></at> 下面的「问题」是系统整理的，可改成更通用的"
-            "说法；把整理过的答案填进答案框，提交后会同步给提问者。"
-            "这个组件的运维知识维护在飞书文档，请把答案一并补充进去。"
-        )
-    else:
-        intro = (
-            f"<at id={owner_id}></at> 下面的「问题」是系统自动整理的，"
-            "可改成更通用的说法（它会作为归档标题和以后的检索关键词）；"
-            "把整理过的答案填进答案框，"
-            f"提交后会追加进 `{archive_path_repr}`。"
-        )
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "📝 问答归档"},
-            "template": "blue",
-        },
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": intro,
-                },
-                {
-                    "tag": "form",
-                    "name": "archive_form",
-                    "elements": [
-                        {
-                            "tag": "input",
-                            "name": "question",
-                            "default_value": _excerpt(question_default, 100),
-                            "max_length": 120,
-                            "placeholder": {
-                                "tag": "plain_text",
-                                "content": "归档用的问题标题（可修订）…",
-                            },
-                            "required": True,
-                        },
-                        {
-                            "tag": "input",
-                            "name": "answer",
-                            "input_type": "multiline_text",
-                            "rows": 6,
-                            "max_length": 1000,
-                            "placeholder": {
-                                "tag": "plain_text",
-                                "content": "粘贴整理后的答案文本（最多 1000 字）…",
-                            },
-                            "required": True,
-                        },
-                        {
-                            "tag": "button",
-                            "name": "submit_btn",
-                            "text": {"tag": "plain_text", "content": "提交并归档"},
-                            "type": "primary",
-                            "form_action_type": "submit",
-                            "behaviors": [
-                                {
-                                    "type": "callback",
-                                    "value": {
-                                        "action": "archive_submit",
-                                        "qid": qid,
-                                    },
-                                }
-                            ],
-                        },
-                    ],
-                },
-            ]
-        },
-    }
-
-
-def _archive_ack_card(icon: str, message: str) -> dict:
-    """提交后用来替换原表单卡的提示卡（card v2，纯文本）。"""
-    return {
-        "schema": "2.0",
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": f"{icon} {message}"},
-            ]
-        },
-    }
-
-
-def _archive_answer_notify_post(
-    asker_id: str,
-    owner_id: str,
-    question: str,
-    answer_markdown: str,
-    archive_rel: str,
-    *,
-    is_feishu: bool = False,
-) -> dict:
-    """构造"负责人答完 → 通知 asker"的 feishu post。
-
-    asker_id 放在第一段以 @ 推送（asker 才会收到飞书侧消息提醒，不然写到归档
-    文件里 asker 永远不知道有答案）；owner_id 内嵌作为"谁答的"标记。
-    answer_markdown 走 markdown_to_feishu_post，保留答案原本的列表/代码块/换行
-    结构。末尾补一行收尾——闭环交付。
-
-    is_feishu=False：本地组件，告知归档路径 + 承诺"下次直接答"（agent 后续轮
-    Read 本地 archive 能命中）。
-
-    is_feishu=True：飞书来源组件，bot 不回读本地 archive（见
-    [[project_feishu_doc_qa_integration]]），**不能**承诺"下次直接答"——那是
-    假的。改成告诉 asker 答案已同步 + 请负责人补充进飞书文档。与
-    `_append_escalate_at` / `_archive_form_card` 的 is_feishu 分支保持一致姿态。
-    """
-    post = markdown_to_feishu_post(answer_markdown, POST_TITLE)
-    # 截短 question 防止特别长的标题撑爆头部一行；归档时已经做了 200 字上限但
-    # 这里再保险一道（头部行越短越好读，详情看下面的答案 body）。
-    q_short = question if len(question) <= 60 else question[:60].rstrip() + "…"
-    intro_paragraph = [
-        {"tag": "at", "user_id": asker_id},
-        {"tag": "text", "text": f" 你之前问的「{q_short}」，"},
-        {"tag": "at", "user_id": owner_id},
-        {"tag": "text", "text": " 已答复 👇"},
-    ]
-    post["zh_cn"]["content"].insert(0, intro_paragraph)
-    post["zh_cn"]["content"].append([{"tag": "text", "text": ""}])  # 空行隔开
-    if is_feishu:
-        tail = (
-            "📁 答案已同步给你；这个组件的运维知识维护在飞书文档，"
-            "已请负责人补充进去。"
-        )
-    else:
-        tail = f"📁 已归档到 {archive_rel}，下次类似问题我能直接从这里答。"
-    post["zh_cn"]["content"].append([{"tag": "text", "text": tail}])
-    return post
 
 
 async def _write_qa_archive(
@@ -2744,97 +1969,6 @@ def _db_admins(database_config: "DatabaseConfig | None") -> set[str]:
     if not database_config:
         return set()
     return set(database_config.admin_open_ids)
-
-
-def _fmt_db_instance(req: "DbChangeRequest") -> str:
-    """卡片/通知里展示的实例标识：host:port（OceanBase 再带 租户#集群 + 模式）。"""
-    base = f"{req.host}:{req.port}"
-    if req.kind in ("ob_mysql", "ob_oracle") and req.tenant:
-        return f"{base} · 租户 {req.tenant}#{req.cluster}（{req.db_type}/{req.mode}）"
-    return f"{base}（{req.db_type}）"
-
-
-def _db_change_card(
-    change_id: str,
-    req: "DbChangeRequest",
-    asker_id: str | None,
-    admin_ids: Iterable[str] | None = None,
-) -> dict:
-    """参数变更确认卡（card v2）：实例 / 参数现值→新值 / 待执行 SQL / 申请人 +
-    「确认执行」「驳回」两个按钮。两个按钮都仅 `admin_open_ids` 名单里的人点有效
-    （校验在 handler，非授权点击保持卡片可见）。所见即所执行：卡上的 SQL 就是确认
-    时原样要跑的那条。
-
-    `admin_ids` 非空时在卡顶加一行 @ 管理员（飞书 `<at id=..></at>` 渲染 @姓名、
-    不暴露 open_id，且会给被 @ 的管理员推通知），让审批方知道有单子待处理。
-    """
-    current = req.current_value or "（未取到，请确认前自行核对）"
-    admin_at = " ".join(f"<at id={a}></at>" for a in (admin_ids or []))
-    notify_md = f"📣 请管理员审批：{admin_at}\n" if admin_at else ""
-    asker_at = f"\n- 申请人：<at id={asker_id}></at>" if asker_id else ""
-    detail_md = (
-        f"{notify_md}"
-        "**🛠 数据库参数变更申请**（需管理员确认后执行）\n"
-        f"- 实例：{_fmt_db_instance(req)}\n"
-        f"- 参数：`{req.param}`\n"
-        f"- 变更：{current}  →  **{req.new_value}**"
-        f"{asker_at}"
-    )
-    sql_md = f"待执行 SQL（管理员确认后由 bot 执行）：\n```sql\n{req.sql}\n```"
-    confirm_btn = {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "✅ 确认执行"},
-        "type": "primary",
-        "behaviors": [
-            {
-                "type": "callback",
-                "value": {"action": "db_change_confirm", "change_id": change_id},
-            }
-        ],
-    }
-    reject_btn = {
-        "tag": "button",
-        "text": {"tag": "plain_text", "content": "❌ 驳回"},
-        "type": "danger",
-        "behaviors": [
-            {
-                "type": "callback",
-                "value": {"action": "db_change_reject", "change_id": change_id},
-            }
-        ],
-    }
-    return {
-        "schema": "2.0",
-        "config": {"update_multi": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": "数据库参数变更确认"},
-            "template": "orange",
-        },
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": detail_md},
-                {"tag": "markdown", "content": sql_md},
-                {"tag": "markdown", "content": "*仅管理员可执行；其他人点击无效。*"},
-                {
-                    "tag": "column_set",
-                    "columns": [
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 1,
-                            "elements": [confirm_btn],
-                        },
-                        {
-                            "tag": "column",
-                            "width": "weighted",
-                            "weight": 1,
-                            "elements": [reject_btn],
-                        },
-                    ],
-                },
-            ]
-        },
-    }
 
 
 def make_db_change_submitter(
