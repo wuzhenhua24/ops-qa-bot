@@ -102,6 +102,9 @@ RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 HELP_TRIGGERS = {"/help", "help", "帮助"}
 # 跟进任务管理指令：列出自己挂起的定时跟进（带取消按钮）。匹配同样先 lower
 TASKS_TRIGGERS = {"/tasks", "跟进任务"}
+# 取消指令：停掉自己正在处理/排队中的答题（发错问题不用干等）。精确匹配整条
+# 消息，"取消"出现在长句里不会误触发
+CANCEL_TRIGGERS = {"/cancel", "取消"}
 
 # 图片输入：Anthropic vision 支持 png/jpeg/gif/webp；超过 5MB 大概率被 API 拒
 # （像素 + 字节双重限制），让 bot 友好提示用户压缩，而不是甩 LLM 报错原文
@@ -676,6 +679,10 @@ class SessionLimitError(RuntimeError):
     """
 
 
+class _QuestionCancelled(Exception):
+    """内部信号：排队期间被 /cancel，放弃答题直接走取消收尾。"""
+
+
 class _SessionEntry:
     __slots__ = ("bot", "lock", "last_used")
 
@@ -697,6 +704,19 @@ _FOLLOWUP_QUESTION_PREFIX = (
     "不要在开头加「@用户」「@发起人」这类字面（写了也不会变成真的 @、只会显示成没用的文字），"
     "也不要自己加“定时跟进结果”之类的标题。\n\n任务："
 )
+
+
+@dataclass
+class _InflightScope:
+    """一条在途问题的取消句柄，挂在 SessionManager 的 inflight 登记表里。
+
+    `cancelled` 被 /cancel 置 True：排队中的问题拿到 session lock 后直接放弃
+    答题；运行中的问题除标记外还会被 `bot.interrupt()` 打断流（bot 引用在进入
+    流式阶段时填上）。handle_question 在 finally 里注销自己。
+    """
+
+    cancelled: bool = False
+    bot: "OpsQABot | None" = None
 
 
 @dataclass
@@ -1025,6 +1045,40 @@ class SessionManager:
             self._followup_scheduler = FollowupScheduler(
                 feishu, self, scheduled_followup_config
             )
+        # 在途问题登记表：(chat, user) → {scope_id: _InflightScope}。/cancel 指令
+        # 据此找到该用户正在处理/排队中的答题并打断。纯内存、随问题结束即清。
+        self._inflight: dict[SessionKey, dict[str, _InflightScope]] = {}
+
+    def register_inflight(self, key: SessionKey, scope: _InflightScope) -> str:
+        """登记一条在途问题，返回 scope_id（注销时用）。同 loop 同步调用，无锁。"""
+        scope_id = uuid.uuid4().hex[:8]
+        self._inflight.setdefault(key, {})[scope_id] = scope
+        return scope_id
+
+    def unregister_inflight(self, key: SessionKey, scope_id: str) -> None:
+        scopes = self._inflight.get(key)
+        if scopes is None:
+            return
+        scopes.pop(scope_id, None)
+        if not scopes:
+            self._inflight.pop(key, None)
+
+    def cancel_inflight(self, key: SessionKey) -> tuple[int, list["OpsQABot"]]:
+        """标记该 (chat, user) 全部在途问题为已取消。
+
+        返回 (标记条数, 需要 interrupt 的 bot 列表)。interrupt 是网络 IO，
+        交给调用方在本方法外做（这里只翻标记，保持同步无锁）。排队中的
+        scope 还没绑 bot，翻标记就够——它拿到 lock 后会自己放弃。
+        """
+        scopes = self._inflight.get(key)
+        if not scopes:
+            return 0, []
+        bots: list[OpsQABot] = []
+        for scope in scopes.values():
+            scope.cancelled = True
+            if scope.bot is not None and scope.bot not in bots:
+                bots.append(scope.bot)
+        return len(scopes), bots
 
     async def start(self) -> None:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -2381,6 +2435,7 @@ def _help_text(session_mgr: SessionManager) -> str:
     lines.append("")
     lines.append("**指令**")
     lines.append("- `/reset`（或 `/new`、新对话、重置）：清空你的对话历史，开新会话")
+    lines.append("- `/cancel`（或 取消）：停掉你正在处理/排队中的提问（发错了不用干等）")
     lines.append("- `/help`（或 帮助）：显示本帮助")
     idle_minutes = max(1, int(session_mgr.idle_ttl // 60))
     lines.append("")
@@ -2470,6 +2525,34 @@ async def handle_question(
         )
         return
 
+    # 取消指令：停掉自己全部在途答题（发错问题不用干等）。运行中的通过
+    # bot.interrupt() 打断流，排队中的翻标记（拿到锁后自行放弃）。各条问题的
+    # 占位由它们自己的 handle_question 收尾成"已取消"，这里只回执行结果。
+    if not images and question.lower() in CANCEL_TRIGGERS:
+        n, bots = session_mgr.cancel_inflight(key)
+        if n == 0:
+            reply = "当前没有正在处理中的问题，无需取消。"
+        else:
+            for b in bots:
+                try:
+                    await b.interrupt()
+                except Exception:
+                    # interrupt 失败也不影响结果：标记已翻，流结束后照样按
+                    # "已取消"收尾，只是这一轮会跑完白烧一点 token
+                    logger.warning(
+                        "interrupt failed during cancel: chat=%s user=%s",
+                        *key,
+                        exc_info=True,
+                    )
+            reply = (
+                f"🛑 已请求取消你 {n} 条处理中/排队中的问题，"
+                "对应消息会标记为已取消。"
+            )
+        await feishu.send_post(
+            chat_id, _mention_post(user_id, reply), parent_id=parent_msg_id
+        )
+        return
+
     # 上一轮 session 已被空闲回收时一次性消费这个标记，等会儿挂在答案最前面
     # 让用户知道"那一句『接着上面的』bot 不会按追问处理"。必须在 get(key) 前
     # 调用，get 会刷新 last_seen 让判定失效。
@@ -2498,9 +2581,17 @@ async def handle_question(
     # 本轮调过 query_feishu_doc 的飞书组件（按出现顺序，去重在 _feishu_reference_links
     # 里做）。在 try 外声明，异常路径也能安全引用（虽然那时一般是空）。
     queried_feishu_components: list[str] = []
+    # 在途登记：/cancel 据此找到这条问题。排队等锁期间也可被取消（翻标记），
+    # 运行期间额外通过 scope.bot 被 interrupt。streaming 结束即注销（finally）。
+    scope = _InflightScope()
+    scope_id = session_mgr.register_inflight(key, scope)
     try:
         entry = await session_mgr.get(key)
         async with entry.lock:
+            # 排队期间被 /cancel：直接放弃答题，不浪费一轮 agent。后面的
+            # scope.cancelled 统一收尾占位为"已取消"。
+            if scope.cancelled:
+                raise _QuestionCancelled()
             # 拿到锁意味着前面的问题已答完，把占位从"排队中"刷成"翻文档中"
             if queued and placeholder_mid is not None:
                 refresh = (
@@ -2520,6 +2611,7 @@ async def handle_question(
             done_meta: dict[str, Any] = {}
             last_update_at = time.time()
             update_count = 0
+            scope.bot = entry.bot  # 运行中：/cancel 可以 interrupt 这个 bot
             async for event in entry.bot.ask(question, images=images):
                 etype = event.get("type")
                 if etype == "tool":
@@ -2563,7 +2655,10 @@ async def handle_question(
                     }
             result = AnswerResult(text="".join(text_chunks).strip(), **done_meta)
             entry.last_used = time.time()
+            scope.bot = None  # 流已收尾，晚到的 /cancel 不再 interrupt 这个 bot
         answer = result.text
+    except _QuestionCancelled:
+        pass  # 统一走下面 scope.cancelled 的取消收尾
     except SessionLimitError:
         # 会话数保险丝命中且无可驱逐的空闲会话：拒新提问，给明确的"稍后再试"
         # 而不是泛化错误文案。不建 session、不烧 token。
@@ -2579,6 +2674,38 @@ async def handle_question(
     except Exception as e:
         logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
         answer = _friendly_error(e, context="问答", suggest_reset=True)
+    finally:
+        session_mgr.unregister_inflight(key, scope_id)
+
+    # /cancel 命中：丢弃结果（可能是被打断的半截答案），把占位收尾成"已取消"，
+    # 不解析 marker、不发任何卡。interrupt 打断流时 SDK 偶尔以异常收场，所以
+    # 这个判断必须放在 except 之后——取消语义优先于错误文案。
+    if scope.cancelled:
+        cancel_post = _mention_post(
+            user_id, "❌ 已取消这条问题。要重新提问直接发新消息即可。"
+        )
+        if placeholder_mid is not None:
+            if not await feishu.update_post(placeholder_mid, cancel_post):
+                await feishu.send_post(
+                    chat_id, cancel_post, parent_id=parent_msg_id
+                )
+        else:
+            await feishu.send_post(chat_id, cancel_post, parent_id=parent_msg_id)
+        feedback_logger.info(
+            json.dumps(
+                {
+                    "event": "cancelled",
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "question": _excerpt(question, 200),
+                },
+                ensure_ascii=False,
+            )
+        )
+        logger.info(
+            "question cancelled by user: chat=%s user=%s", chat_id, user_id
+        )
+        return
     answer = answer or "（无回答内容）"
 
     # max_turns 保险丝命中：答案是被截断的（agent 步数到顶被迫收尾），明确告诉

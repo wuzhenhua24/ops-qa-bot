@@ -430,6 +430,18 @@ class OpsQABot:
         await self._client.__aexit__(exc_type, exc, tb)
         self._client = None
 
+    async def interrupt(self) -> None:
+        """打断当前正在进行的答题轮（透传 SDK 的 interrupt）。
+
+        用于"用户发错问题想取消"：上层在另一个协程里调用，正在 `ask()` 里
+        消费的流会随之收尾（SDK 停掉本轮 agent loop）。没有进行中的轮时
+        调用也安全（SDK 侧幂等/快速返回）。session 历史保留，取消后下一个
+        问题照常追问；嫌上下文脏可以 /reset。
+        """
+        if self._client is None:
+            raise RuntimeError("OpsQABot 必须在 async with 块内使用")
+        await self._client.interrupt()
+
     async def ask(
         self,
         question: str,
