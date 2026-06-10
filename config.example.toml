@@ -25,6 +25,16 @@ port = 8000                           # env: PORT
 
 [session]
 idle_ttl = 1800                       # env: SESSION_IDLE_TTL（秒，默认 30 分钟）
+# 活跃会话数上限（资源保险丝）。每个会话是一个常驻 claude 子进程，超限时驱逐
+# 最闲的空闲会话（正在答题的不动），全忙则让新提问"稍后再试"。日常体量到不了
+# 默认值，被刷屏 / 大群集中提问时才会兜底。
+max_sessions = 50                     # env: SESSION_MAX_SESSIONS
+
+[agent]
+# 单轮答题的 agent 步数上限（资源保险丝，0 = 不限）。典型问答只用个位数步，
+# 默认 30 远高于正常水位；命中时答案末尾会提示"结论可能不完整"，并在
+# feedback.log 的 qa 事件里带 max_turns_hit 字段（常命中→上限配低了或该查 prompt）。
+max_turns = 30                        # env: AGENT_MAX_TURNS
 
 [admin]
 # /admin/* 接口保护 token。不设时接口开放（适合纯内网部署）。

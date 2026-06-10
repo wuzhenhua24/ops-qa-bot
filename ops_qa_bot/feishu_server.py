@@ -97,6 +97,8 @@ def create_app(config: AppConfig) -> FastAPI:
     session_mgr = SessionManager(
         docs_root=docs_root,
         idle_ttl=idle_ttl,
+        max_sessions=config.session_max_sessions,
+        max_turns=config.agent_max_turns,
         doc_qa_config=config.doc_qa,
         gateway_trace_config=config.gateway_trace,
         database_config=config.database,

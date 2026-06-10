@@ -747,6 +747,13 @@ class FeishuClient:
         return data, _normalize_image_media_type("", data)
 
 
+class SessionLimitError(RuntimeError):
+    """活跃会话数已达上限且没有可驱逐的空闲会话（全在答题中）。
+
+    handle_question 捕获后给用户回"稍后再试"的友好提示，而不是泛化错误文案。
+    """
+
+
 class _SessionEntry:
     __slots__ = ("bot", "lock", "last_used")
 
@@ -940,9 +947,17 @@ class SessionManager:
         database_config: "DatabaseConfig | None" = None,
         scheduled_followup_config: "ScheduledFollowupConfig | None" = None,
         feishu: "FeishuClient | None" = None,
+        max_sessions: int = 50,
+        max_turns: int | None = None,
     ):
         self._docs_root = docs_root
         self._idle_ttl = idle_ttl
+        # 会话数保险丝：每个会话是一个常驻 claude 子进程，没有上限的话被刷一波
+        # @（或一个大群集中提问）内存和 token 都没闸。超限时驱逐最闲的空闲会话
+        # （LRU；正在答题的不动），全忙则拒新提问。日常体量远到不了默认值。
+        self._max_sessions = max(1, max_sessions)
+        # 单轮答题步数保险丝，透传给每个 OpsQABot（<=0 视作不限，bot 侧归一）
+        self._max_turns = max_turns
         self._doc_qa_config = doc_qa_config
         self._gateway_trace_config = gateway_trace_config
         self._database_config = database_config
@@ -992,6 +1007,33 @@ class SessionManager:
         async with self._manager_lock:
             entry = self._sessions.get(key)
             if entry is None:
+                # 会话数到顶：先驱逐最闲的空闲会话腾位（正在答题的不能动，
+                # 关它会把人家跑到一半的问题掐死）；全在忙就拒——抛
+                # SessionLimitError 让 handle_question 回"稍后再试"。
+                if len(self._sessions) >= self._max_sessions:
+                    victim_key: SessionKey | None = None
+                    victim_entry: _SessionEntry | None = None
+                    for k, e in self._sessions.items():
+                        if e.lock.locked():
+                            continue
+                        if (
+                            victim_entry is None
+                            or e.last_used < victim_entry.last_used
+                        ):
+                            victim_key, victim_entry = k, e
+                    if victim_entry is None or victim_key is None:
+                        raise SessionLimitError(
+                            f"会话数已达上限 {self._max_sessions} 且全部在答题中"
+                        )
+                    # 不清 last_seen：被驱逐者隔很久回来时"上下文已过期"提示
+                    # 仍按原逻辑触发（短时间内回来的撞上下文丢失属罕见 case）
+                    self._sessions.pop(victim_key, None)
+                    logger.warning(
+                        "session cap (%d) reached, evicting idlest: chat=%s user=%s",
+                        self._max_sessions,
+                        *victim_key,
+                    )
+                    await self._close_entry(victim_key, victim_entry)
                 submitter = None
                 if (
                     self._feishu is not None
@@ -1021,6 +1063,7 @@ class SessionManager:
                     db_change_submitter=submitter,
                     scheduled_followup_config=self._scheduled_followup_config,
                     followup_submitter=followup_submitter,
+                    max_turns=self._max_turns,
                 )
                 await bot.__aenter__()
                 entry = _SessionEntry(bot)
@@ -3225,14 +3268,44 @@ async def handle_question(
                         "num_turns": event.get("num_turns"),
                         "duration_ms": event.get("duration_ms"),
                         "duration_api_ms": event.get("duration_api_ms"),
+                        "subtype": event.get("subtype"),
                     }
             result = AnswerResult(text="".join(text_chunks).strip(), **done_meta)
             entry.last_used = time.time()
         answer = result.text
+    except SessionLimitError:
+        # 会话数保险丝命中且无可驱逐的空闲会话：拒新提问，给明确的"稍后再试"
+        # 而不是泛化错误文案。不建 session、不烧 token。
+        logger.warning(
+            "session cap hit, rejecting question: chat=%s user=%s",
+            chat_id,
+            user_id,
+        )
+        answer = (
+            "🚦 现在同时提问的人比较多（活跃会话已达上限），"
+            "这条先没接进来。请过一两分钟再发一次。"
+        )
     except Exception as e:
         logger.exception("answer failed: chat=%s user=%s", chat_id, user_id)
         answer = _friendly_error(e, context="问答", suggest_reset=True)
     answer = answer or "（无回答内容）"
+
+    # max_turns 保险丝命中：答案是被截断的（agent 步数到顶被迫收尾），明确告诉
+    # 用户结论可能不完整，别让他拿半截排查结果当结论用。频率看 qa 日志的
+    # max_turns_hit 字段——常命中说明上限配低了或某类问题让 agent 兜圈。
+    max_turns_hit = result is not None and result.subtype == "error_max_turns"
+    if max_turns_hit:
+        logger.warning(
+            "max_turns fuse hit: chat=%s user=%s num_turns=%s",
+            chat_id,
+            user_id,
+            result.num_turns if result else None,
+        )
+        answer = (
+            answer.rstrip()
+            + "\n\n⚠️ 本次排查步骤数达到单轮上限，以上结论可能不完整。"
+            "建议把问题拆小、或带上更具体的信息（实例/报错原文）再问一次。"
+        ).strip()
 
     # raw_answer 留作 drift 检测：parsing 会把 marker 剥掉，事后只看 answer 没法
     # 区分"LLM 输出了 <<ESCALATE:none>>（marker 在但 owner=none）"和"LLM 啥 marker
@@ -3469,6 +3542,9 @@ async def handle_question(
         # grep 频率：jq 'select(.escalate_drift_fallback) | {qid, question}' feedback.log
         # 频率高就该回头调 prompt 强化"找不到必须输出 marker"那条
         qa_record["escalate_drift_fallback"] = True
+    if max_turns_hit:
+        # grep 频率：常命中说明 max_turns 配低了或某类问题让 agent 兜圈
+        qa_record["max_turns_hit"] = True
     if at_rendered_in_body or at_dropped_in_body:
         # 正文 @ owner 渲染统计——rendered 是用户实际能 ping 到的人数，
         # dropped 是 LLM 编 open_id 被剥的次数，监控 LLM 输出靠谱程度

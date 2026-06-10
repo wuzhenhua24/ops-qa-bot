@@ -185,6 +185,12 @@ class AppConfig:
     feishu: FeishuConfig
     server: ServerConfig = field(default_factory=ServerConfig)
     session_idle_ttl: float = 1800.0
+    # 资源保险丝（防失控，不是日常限流）：实际使用里没真撞到过，默认值取得宽——
+    # 正常体量永远碰不到，被恶意刷屏 / agent 跑飞时才兜底。
+    # max_sessions：活跃会话（= claude 子进程）数上限，超限驱逐最闲的空闲会话。
+    # agent_max_turns：单轮答题的 agent 步数上限（0 = 不限），防文档迷路无限烧 token。
+    session_max_sessions: int = 50
+    agent_max_turns: int = 30
     admin_token: str | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
@@ -236,6 +242,12 @@ def load_config(path: Path) -> AppConfig:
 
     session_raw = data.get("session") or {}
     idle_ttl = float(_pick("SESSION_IDLE_TTL", session_raw.get("idle_ttl"), 1800))
+    max_sessions = int(
+        _pick("SESSION_MAX_SESSIONS", session_raw.get("max_sessions"), 50)
+    )
+
+    agent_raw = data.get("agent") or {}
+    agent_max_turns = int(_pick("AGENT_MAX_TURNS", agent_raw.get("max_turns"), 30))
 
     admin_raw = data.get("admin") or {}
     admin_token = _pick("ADMIN_TOKEN", admin_raw.get("token")) or None
@@ -379,6 +391,8 @@ def load_config(path: Path) -> AppConfig:
         ),
         server=ServerConfig(host=host, port=port),
         session_idle_ttl=idle_ttl,
+        session_max_sessions=max_sessions,
+        agent_max_turns=agent_max_turns,
         admin_token=admin_token,
         logging=LoggingConfig(main_log=main_log, feedback_log=feedback_log),
         health=HealthConfig(

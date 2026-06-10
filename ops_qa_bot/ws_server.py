@@ -109,6 +109,8 @@ class WsRunner:
         self._session_mgr = SessionManager(
             docs_root=docs_root,
             idle_ttl=config.session_idle_ttl,
+            max_sessions=config.session_max_sessions,
+            max_turns=config.agent_max_turns,
             doc_qa_config=config.doc_qa,
             gateway_trace_config=config.gateway_trace,
             database_config=config.database,

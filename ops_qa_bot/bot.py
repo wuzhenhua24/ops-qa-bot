@@ -165,6 +165,9 @@ class AnswerResult:
     num_turns: int | None = None
     duration_ms: int | None = None
     duration_api_ms: int | None = None
+    # SDK ResultMessage.subtype："success" 正常；"error_max_turns" 表示撞了
+    # max_turns 保险丝（答案可能不完整，上层应提示用户）
+    subtype: str | None = None
 
 
 def format_tool_call(name: str, tool_input: dict) -> str:
@@ -226,6 +229,7 @@ class OpsQABot:
         db_change_submitter: DbChangeSubmitter | None = None,
         scheduled_followup_config: ScheduledFollowupConfig | None = None,
         followup_submitter: FollowupSubmitter | None = None,
+        max_turns: int | None = None,
     ):
         self.docs_root = Path(docs_root).resolve()
         if not self.docs_root.is_dir():
@@ -319,7 +323,15 @@ class OpsQABot:
             )
             allowed_tools.append(FOLLOWUP_FULL_TOOL_NAME)
 
+        # 单轮答题步数保险丝：防 agent 在文档里迷路 / 诊断反复失败时无限烧 token。
+        # 典型问答 num_turns 在个位数，默认 30 是远高于正常水位的兜底值；命中时
+        # SDK 的 ResultMessage.subtype 为 "error_max_turns"，上层据此提示用户
+        # "结论可能不完整"。<= 0 视作不限（与 SDK 的 None 语义一致）。
+        if max_turns is not None and max_turns <= 0:
+            max_turns = None
+
         self._options = ClaudeAgentOptions(
+            max_turns=max_turns,
             system_prompt=build_system_prompt(
                 self.docs_root,
                 doc_qa_enabled=doc_qa_enabled,
@@ -417,6 +429,7 @@ class OpsQABot:
                     "num_turns": msg.num_turns,
                     "duration_ms": msg.duration_ms,
                     "duration_api_ms": msg.duration_api_ms,
+                    "subtype": msg.subtype,
                 }
 
     async def answer(
@@ -443,6 +456,7 @@ class OpsQABot:
         num_turns: int | None = None
         duration_ms: int | None = None
         duration_api_ms: int | None = None
+        subtype: str | None = None
         async for event in self.ask(question, images=images):
             if event["type"] == "tool":
                 logger.info("  tool: %s", format_tool_call(event["name"], event["input"]))
@@ -454,6 +468,7 @@ class OpsQABot:
                 num_turns = event.get("num_turns")
                 duration_ms = event.get("duration_ms")
                 duration_api_ms = event.get("duration_api_ms")
+                subtype = event.get("subtype")
                 parts: list[str] = []
                 if cost_usd is not None:
                     parts.append(f"cost=${cost_usd:.4f}")
@@ -477,4 +492,5 @@ class OpsQABot:
             num_turns=num_turns,
             duration_ms=duration_ms,
             duration_api_ms=duration_api_ms,
+            subtype=subtype,
         )
