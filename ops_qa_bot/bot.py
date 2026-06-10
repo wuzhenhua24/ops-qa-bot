@@ -47,10 +47,27 @@ _WRITE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # 文件系统破坏性写
     (re.compile(r"\brm\b", re.IGNORECASE), "rm"),
     (re.compile(r"\bmv\b", re.IGNORECASE), "mv"),
+    (re.compile(r"\bcp\b", re.IGNORECASE), "cp"),
     (re.compile(r"\bdd\b", re.IGNORECASE), "dd"),
     (re.compile(r"\bmkfs\b", re.IGNORECASE), "mkfs"),
     (re.compile(r"\bchmod\b", re.IGNORECASE), "chmod"),
     (re.compile(r"\bchown\b", re.IGNORECASE), "chown"),
+    (re.compile(r"\btruncate\b", re.IGNORECASE), "truncate"),
+    (re.compile(r"\bshred\b", re.IGNORECASE), "shred"),
+    (re.compile(r"\bunlink\b", re.IGNORECASE), "unlink"),
+    (re.compile(r"\btee\b", re.IGNORECASE), "tee"),
+    # sed 原地改文件（-i / -ri / -i.bak / --in-place）；只过滤不写盘的 sed 不拦
+    (
+        re.compile(r"\bsed\s+(-[a-zA-Z]*i[a-zA-Z]*\b|--in-place)", re.IGNORECASE),
+        "sed -i",
+    ),
+    # 文件外传/覆盖：诊断只需要 ssh 远端 cat/grep，不需要搬文件
+    (re.compile(r"\bscp\b", re.IGNORECASE), "scp"),
+    (re.compile(r"\brsync\b", re.IGNORECASE), "rsync"),
+    # crontab 除 -l（只读列出）外都是装载/删除定时任务
+    (re.compile(r"\bcrontab\b(?!\s+-l\b)", re.IGNORECASE), "crontab 写操作"),
+    # 注：shell 重定向（>、>>）刻意不拦——awk 比较表达式（$3 > 100）和
+    # 2>/dev/null 这类日常诊断写法误杀率太高，这条边角留给 prompt 自律层。
     # 进程/服务管理
     (re.compile(r"\bkill(all)?\b", re.IGNORECASE), "kill/killall"),
     (re.compile(r"\bpkill\b", re.IGNORECASE), "pkill"),
@@ -86,17 +103,68 @@ _WRITE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\bDEBUG\s+(SLEEP|RELOAD|LOADAOF|FLUSHALL)\b", re.IGNORECASE),
         "DEBUG 写",
     ),
-    # SQL 写（带后续修饰，避免 SHOW CREATE TABLE 等误中）
+    # Redis 数据写命令（SET/DEL 一族）：这些词太通用，裸 \bSET\b 会误杀
+    # `grep set` / 名字带 set 的 key，所以锚定在 redis-cli 调用段内——
+    # [^|;&]* 不跨管道/分号，`redis-cli INFO | grep set` 不会被牵连。
+    # 超通用词（SET/DEL/EXPIRE 等）还要求后跟参数，避免命中 `TTL set:members`
+    # 这类 key 字面量（SETEX/HSET 等带前后缀的词本身已足够独特，不要求参数）。
+    (
+        re.compile(
+            r"redis-cli\b[^|;&]*"
+            r"\b(SET|DEL|INCR|DECR|APPEND|MOVE|COPY|RENAME|EXPIRE|PERSIST)"
+            r"\s+\S+",
+            re.IGNORECASE,
+        ),
+        "Redis 写命令",
+    ),
+    (
+        re.compile(
+            r"redis-cli\b[^|;&]*\b("
+            r"SETEX|PSETEX|SETNX|MSET|MSETNX|GETSET|GETDEL|SETRANGE|SETBIT"
+            r"|UNLINK|PEXPIRE|EXPIREAT|PEXPIREAT|RENAMENX"
+            r"|MIGRATE|RESTORE|SWAPDB"
+            r"|INCRBY|DECRBY|INCRBYFLOAT"
+            r"|LPUSH|RPUSH|LPOP|RPOP|LSET|LREM|LTRIM|LINSERT|LMOVE|RPOPLPUSH"
+            r"|SADD|SREM|SPOP|SMOVE|SINTERSTORE|SUNIONSTORE|SDIFFSTORE"
+            r"|HSET|HMSET|HSETNX|HDEL|HINCRBY|HINCRBYFLOAT"
+            r"|ZADD|ZREM|ZINCRBY|ZPOPMIN|ZPOPMAX|ZREMRANGEBY\w+|ZRANGESTORE"
+            r"|XADD|XDEL|XTRIM|XSETID|XGROUP"
+            r"|PFADD|PFMERGE|GEOADD"
+            r"|BGSAVE|BGREWRITEAOF"
+            r"|SLAVEOF|REPLICAOF"
+            r"|EVAL|EVALSHA|FCALL"
+            r"|SCRIPT\s+(LOAD|FLUSH|KILL)"
+            r"|FUNCTION\s+(LOAD|DELETE|FLUSH|RESTORE)"
+            r"|ACL\s+(SETUSER|DELUSER|LOAD|SAVE)"
+            r")\b",
+            re.IGNORECASE,
+        ),
+        "Redis 写命令",
+    ),
+    # SQL 写（带后续修饰，避免 SHOW CREATE TABLE 等误中；CREATE 一族另用
+    # 负向后顾排除 SHOW CREATE 前缀）。SET GLOBAL/PERSIST 与 ALTER SYSTEM
+    # 是参数变更——那是 request_db_change 审批链路的事，agent 进程不许直跑。
     (
         re.compile(
             r"\b(INSERT\s+INTO"
+            r"|REPLACE\s+INTO"
             r"|UPDATE\s+\S+\s+SET"
             r"|DELETE\s+FROM"
+            r"|LOAD\s+DATA"
+            r"|RENAME\s+TABLE"
             r"|DROP\s+(TABLE|DATABASE|INDEX|VIEW|PROCEDURE|USER)"
-            r"|ALTER\s+(TABLE|DATABASE|USER)"
+            r"|ALTER\s+(TABLE|DATABASE|USER|SYSTEM|TENANT)"
             r"|TRUNCATE\s+(TABLE\s+)?\S+"
+            r"|SET\s+(GLOBAL|PERSIST)"
             r"|GRANT\s+.+\s+ON"
             r"|REVOKE\s+.+\s+ON)\b",
+            re.IGNORECASE,
+        ),
+        "SQL 写操作",
+    ),
+    (
+        re.compile(
+            r"(?<!\bSHOW\s)\bCREATE\s+(TABLE|DATABASE|INDEX|VIEW|PROCEDURE|USER)\b",
             re.IGNORECASE,
         ),
         "SQL 写操作",
