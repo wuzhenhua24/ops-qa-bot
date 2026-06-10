@@ -58,6 +58,7 @@ from .feishu_core import (
     handle_feedback_click,
     handle_feedback_reason_skip,
     handle_feedback_reason_submit,
+    handle_followup_cancel_click,
     handle_followup_click,
     normalize_card_reasons,
 )
@@ -238,6 +239,21 @@ class WsRunner:
                 except Exception:
                     logger.exception("clarify_giveup click failed: qid=%s", qid)
                     ack_card = _followup_error_card("触发失败，请重试。")
+
+            elif action_name == "followup_cancel":
+                record_id = value.get("record_id")
+                chat_id_v = value.get("chat_id")
+                asker_id = value.get("asker_id")
+                try:
+                    ack_card = handle_followup_cancel_click(
+                        record_id, chat_id_v, asker_id, clicker_id,
+                        self._session_mgr,
+                    )
+                except Exception:
+                    logger.exception(
+                        "followup cancel failed: id=%s", record_id
+                    )
+                    ack_card = _followup_error_card("取消失败，请重试。")
 
             elif action_name == "archive_submit":
                 qid = value.get("qid")

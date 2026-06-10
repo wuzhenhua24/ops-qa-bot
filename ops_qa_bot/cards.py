@@ -188,6 +188,88 @@ def _followup_error_card(message: str) -> dict:
     }
 
 
+def _followup_tasks_card(
+    asker_id: str,
+    chat_id: str,
+    items: list[dict],
+    *,
+    notice: str | None = None,
+) -> dict:
+    """/tasks 指令的跟进任务列表卡：每条挂起跟进一行说明 + 一颗取消按钮。
+
+    `items` 来自 FollowupScheduler.list_pending（record_id / task /
+    remaining_minutes / firing）。执行中（firing）的条目只展示状态、不给取消
+    按钮——那一轮已经在跑了。`notice` 是取消回调刷新卡片时挂在顶部的结果行
+    （"✅ 已取消…"）；列表为空时整张卡收尾成纯文本。asker-only 校验在
+    handle_followup_cancel_click 里做，按钮 value 带回 record_id 与归属。
+    """
+    elements: list[dict] = []
+    if notice:
+        elements.append({"tag": "markdown", "content": notice})
+    if not items:
+        elements.append(
+            {"tag": "markdown", "content": "当前没有挂起的定时跟进了。"}
+        )
+        return {
+            "schema": "2.0",
+            "config": {"update_multi": True},
+            "body": {"elements": elements},
+        }
+
+    elements.append(
+        {"tag": "markdown", "content": f"⏰ 你有 **{len(items)}** 个挂起的定时跟进："}
+    )
+    for i, item in enumerate(items, 1):
+        task_short = _excerpt(str(item.get("task", "")), 80)
+        if item.get("firing"):
+            status = "⏳ 正在执行，结果马上发出"
+        else:
+            m = int(item.get("remaining_minutes", 0))
+            status = f"约 {m} 分钟后执行" if m > 0 else "即将执行（不足 1 分钟）"
+        elements.append(
+            {"tag": "markdown", "content": f"**{i}.** {status}\n{task_short}"}
+        )
+        if not item.get("firing"):
+            elements.append(
+                {
+                    "tag": "column_set",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [
+                                {
+                                    "tag": "button",
+                                    "text": {
+                                        "tag": "plain_text",
+                                        "content": "🗑 取消这条跟进",
+                                    },
+                                    "type": "default",
+                                    "behaviors": [
+                                        {
+                                            "type": "callback",
+                                            "value": {
+                                                "action": "followup_cancel",
+                                                "record_id": item.get("record_id"),
+                                                "chat_id": chat_id,
+                                                "asker_id": asker_id,
+                                            },
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {"elements": elements},
+    }
+
+
 def _clarify_giveup_card(
     qid: str,
     user_id: str,

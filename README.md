@@ -212,7 +212,7 @@ curl http://localhost:8000/admin/sessions -H "X-Admin-Token: xxxxxxxx"
 | `query_gateway_trace` | `gateway_trace.py` | 用户报"访问失败 + 给了 `Hi-Trace-Id`"时，确定性地取 cat logview 链路日志（而不是靠读文档现拼 curl，触发不稳）。 | 配了 `[gateway_trace].base_url` |
 | `query_database` | `db_query.py` | 用**只读账号**直连测试库（本机 `mysql`/`obclient`）跑诊断 SQL，查 CPU/连接数/慢查询等。只读靠 DBA 只读账号的引擎权限强制，不做 SQL 黑名单；密码经 `MYSQL_PWD` 注入，不进命令行/日志/agent 上下文。**直连、不经 jumphost**。 | `[database].allowed_hosts` 非空 + 至少一套只读账号 |
 | `request_db_change` | `db_query.py` | 参数变更审批：asker 申请改某实例参数 → bot 用 admin 账号拼出 `SET GLOBAL`/`ALTER SYSTEM SET` → 发确认卡到群里 → **只有 `admin_open_ids` 名单里的人点确认才执行**（执行在飞书回调里、不在 agent 进程内）。`admin_open_ids` 与文档负责人（INDEX.md owner）刻意解耦——"改库参数"和"答归档问题"是两个量级的权限。 | 白名单 + `admin_open_ids` 非空 + 至少一套 admin 账号（`admin_enabled`） |
-| `schedule_followup` | `scheduled_followup.py` | "X 分钟后帮我再看看 Y"：agent 登记一笔跟进，到点由飞书侧内存定时器复用 `handle_question` 跑一轮、把结果 @ 用户推回群。**MVP 是纯内存定时器，进程重启会丢未触发的任务**。 | `[scheduled_followup].enabled = true`（默认关）+ 飞书 outbound client 在位 |
+| `schedule_followup` | `scheduled_followup.py` | "X 分钟后帮我再看看 Y"：agent 登记一笔跟进，到点由飞书侧内存定时器复用 `handle_question` 跑一轮、把结果 @ 用户推回群。用户发 `/tasks`（或 `跟进任务`）可查看自己挂起的跟进（剩余时间 + 任务摘要），每条带「取消」按钮（仅登记者本人可点；已进入执行的不可取消）。**MVP 是纯内存定时器，进程重启会丢未触发的任务**。 | `[scheduled_followup].enabled = true`（默认关）+ 飞书 outbound client 在位 |
 
 > 数据库账号按连接类型分三套：`mysql`（原生 MySQL）/`ob_mysql`（OceanBase mysql 模式）/`ob_oracle`（oracle 模式），只读与 admin 同结构、同 `MYSQL_PWD` 注入纪律。CLI 直用（`run.py`）时没有飞书定时器/审批回调链路，`request_db_change` 和 `schedule_followup` 不挂。
 

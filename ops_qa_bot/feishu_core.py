@@ -16,6 +16,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -53,6 +54,7 @@ from .cards import (
     _followup_ack_card,
     _followup_card,
     _followup_error_card,
+    _followup_tasks_card,
     _mention_post,
 )
 from .config import (
@@ -98,6 +100,8 @@ RESET_TRIGGERS = {"/reset", "/new", "新对话", "重置"}
 # 帮助指令：列 bot 能力 + 可用指令，新人进群不用翻部署文档。匹配前先 lower，
 # "HELP"/"Help" 也认；中文触发词不受影响
 HELP_TRIGGERS = {"/help", "help", "帮助"}
+# 跟进任务管理指令：列出自己挂起的定时跟进（带取消按钮）。匹配同样先 lower
+TASKS_TRIGGERS = {"/tasks", "跟进任务"}
 
 # 图片输入：Anthropic vision 支持 png/jpeg/gif/webp；超过 5MB 大概率被 API 拒
 # （像素 + 字节双重限制），让 bot 友好提示用户压缩，而不是甩 LLM 报错原文
@@ -695,6 +699,23 @@ _FOLLOWUP_QUESTION_PREFIX = (
 )
 
 
+@dataclass
+class _FollowupRecord:
+    """一笔挂起的定时跟进的元数据，给 /tasks 列表与取消用。
+
+    `firing` 在 sleep 结束、进入实际执行阶段时置 True——执行中的跟进不可取消
+    （取消会把跑到一半的答题掐死，且结果马上就出了）。
+    """
+
+    record_id: str
+    chat_id: str
+    asker_id: str
+    task: str
+    fire_at: float  # 预计触发时刻（unix ts），列表里算"还剩几分钟"
+    handle: asyncio.Task | None = None
+    firing: bool = False
+
+
 class FollowupScheduler:
     """定时跟进任务的内存定时器（MVP，无持久化）。
 
@@ -703,6 +724,10 @@ class FollowupScheduler:
     query_database 等工具去查），把结果 @ asker 推回原群。任务跑在创建它的
     asyncio loop 上（即 channel 后台 loop——submitter 在 agent 工具调用里被
     await，而那整条链跑在后台 loop），与所有业务同 loop，锁语义一致。
+
+    每笔任务带 `_FollowupRecord` 元数据：`list_pending` 给 /tasks 指令列
+    "还剩几分钟 + 查什么"，`cancel` 给卡片按钮做 asker-only 取消（执行中不可取消）。
+    挂起计数从 records 现算，登记/触发/取消天然一致，无需独立计数表。
 
     边界：按 (chat, asker) 维度限每人挂起数（`max_pending_per_user`），防误用堆爆。
     进程退出 / `stop()` 时取消所有未触发任务（内存态，重启即丢——见
@@ -718,13 +743,60 @@ class FollowupScheduler:
         self._feishu = feishu
         self._session_mgr = session_mgr
         self.max_pending_per_user = config.max_pending_per_user
-        self._tasks: set[asyncio.Task] = set()
-        # (chat, asker) → 当前挂起（含正在执行）的跟进数，给每人上限做计数
-        self._pending: dict[SessionKey, int] = {}
+        # record_id → 挂起（含正在执行）的跟进；触发完成/取消时移除
+        self._records: dict[str, _FollowupRecord] = {}
         self._closing = False
 
     def pending_count(self, key: SessionKey) -> int:
-        return self._pending.get(key, 0)
+        return sum(
+            1
+            for r in self._records.values()
+            if (r.chat_id, r.asker_id) == key
+        )
+
+    def list_pending(self, key: SessionKey) -> list[dict]:
+        """该 (chat, asker) 挂起的跟进列表（按触发时间升序），给 /tasks 渲染。
+
+        每项：record_id / task / remaining_minutes（不足 1 分钟按 0）/ firing。
+        """
+        now = time.time()
+        items = [
+            {
+                "record_id": r.record_id,
+                "task": r.task,
+                "remaining_minutes": max(0, int((r.fire_at - now + 59) // 60)),
+                "firing": r.firing,
+            }
+            for r in self._records.values()
+            if (r.chat_id, r.asker_id) == key
+        ]
+        items.sort(key=lambda x: x["remaining_minutes"])
+        return items
+
+    def cancel(self, record_id: str, key: SessionKey) -> str:
+        """取消一笔挂起的跟进。返回状态字符串：
+
+        - "cancelled"：取消成功
+        - "not_found"：不存在（已触发完成 / 已被取消 / id 错）
+        - "not_yours"：record 不属于该 (chat, asker)——卡片转发到别处被点等
+        - "firing"：已进入执行阶段，不可取消（结果马上会发出来）
+        """
+        rec = self._records.get(record_id)
+        if rec is None:
+            return "not_found"
+        if (rec.chat_id, rec.asker_id) != key:
+            return "not_yours"
+        if rec.firing:
+            return "firing"
+        self._records.pop(record_id, None)
+        if rec.handle is not None:
+            rec.handle.cancel()
+        logger.info(
+            "scheduled followup cancelled: id=%s chat=%s user=%s",
+            record_id,
+            *key,
+        )
+        return "cancelled"
 
     def schedule(
         self, chat_id: str, asker_id: str, delay_minutes: int, task: str
@@ -735,18 +807,22 @@ class FollowupScheduler:
             return False
         if self.pending_count(key) >= self.max_pending_per_user:
             return False
-        self._pending[key] = self.pending_count(key) + 1
-        t = asyncio.create_task(self._run(chat_id, asker_id, delay_minutes, task))
-        self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+        rec = _FollowupRecord(
+            record_id=uuid.uuid4().hex[:8],
+            chat_id=chat_id,
+            asker_id=asker_id,
+            task=task,
+            fire_at=time.time() + delay_minutes * 60,
+        )
+        self._records[rec.record_id] = rec
+        rec.handle = asyncio.create_task(self._run(rec, delay_minutes))
         return True
 
-    async def _run(
-        self, chat_id: str, asker_id: str, delay_minutes: int, task: str
-    ) -> None:
-        key = (chat_id, asker_id)
+    async def _run(self, rec: _FollowupRecord, delay_minutes: int) -> None:
+        chat_id, asker_id, task = rec.chat_id, rec.asker_id, rec.task
         try:
             await asyncio.sleep(delay_minutes * 60)
+            rec.firing = True  # 进入执行阶段，cancel 从此拒绝
             request_id_var.set("fu" + uuid.uuid4().hex[:6])
             logger.info(
                 "scheduled followup firing: chat=%s user=%s delay=%dmin",
@@ -786,23 +862,20 @@ class FollowupScheduler:
                     asker_id,
                 )
         finally:
-            n = self._pending.get(key, 0) - 1
-            if n <= 0:
-                self._pending.pop(key, None)
-            else:
-                self._pending[key] = n
+            self._records.pop(rec.record_id, None)
 
     async def stop(self) -> None:
         """取消所有未触发/在跑的跟进任务（进程收尾用）。"""
         self._closing = True
-        tasks = list(self._tasks)
-        for t in tasks:
-            t.cancel()
-        for t in tasks:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await t
-        self._tasks.clear()
-        self._pending.clear()
+        recs = list(self._records.values())
+        for r in recs:
+            if r.handle is not None:
+                r.handle.cancel()
+        for r in recs:
+            if r.handle is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await r.handle
+        self._records.clear()
 
 
 def make_followup_submitter(
@@ -840,6 +913,57 @@ def make_followup_submitter(
         )
 
     return submit
+
+
+def handle_followup_cancel_click(
+    record_id: str | None,
+    chat_id: str | None,
+    asker_id: str | None,
+    clicker_id: str | None,
+    session_mgr: "SessionManager",
+) -> dict | None:
+    """/tasks 卡片上「取消」按钮的回调。
+
+    asker-only：非登记者点击返回 None（卡片保持原样，不给任何反馈，与追问卡
+    同姿态）。取消成功/失败后都用**刷新过的任务列表卡**替换原卡——列表是会过期
+    的快照（其他任务可能已触发），每次点击顺带刷新比留着陈旧列表强。
+    结果记一条 feedback 日志（event=followup_cancel），事后可统计取消率。
+    """
+    if not clicker_id or not asker_id or clicker_id != asker_id:
+        logger.info(
+            "followup cancel rejected (not asker): id=%s clicker=%s asker=%s",
+            record_id,
+            clicker_id,
+            asker_id,
+        )
+        return None
+    scheduler = session_mgr._followup_scheduler
+    if scheduler is None or not record_id or not chat_id:
+        return _archive_ack_card("⚠️", "该跟进任务已不存在（服务可能重启过）。")
+
+    key = (chat_id, asker_id)
+    status = scheduler.cancel(record_id, key)
+    notice = {
+        "cancelled": "✅ 已取消该跟进。",
+        "not_found": "⏰ 该跟进已执行完成或已被取消。",
+        "not_yours": "⚠️ 这条跟进不是在本群登记的，无法在这里取消。",
+        "firing": "⏳ 这条跟进已经在执行了，结果马上会发出来，取消不了。",
+    }[status]
+    feedback_logger.info(
+        json.dumps(
+            {
+                "event": "followup_cancel",
+                "record_id": record_id,
+                "chat_id": chat_id,
+                "asker_id": asker_id,
+                "status": status,
+            },
+            ensure_ascii=False,
+        )
+    )
+    # 取消后刷新列表：还有挂起的就继续列（带最新剩余时间），没了就收尾成纯文本卡
+    items = scheduler.list_pending(key)
+    return _followup_tasks_card(asker_id, chat_id, items, notice=notice)
 
 
 class SessionManager:
@@ -2247,7 +2371,8 @@ def _help_text(session_mgr: SessionManager) -> str:
             )
     if session_mgr._followup_scheduler is not None:
         lines.append(
-            "- ⏰ 定时跟进：「20 分钟后帮我看看 XX 完成没」，到点我自动复查并 @ 你"
+            "- ⏰ 定时跟进：「20 分钟后帮我看看 XX 完成没」，到点我自动复查并 @ 你；"
+            "发 `/tasks`（或 跟进任务）可查看并取消你挂起的跟进"
         )
     lines.append("")
     lines.append(
@@ -2309,6 +2434,38 @@ async def handle_question(
         await feishu.send_post(
             chat_id,
             _mention_post(user_id, _help_text(session_mgr)),
+            parent_id=parent_msg_id,
+        )
+        return
+
+    # 跟进任务管理指令：列出该 (chat, user) 挂起的定时跟进，每条带取消按钮。
+    # 同 /help 姿态：短路应答、零 LLM 成本、不消费过期提示。
+    if not images and question.lower() in TASKS_TRIGGERS:
+        scheduler = session_mgr._followup_scheduler
+        if scheduler is None:
+            await feishu.send_post(
+                chat_id,
+                _mention_post(
+                    user_id, "定时跟进功能未启用，没有可管理的跟进任务。"
+                ),
+                parent_id=parent_msg_id,
+            )
+            return
+        items = scheduler.list_pending(key)
+        if not items:
+            await feishu.send_post(
+                chat_id,
+                _mention_post(
+                    user_id,
+                    "你当前没有挂起的定时跟进。"
+                    "需要时直接说「X 分钟后帮我再看看 …」即可登记。",
+                ),
+                parent_id=parent_msg_id,
+            )
+            return
+        await feishu.send_interactive(
+            chat_id,
+            _followup_tasks_card(user_id, chat_id, items),
             parent_id=parent_msg_id,
         )
         return
