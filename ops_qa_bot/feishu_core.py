@@ -838,6 +838,25 @@ class FollowupScheduler:
             logger.exception(
                 "scheduled followup failed: chat=%s user=%s", chat_id, asker_id
             )
+            # 静默失败等于放用户鸽子：他在等一个"到点会来 @ 我"的承诺。补一条
+            # 失败提示让他知道改手动问。通知本身再失败就只能认了（日志兜底）。
+            try:
+                await self._feishu.send_post(
+                    chat_id,
+                    _mention_post(
+                        asker_id,
+                        "⚠️ 你之前登记的定时跟进刚才执行失败了"
+                        f"（任务：{_excerpt(task, 100)}）。"
+                        "请直接把要查的事再发我一遍，我立刻查。",
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "scheduled followup failure notice also failed: "
+                    "chat=%s user=%s",
+                    chat_id,
+                    asker_id,
+                )
         finally:
             n = self._pending.get(key, 0) - 1
             if n <= 0:

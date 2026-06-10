@@ -4,7 +4,8 @@
 - schedule_followup handler：delay 越界 / 非整数 / task 空 / task 超长都返回
   is_error 文字而不抛；合法入参透传给 submitter 并返回其确认文字。
 - FollowupScheduler：到点用前缀拼好的问题调 handle_question（delay=0 即时触发）；
-  per-(chat,asker) 上限到顶后拒登记；stop() 取消未触发任务并清计数。
+  per-(chat,asker) 上限到顶后拒登记；stop() 取消未触发任务并清计数；
+  到点执行失败时往群里 @ asker 补失败提示（通知本身失败也不炸、计数照常回收）。
 - make_followup_submitter：未超限返回 ✅ 确认文字 + 真的登记；超限返回 ⚠️ 引导文字
   且不登记。
 - 特性开关：SessionManager 在 enabled=False / 无 feishu 时不建 scheduler。
@@ -181,6 +182,72 @@ def test_scheduler_enforces_per_user_cap():
         await sched.stop()
 
     _run(go())
+
+
+class _RecordingFeishu:
+    """记录 send_post 调用的假 outbound client；fail=True 时模拟飞书接口也挂。"""
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.posts: list[tuple] = []
+
+    async def send_post(self, chat_id, post_content, parent_id=None):
+        if self.fail:
+            raise RuntimeError("feishu down")
+        self.posts.append((chat_id, post_content))
+        return "mid_notice"
+
+
+def test_scheduler_failure_notifies_asker(monkeypatch):
+    async def boom_hq(*a, **k):
+        raise RuntimeError("answer pipeline exploded")
+
+    monkeypatch.setattr(fc, "handle_question", boom_hq)
+
+    async def go():
+        feishu = _RecordingFeishu()
+        sched = fc.FollowupScheduler(
+            feishu=feishu, session_mgr=object(), config=_cfg()
+        )
+        sched.schedule("chatA", "userA", 0, "检查表 foo 的 ALTER 完成没")
+        await asyncio.sleep(0.05)
+        cnt = sched.pending_count(("chatA", "userA"))
+        await sched.stop()
+        return feishu.posts, cnt
+
+    posts, cnt = _run(go())
+    assert len(posts) == 1
+    chat_id, post = posts[0]
+    assert chat_id == "chatA"
+    flat = repr(post)
+    # @ 回发起人 + 失败提示 + 带任务摘要让他知道是哪笔跟进黄了
+    assert "userA" in flat
+    assert "执行失败" in flat
+    assert "检查表 foo 的 ALTER 完成没" in flat
+    # 失败路径同样要清挂起计数，不能占着每人上限
+    assert cnt == 0
+
+
+def test_scheduler_failure_notice_failure_is_swallowed(monkeypatch):
+    async def boom_hq(*a, **k):
+        raise RuntimeError("answer pipeline exploded")
+
+    monkeypatch.setattr(fc, "handle_question", boom_hq)
+
+    async def go():
+        sched = fc.FollowupScheduler(
+            feishu=_RecordingFeishu(fail=True),
+            session_mgr=object(),
+            config=_cfg(),
+        )
+        sched.schedule("c", "u", 0, "task")
+        # 通知也失败：不能炸 task、计数照样回收
+        await asyncio.sleep(0.05)
+        cnt = sched.pending_count(("c", "u"))
+        await sched.stop()
+        return cnt
+
+    assert _run(go()) == 0
 
 
 def test_scheduler_stop_cancels_pending():
