@@ -4,7 +4,7 @@
 =False``）。但 PolicyGate 的 ``mentioned_all`` 只认纯文本里的 ``@_all`` 占位符——
 post 里 @所有人 是 ``{"tag":"at","user_id":"all"}`` 元素，被 SDK 的 post 转换器
 渲染成字面 ``@所有人``，"all" 信号丢失，于是 post 形态的 @所有人 漏过 PolicyGate，
-bot 把全员广播当问题答了（线上实测：孙勇 @所有人 发压测禁令 → bot 答题）。
+bot 把全员广播当问题答了（线上实测：某同事 @所有人 发广播通知 → bot 答题）。
 
 修复：PostContent 分支用 ``_post_mention_all_ids`` 走 raw AST 兜底——纯 @所有人
 广播不答题；"@所有人 + 同时单独 @bot" 仍放行（对齐 text 路径语义）。
@@ -141,7 +141,7 @@ def _dispatch_post(content_dict, *, bot_ids=(BOT,), mentions=None):
 
 
 def test_dispatch_real_wire_at_all_image_dropped():
-    # 吴振华那条的真实结构（从线上 [DEBUG raw-post-ast] 日志原样还原）：
+    # 线上那条 @所有人 图文消息的真实结构（从 [DEBUG raw-post-ast] 日志原样还原）：
     # @所有人(user_id="@_all") + 图 + 文字，未单独 @bot → 不答题。
     # 这是最初 user_id=="all" 漏拦的线上 case，锁死。
     handled = _dispatch_post({"title": "", "content": [
@@ -154,7 +154,7 @@ def test_dispatch_real_wire_at_all_image_dropped():
 
 
 def test_dispatch_pure_at_all_dropped():
-    # 孙勇那条的形态：纯 @所有人 + 文字（+图），未单独 @bot → 不答题
+    # 线上那条纯文本广播的形态：纯 @所有人 + 文字（+图），未单独 @bot → 不答题
     handled = _dispatch_post({"content": [[
         {"tag": "at", "user_id": "all", "user_name": "所有人"},
         {"tag": "text", "text": " 各同事，禁止压测，分支环境请关闭回收。"},
