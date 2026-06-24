@@ -189,17 +189,23 @@ def _iter_post_documents(post: dict) -> list[dict]:
     return [doc for doc in post.values() if isinstance(doc, dict)]
 
 
+# @所有人 在 post AST 的 ``at`` 元素里 ``user_id`` 实测取值。线上抓包（2026-06-24）
+# 是 ``@_all``；SDK 文档的 ``is_mention_all`` 又按 ``all`` 判——两种都收，避免再被
+# wire 取值变体绕过。普通 @某人 是 open_id（``ou_xxx``），不会撞这两个值。
+_POST_AT_ALL_IDS = frozenset({"all", "@_all"})
+
+
 def _post_mention_all_ids(post: dict) -> tuple[bool, set[str]]:
     """扫 post AST 的 ``at`` 元素，返回 ``(是否含@所有人, 其余被@到的 id 集合)``。
 
-    富文本里 @所有人 是 ``{"tag":"at","user_id":"all"}``、@某人是 ``user_id=ou_xxx``。
+    富文本里 @所有人 是 ``{"tag":"at","user_id":"@_all"}``、@某人是 ``user_id=ou_xxx``。
     SDK 的 ``mentioned_all`` 只认纯文本里的 ``@_all`` 占位符——post 的 ``at`` 元素被
-    ``converters/post.py`` 直接渲染成字面 ``@所有人``，"all" 信号在转换时就丢了，于是
+    ``converters/post.py`` 直接渲染成字面 ``@所有人``，all 信号在转换时就丢了，于是
     post 形态的 @所有人 绕过 channel PolicyGate（``policy_mention_all_blocked`` 不
     触发）。这里直接走 raw AST 兜底识别，不依赖 SDK 的 mention 抽取。
 
-    ``user_id`` 字段在飞书 post wire 里装的就是 open_id（``ou_xxx``）；``all`` 是
-    @所有人 的特例。两者都从这一字段取（``open_id`` 作历史形态兜底）。
+    ``user_id`` 字段在飞书 post wire 里装的就是 open_id（``ou_xxx``）；@所有人 是
+    ``_POST_AT_ALL_IDS`` 里的特例。``open_id`` 作历史形态兜底。
     """
     has_all = False
     at_ids: set[str] = set()
@@ -211,7 +217,7 @@ def _post_mention_all_ids(post: dict) -> tuple[bool, set[str]]:
                 if not isinstance(el, dict) or el.get("tag") != "at":
                     continue
                 uid = el.get("user_id") or el.get("open_id") or ""
-                if uid == "all":
+                if uid in _POST_AT_ALL_IDS:
                     has_all = True
                 elif uid:
                     at_ids.add(uid)
@@ -3161,17 +3167,6 @@ async def dispatch_inbound(
         # 认文本里的 @_all 占位符，post 的 at 元素识别不到）——这里 AST 兜底：纯
         # @所有人 广播不答题；"@所有人 + 同时单独 @bot" 仍放行（对齐 text 路径语义）。
         has_mention_all, post_at_ids = _post_mention_all_ids(content.post)
-        # TODO(temp-debug 2026-06-24): @所有人 post 仍漏的现场取证——把原始 post AST
-        # + 检测结果原样打出来，定位真实飞书 wire 结构。确认根因后删除本块。
-        logger.info(
-            "[DEBUG raw-post-ast] chat=%s user=%s has_all=%s post_at_ids=%s "
-            "sdk_mentioned_all=%s mentions=%s content_text=%r post=%s",
-            chat_id, sender_id, has_mention_all, sorted(post_at_ids),
-            inbound.mentioned_all,
-            [m.open_id for m in inbound.mentions],
-            (inbound.content_text or "")[:120],
-            json.dumps(content.post, ensure_ascii=False),
-        )
         if has_mention_all:
             bot_ids = feishu.bot_self_ids
             mentioned_bot = bool(post_at_ids & bot_ids) or any(

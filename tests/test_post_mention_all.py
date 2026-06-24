@@ -87,6 +87,18 @@ def test_open_id_fallback_field():
     assert has_all is True
 
 
+def test_at_all_real_wire_underscore():
+    # 线上真实 wire（2026-06-24 [DEBUG raw-post-ast] 抓的）：@所有人 的 user_id
+    # 是 "@_all" 而非文档约定的 "all"——关键回归，最初漏拦就是因为只认了 "all"
+    post = {"content": [[
+        {"tag": "at", "user_id": "@_all", "user_name": "所有人", "style": []},
+        {"tag": "text", "text": " ", "style": []},
+    ]]}
+    has_all, ids = fc._post_mention_all_ids(post)
+    assert has_all is True
+    assert ids == set()
+
+
 # ---------------------------------------------------------------------------
 # 端到端：dispatch_inbound 的 PostContent 分支 drop / 放行
 # ---------------------------------------------------------------------------
@@ -126,6 +138,19 @@ def _dispatch_post(content_dict, *, bot_ids=(BOT,), mentions=None):
     finally:
         fc.handle_post_question = orig
     return bool(called)
+
+
+def test_dispatch_real_wire_at_all_image_dropped():
+    # 吴振华那条的真实结构（从线上 [DEBUG raw-post-ast] 日志原样还原）：
+    # @所有人(user_id="@_all") + 图 + 文字，未单独 @bot → 不答题。
+    # 这是最初 user_id=="all" 漏拦的线上 case，锁死。
+    handled = _dispatch_post({"title": "", "content": [
+        [{"tag": "at", "user_id": "@_all", "user_name": "所有人", "style": []},
+         {"tag": "text", "text": " ", "style": []}],
+        [{"tag": "img", "image_key": "img_v3_x", "width": 1263, "height": 347}],
+        [{"tag": "text", "text": " 文字", "style": []}],
+    ]})
+    assert handled is False
 
 
 def test_dispatch_pure_at_all_dropped():
