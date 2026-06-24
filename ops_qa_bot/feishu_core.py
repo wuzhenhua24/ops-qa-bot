@@ -3161,6 +3161,17 @@ async def dispatch_inbound(
         # 认文本里的 @_all 占位符，post 的 at 元素识别不到）——这里 AST 兜底：纯
         # @所有人 广播不答题；"@所有人 + 同时单独 @bot" 仍放行（对齐 text 路径语义）。
         has_mention_all, post_at_ids = _post_mention_all_ids(content.post)
+        # TODO(temp-debug 2026-06-24): @所有人 post 仍漏的现场取证——把原始 post AST
+        # + 检测结果原样打出来，定位真实飞书 wire 结构。确认根因后删除本块。
+        logger.info(
+            "[DEBUG raw-post-ast] chat=%s user=%s has_all=%s post_at_ids=%s "
+            "sdk_mentioned_all=%s mentions=%s content_text=%r post=%s",
+            chat_id, sender_id, has_mention_all, sorted(post_at_ids),
+            inbound.mentioned_all,
+            [m.open_id for m in inbound.mentions],
+            (inbound.content_text or "")[:120],
+            json.dumps(content.post, ensure_ascii=False),
+        )
         if has_mention_all:
             bot_ids = feishu.bot_self_ids
             mentioned_bot = bool(post_at_ids & bot_ids) or any(
