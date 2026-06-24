@@ -189,6 +189,35 @@ def _iter_post_documents(post: dict) -> list[dict]:
     return [doc for doc in post.values() if isinstance(doc, dict)]
 
 
+def _post_mention_all_ids(post: dict) -> tuple[bool, set[str]]:
+    """扫 post AST 的 ``at`` 元素，返回 ``(是否含@所有人, 其余被@到的 id 集合)``。
+
+    富文本里 @所有人 是 ``{"tag":"at","user_id":"all"}``、@某人是 ``user_id=ou_xxx``。
+    SDK 的 ``mentioned_all`` 只认纯文本里的 ``@_all`` 占位符——post 的 ``at`` 元素被
+    ``converters/post.py`` 直接渲染成字面 ``@所有人``，"all" 信号在转换时就丢了，于是
+    post 形态的 @所有人 绕过 channel PolicyGate（``policy_mention_all_blocked`` 不
+    触发）。这里直接走 raw AST 兜底识别，不依赖 SDK 的 mention 抽取。
+
+    ``user_id`` 字段在飞书 post wire 里装的就是 open_id（``ou_xxx``）；``all`` 是
+    @所有人 的特例。两者都从这一字段取（``open_id`` 作历史形态兜底）。
+    """
+    has_all = False
+    at_ids: set[str] = set()
+    for doc in _iter_post_documents(post):
+        for para in doc.get("content") or []:
+            if not isinstance(para, list):
+                continue
+            for el in para:
+                if not isinstance(el, dict) or el.get("tag") != "at":
+                    continue
+                uid = el.get("user_id") or el.get("open_id") or ""
+                if uid == "all":
+                    has_all = True
+                elif uid:
+                    at_ids.add(uid)
+    return has_all, at_ids
+
+
 def card_form_value(event: CardActionEvent) -> dict:
     """从 CardActionEvent.raw 抽 form_value。
 
@@ -533,6 +562,18 @@ class FeishuClient:
                 raise ValueError("FeishuClient: 必须提供 app_id+app_secret 或 channel")
             channel = FeishuChannel(app_id=app_id, app_secret=app_secret)
         self._channel = channel
+
+    @property
+    def bot_self_ids(self) -> set[str]:
+        """bot 自身的 open_id / user_id 集合，用于判断消息是否直接 @ 了 bot。
+
+        channel 在 ``.start()`` 时 fetch 一次 bot identity。未解析出来时返回空集——
+        调用方据此 fail-safe（@所有人 post 一律按广播丢，宁可漏答不误答广播）。
+        """
+        ident = self._channel.bot_identity
+        if ident is None:
+            return set()
+        return {x for x in (ident.open_id, getattr(ident, "user_id", None)) if x}
 
     @staticmethod
     def _reply_opts(parent_id: str | None) -> dict | None:
@@ -3071,7 +3112,10 @@ async def dispatch_inbound(
     - chat_id / sender_id / message_type 任一缺失：忽略
     - inbound.sender.is_bot：忽略（机器人互相 @ 形成的环路）
     - @所有人 过滤交给 channel PolicyGate（``respond_to_mention_all=False``）；
-      纯 @所有人 被 channel 直接拒，"@所有人 + 同时单独 @bot" 仍然放行答题
+      纯 @所有人 被 channel 直接拒，"@所有人 + 同时单独 @bot" 仍然放行答题。
+      ⚠️ 仅 text 形态如此：post（富文本）里 @所有人 是 ``at`` 元素，SDK 的
+      ``mentioned_all`` 探不到（只认文本 ``@_all`` 占位符），漏过 PolicyGate——
+      故 PostContent 分支额外用 ``_post_mention_all_ids`` 走 AST 兜底拦截。
 
     路由按 ``inbound.content`` 类型分支：
     - ImageContent → handle_image_question（caption 走 raw）
@@ -3113,6 +3157,22 @@ async def dispatch_inbound(
         return
 
     if isinstance(content, PostContent):
+        # post 形态的 @所有人 走不到 channel PolicyGate 的 mention_all 拦截（SDK 只
+        # 认文本里的 @_all 占位符，post 的 at 元素识别不到）——这里 AST 兜底：纯
+        # @所有人 广播不答题；"@所有人 + 同时单独 @bot" 仍放行（对齐 text 路径语义）。
+        has_mention_all, post_at_ids = _post_mention_all_ids(content.post)
+        if has_mention_all:
+            bot_ids = feishu.bot_self_ids
+            mentioned_bot = bool(post_at_ids & bot_ids) or any(
+                m.open_id in bot_ids for m in inbound.mentions if m.open_id
+            )
+            if not mentioned_bot:
+                logger.info(
+                    "post @所有人 广播已过滤（未单独 @bot）: chat=%s user=%s",
+                    chat_id, sender_id,
+                )
+                return
+
         # post 消息：飞书把"@bot + 文字 + 截图"打成 post（富文本），不是 image。
         # 解析出文字 + 多张图，走视觉路径；啥可用内容都没有的 post（纯 sticker /
         # 表情 / 仅 link）handle_post_question 内部会兜底回 unsupported hint。
