@@ -49,6 +49,9 @@ def _sample_log(tmp_path: Path) -> Path:
                 },
                 "escalated_to": "ou_x",
                 "escalation_kind": "qa",
+                # q1 同时是"泄漏 open_id 被救回成升级"的一轮（promoted ⊆ scrubbed ⊆ escalated_qa）
+                "open_ids_scrubbed": 1,
+                "escalate_from_leaked_open_id": True,
             },
         ),
         _line(
@@ -127,6 +130,7 @@ def test_aggregate_counts(tmp_path: Path):
     assert s["active_users"] == {"ou_a", "ou_b"}
     assert s["clarifications"] == 1
     assert s["escalated_qa"] == 1 and s["escalated_ticket"] == 0
+    assert s["open_id_scrub_rounds"] == 1 and s["open_id_promoted"] == 1
     assert s["up"] == 1 and s["down"] == 1
     assert s["reason_counter"]["文档过时"] == 1
     # 被踩问题回填了原题和原因
@@ -158,6 +162,8 @@ def test_render_contains_key_numbers(tmp_path: Path):
     assert "redis 内存满了怎么办" in text  # 被踩问题列出来
     assert "redis/qa-archive.md" in text
     assert "max_turns 命中 0" in text
+    # open_id 泄漏行：剥 1 轮、其中救回升级 1 轮
+    assert "open_id 泄漏：剥 1 轮，其中救回升级 @ 1 轮" in text
     # 用量口径：纯 token 为主（13,500 = 1000+2000+10000+500）
     assert "总用量 13,500 tokens" in text
     assert "平均每题 6,750 tokens" in text

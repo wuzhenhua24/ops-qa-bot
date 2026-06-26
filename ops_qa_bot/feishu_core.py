@@ -84,12 +84,14 @@ from .markers import (
     _OPEN_ID_RE,
     _excerpt,
     _is_escalate_drift,
+    _leaked_owner_ids,
     _parse_archive_q,
     _parse_clarify,
     _parse_escalate,
     _parse_escalate_ticket,
     _parse_followups,
     _rewrite_owner_at_mentions,
+    _scrub_leaked_open_ids,
 )
 from .scheduled_followup import ScheduledFollowupRequest
 
@@ -2835,14 +2837,39 @@ async def handle_question(
         archive_q_draft = None
     is_ticket = escalate_ticket_owner is not None
 
+    # INDEX.md 注册负责人白名单：drift 升级提升 + 正文 @ 渲染（_rewrite_owner_at_mentions）
+    # 都要用，路径解析有 mtime 缓存、算一次复用即可。
+    registered_owners = set(
+        _index_owner_to_dirs(session_mgr.docs_root).keys()
+    )
+
     # Escalate marker drift 兜底（[[project-escalate-trigger-probabilistic]]）：
     # LLM 答出"文档中未找到"但忘了输出 ESCALATE/CLARIFY marker。判定条件 +
-    # 决策都在 _is_escalate_drift 里，本处只负责"命中后追加 asker-facing 提示
-    # + 打 warning + qa_record 标记"。不强行猜 owner @——没可靠依据从问题文本
-    # 推断组件，乱 @ 错人比不 @ 更糟。
+    # 决策都在 _is_escalate_drift 里。
     escalate_drift = _is_escalate_drift(
         raw_answer, answer, escalate_owner, is_clarification
     )
+    promoted_owner_from_leak = False
+    if escalate_drift:
+        # 漂移轮里，如果 LLM 正文把在册负责人的 open_id 当文字点了名（典型
+        # `张三 (open_id: ou_xxx)`，没走 marker）——这是比"拿问题文本猜组件"可靠
+        # 得多的升级信号，直接提升为升级目标，让"答不上来"也能正经 @ 上人 + 发
+        # 归档卡（用户反馈这类本就该 @ 负责人），而不是只把 open_id 剥干净留用户
+        # 自己去群里 @。多个取第一个；幻觉 id（不在白名单）不算。提升后不再是
+        # "无人接手"的漂移，跳过下面的兜底提示，正文里那串 open_id 仍由
+        # _scrub_leaked_open_ids 兜底剥掉（@ 走末尾 _append_escalate_at）。
+        leaked = _leaked_owner_ids(answer, registered_owners)
+        if leaked:
+            escalate_owner = leaked[0]
+            promoted_owner_from_leak = True
+            escalate_drift = False
+            logger.info(
+                "escalate drift promoted to owner via leaked open_id in body: "
+                "chat=%s user=%s owner=%s",
+                chat_id,
+                user_id,
+                escalate_owner,
+            )
     if escalate_drift:
         logger.warning(
             "escalate drift: not-found answer with no marker, append fallback hint. "
@@ -2880,11 +2907,9 @@ async def handle_question(
     final_post = _mention_post(user_id, answer)
 
     # 正文 @ owner 渲染：LLM 在答案正文里写 `<@ou_xxx>` 列候选负责人（drift 兜底
-    # 时多见），markdown 渲染会原样输出尖括号文本。对照 INDEX.md 注册白名单转成
-    # 飞书 <at> tag，幻觉编出来的 open_id 静默剥除。详见 _rewrite_owner_at_mentions。
-    registered_owners = set(
-        _index_owner_to_dirs(session_mgr.docs_root).keys()
-    )
+    # 时多见），markdown 渲染会原样输出尖括号文本。对照 INDEX.md 注册白名单（上面
+    # 已算好的 registered_owners）转成飞书 <at> tag，幻觉编出来的 open_id 静默剥除。
+    # 详见 _rewrite_owner_at_mentions。
     at_rendered_in_body, at_dropped_in_body = _rewrite_owner_at_mentions(
         final_post, registered_owners
     )
@@ -2895,6 +2920,23 @@ async def handle_question(
             "stripped %d unregistered <@ou_xxx> mention(s) from answer body: "
             "chat=%s user=%s",
             at_dropped_in_body,
+            chat_id,
+            user_id,
+        )
+
+    # 兜底净化泄漏的 open_id：LLM 没走 `<@ou_xxx>` / `<<ESCALATE>>`，而是把负责人
+    # open_id 当普通文字写进正文（典型 `张三 (open_id: ou_xxx)`），_rewrite 收不到、
+    # 原样渲染给用户。必须放在 _rewrite_owner_at_mentions 之后（否则会误删合法
+    # `<@ou_xxx>` 的字面）。详见 _scrub_leaked_open_ids。
+    leaked_open_ids = _scrub_leaked_open_ids(final_post)
+    if leaked_open_ids:
+        # 频率高说明 prompt"别在正文写 open_id"那条没拦住——LLM 习惯把 ID 当
+        # 引用塞进括号里，可考虑在喂 INDEX.md 时就别让它直接看到裸 open_id。
+        logger.warning(
+            "scrubbed %d leaked open_id(s) from answer body (LLM wrote raw "
+            "open_id as text instead of <<ESCALATE>> / naming the owner): "
+            "chat=%s user=%s",
+            leaked_open_ids,
             chat_id,
             user_id,
         )
@@ -2996,6 +3038,11 @@ async def handle_question(
     if escalate_owner is not None:
         qa_record["escalated_to"] = escalate_owner
         qa_record["escalation_kind"] = "ticket" if is_ticket else "qa"
+        if promoted_owner_from_leak:
+            # grep 频率：jq 'select(.escalate_from_leaked_open_id)' feedback.log
+            # 这类是"LLM 漏了 marker 但泄漏了在册 owner、被兜底救回成正经升级"，
+            # 频率高说明 prompt 那条"找不到必须输出 <<ESCALATE>>"没拦住，回头强化
+            qa_record["escalate_from_leaked_open_id"] = True
         if is_feishu_component:
             # 观察期抓手：grep `feishu_component` 统计飞书来源组件多频繁升级。
             # 升级率高 = 飞书文档没覆盖到 / 负责人没在维护，是决定要不要切"兼读
@@ -3015,6 +3062,10 @@ async def handle_question(
         # dropped 是 LLM 编 open_id 被剥的次数，监控 LLM 输出靠谱程度
         qa_record["at_rendered_in_body"] = at_rendered_in_body
         qa_record["at_dropped_in_body"] = at_dropped_in_body
+    if leaked_open_ids:
+        # grep 频率：jq 'select(.open_ids_scrubbed) | {qid, question}' feedback.log
+        # 高频说明 LLM 爱把 open_id 当文字塞正文，回头强化 prompt 那条约束
+        qa_record["open_ids_scrubbed"] = leaked_open_ids
     if attached_images:
         # 用相对路径而不是 image_key，事后能直接定位到具体哪些图被引用
         qa_record["images_attached"] = attached_images

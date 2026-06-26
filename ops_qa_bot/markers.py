@@ -49,6 +49,19 @@ _NOT_FOUND_RE = re.compile(
 # 来的 open_id）静默剥除。容忍空格防 LLM 输出 `< @ou_xxx >` 等变种。
 _AT_OWNER_RE = re.compile(r"<\s*@\s*(ou_[A-Za-z0-9_-]+)\s*>")
 
+# 兜底净化：LLM 偶尔把负责人 open_id 当普通文字写进正文——典型 `张三 (open_id: ou_xxx)`
+# 或裸 `ou_xxx`。既不是 `<@ou_xxx>`（_rewrite_owner_at_mentions 收不到）也没走
+# `<<ESCALATE>>` marker，于是原样渲染给用户。open_id 是内部标识，对用户无意义又难看，
+# 任何残留都该剥掉（和 [[project-escalate-trigger-probabilistic]] 一个思路：别指望
+# prompt 100% 约束 LLM 输出，加 bot 侧确定性兜底）。优先连同 `(open_id: …)` /
+# `（open_id：…）` / `[open_id: …]` 这类包裹标签整体删掉，避免留下空括号；标签里
+# open_id / openid / open id / open-id 及大小写都容忍。剥不掉包裹时退化为只删裸 id。
+_LEAKED_OPEN_ID_WRAPPED_RE = re.compile(
+    r"\s*[（(\[]\s*open[\s_-]?id\s*[:：]?\s*ou_[A-Za-z0-9_-]+\s*[)）\]]",
+    re.IGNORECASE,
+)
+_LEAKED_OPEN_ID_BARE_RE = re.compile(r"\s*ou_[A-Za-z0-9_-]+")
+
 
 def _is_escalate_drift(
     raw_answer: str,
@@ -282,5 +295,51 @@ def _rewrite_owner_at_mentions(
         # 段被替换成空（全是被丢的 @ + 没文字）时塞个空 text 段，避免后续渲染崩
         content[i] = new_para if new_para else [{"tag": "text", "text": ""}]
     return rendered, dropped
+
+
+def _leaked_owner_ids(text: str, registered_owners: set[str]) -> list[str]:
+    """从答案正文挑出"被当普通文字写出来"的在册负责人 open_id（保序去重）。
+
+    用于 escalate drift 兜底：LLM 答不上来、漏了 `<<ESCALATE>>` marker，但正文里把
+    在册负责人的 open_id 当文字点了名（典型 `张三 (open_id: ou_xxx)`）——这比"拿问题
+    文本猜组件"可靠得多，调用方据此把它提升为升级目标 @ 上人。先抹掉 `<@ou_xxx>`
+    形态（那是 _rewrite_owner_at_mentions 的活、不算泄漏），剩下的 `ou_xxx` 才是裸 /
+    带标签泄漏；只回在 `registered_owners` 白名单里的（幻觉 id 不 @）。
+    """
+    residual = _AT_OWNER_RE.sub("", text)
+    found: list[str] = []
+    for m in re.finditer(r"ou_[A-Za-z0-9_-]+", residual):
+        oid = m.group(0)
+        if oid in registered_owners and oid not in found:
+            found.append(oid)
+    return found
+
+
+def _scrub_leaked_open_ids(post: dict) -> int:
+    """剥掉答案正文 text 段里残留的负责人 open_id 字面，返回剥掉的处数。
+
+    只动 `tag=text` 段（at / img / code_block 不碰）。每段先按包裹标签
+    （`(open_id: ou_xxx)` 等）整体删，再删剩下的裸 `ou_xxx`，两步命中数累加。
+
+    **必须在 `_rewrite_owner_at_mentions` 之后跑**：那一步先把合法的 `<@ou_xxx>`
+    形态转成 at 段（其字面也含 `ou_xxx`），本函数先跑会把它们当泄漏误删。跑完后
+    text 段里还残留的 `ou_xxx` 才是 LLM 漏出来的内部标识，统统剥掉。调用方用返回
+    值打日志 + 写 qa_record，监控 LLM 泄漏 open_id 的频率（高了回头调 prompt）。
+    """
+    scrubbed = 0
+    content = post.get("zh_cn", {}).get("content", [])
+    for paragraph in content:
+        for seg in paragraph:
+            if seg.get("tag") != "text":
+                continue
+            text = seg.get("text", "")
+            if "ou_" not in text:  # 快路径：绝大多数答案段不含 open_id
+                continue
+            text, n_wrapped = _LEAKED_OPEN_ID_WRAPPED_RE.subn("", text)
+            text, n_bare = _LEAKED_OPEN_ID_BARE_RE.subn("", text)
+            if n_wrapped or n_bare:
+                scrubbed += n_wrapped + n_bare
+                seg["text"] = text
+    return scrubbed
 
 

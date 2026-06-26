@@ -80,6 +80,12 @@ def aggregate(events: list[tuple[str, dict]], prices: dict) -> dict:
         "escalated_qa": 0,
         "escalated_ticket": 0,
         "drift": 0,
+        # open_id 泄漏兜底（[[project-open-id-leak-in-body-scrub]]）：LLM 把负责人
+        # open_id 当文字写进正文。scrub_rounds = 被剥过的轮次（含正常答完只清理的）；
+        # promoted = 其中"答不上来 + 点名在册负责人"被救回成正经升级 @ 的轮次（⊆ scrub_rounds，
+        # 也 ⊆ escalated_qa）。两者都高说明 prompt 那条"别在正文写 open_id"没拦住。
+        "open_id_scrub_rounds": 0,
+        "open_id_promoted": 0,
         "max_turns_hit": 0,
         "images_answers": 0,
         "up": 0,
@@ -117,6 +123,10 @@ def aggregate(events: list[tuple[str, dict]], prices: dict) -> dict:
                     s["escalated_qa"] += 1
             if e.get("escalate_drift_fallback"):
                 s["drift"] += 1
+            if e.get("open_ids_scrubbed"):
+                s["open_id_scrub_rounds"] += 1
+            if e.get("escalate_from_leaked_open_id"):
+                s["open_id_promoted"] += 1
             if e.get("max_turns_hit"):
                 s["max_turns_hit"] += 1
             if e.get("images_attached"):
@@ -204,6 +214,12 @@ def render(s: dict, *, days: int, today: date, show_priced: bool = False) -> str
             f"（知识 {s['escalated_qa']} / 工单 {s['escalated_ticket']}）；"
             f"drift 兜底 {s['drift']}；max_turns 命中 {s['max_turns_hit']}"
         )
+        # open_id 泄漏只在发生过时才打一行，避免零值噪音
+        if s["open_id_scrub_rounds"] or s["open_id_promoted"]:
+            lines.append(
+                f"- open_id 泄漏：剥 {s['open_id_scrub_rounds']} 轮，"
+                f"其中救回升级 @ {s['open_id_promoted']} 轮"
+            )
 
     lines.append("")
     lines.append("【满意度】")
