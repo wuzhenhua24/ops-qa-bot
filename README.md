@@ -32,7 +32,8 @@ ops-qa-bot/
 │   ├── gateway_trace.py     # 可选工具：query_gateway_trace（网关链路排查）
 │   ├── db_query.py          # 可选工具：query_database / request_db_change（数据库只读分析 + 参数变更审批）
 │   ├── scheduled_followup.py # 可选工具：schedule_followup（定时跟进）
-│   └── logging_config.py    # 主日志 + 反馈日志独立 handler
+│   ├── logging_config.py    # 主日志 + 反馈日志独立 handler
+│   └── feedback_stats.py    # 反馈日志离线报表（满意率 / 升级率 / token 成本等）
 ├── run.py                   # CLI 入口（本地交互问答）
 ├── run_server.py            # HTTP 模式入口
 └── run_ws.py                # 长连接模式入口
@@ -95,7 +96,7 @@ uv run python run.py --hide-tools
 ### 启动服务
 
 ```bash
-# 1. 装上 server 依赖（fastapi / uvicorn / httpx / cachetools）
+# 1. 装上 server 依赖（fastapi / uvicorn / httpx / cachetools / lark-oapi）
 uv sync --extra server
 
 # 2. 复制配置模板并按需填写（config.toml 已被 .gitignore）
