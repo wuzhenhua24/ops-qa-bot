@@ -385,10 +385,13 @@ class WsRunner:
         """主入口：启动 channel + SessionManager + HealthServer。"""
         self._started_at = time.time()
 
-        # channel.connect() 在 ws 模式下：建后台 loop+thread、同步 fetch bot
-        # identity（10s 超时；失败进 retry loop 不阻塞）、建 dispatcher、
-        # 启 WSClient（连上飞书 + 后台跑 ws 收发循环）。
-        await self._channel.connect()
+        # 不能用 channel.connect()：ws 模式下它是前台阻塞语义（内部
+        # WSClient.start() 的 run_until_complete 永不返回），会把 run() 卡死
+        # 在这一行，下面的 _bootstrap 永远不跑——reaper / health / 启动日志
+        # 全丢。connect_until_ready() 在后台线程启动 WS，连上即返回（默认
+        # 30s 超时抛 FeishuChannelError，进程退出交给 systemd 拉起），且只有
+        # 这条路径会置 is_ready=True，readyz 才能正常报 ready。
+        await self._channel.connect_until_ready()
 
         # 把 SessionManager + HealthServer 启动到 channel 后台 loop。
         # 业务 handler 也在那个 loop 跑，全局单 loop 简化锁语义。
